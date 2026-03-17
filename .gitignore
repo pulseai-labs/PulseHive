@@ -1,0 +1,31 @@
+# Rust build artifacts
+/target/
+Cargo.lock
+
+# Private - internal brainstorming and competitive analysis
+discussion.md
+compass_artifact_*.md
+
+# AI tooling config (contains auth tokens, local paths)
+CLAUDE.md
+AGENTS.md
+.claude/
+.mcp.json
+opencode.json
+.opencode/
+
+# Environment and data
+.env
+.env.*
+*.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
