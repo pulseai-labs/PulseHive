@@ -74,7 +74,10 @@ pub struct HiveMind {
 impl std::fmt::Debug for HiveMind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("HiveMind")
-            .field("llm_providers", &self.llm_providers.keys().collect::<Vec<_>>())
+            .field(
+                "llm_providers",
+                &self.llm_providers.keys().collect::<Vec<_>>(),
+            )
             .finish_non_exhaustive()
     }
 }
@@ -142,8 +145,7 @@ impl HiveMindBuilder {
         name: impl Into<String>,
         provider: impl LlmProvider + 'static,
     ) -> Self {
-        self.llm_providers
-            .insert(name.into(), Arc::new(provider));
+        self.llm_providers.insert(name.into(), Arc::new(provider));
         self
     }
 
@@ -232,8 +234,7 @@ mod tests {
                 _msgs: Vec<Message>,
                 _tools: Vec<ToolDefinition>,
                 _config: &LlmConfig,
-            ) -> HiveResult<Pin<Box<dyn Stream<Item = HiveResult<LlmChunk>> + Send>>>
-            {
+            ) -> HiveResult<Pin<Box<dyn Stream<Item = HiveResult<LlmChunk>> + Send>>> {
                 Ok(Box::pin(futures::stream::empty()))
             }
         }

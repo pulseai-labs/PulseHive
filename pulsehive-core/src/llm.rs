@@ -180,7 +180,9 @@ mod tests {
         };
         let json = serde_json::to_string(&msg).unwrap();
         let deserialized: Message = serde_json::from_str(&json).unwrap();
-        assert!(matches!(deserialized, Message::System { content } if content == "You are a helpful agent."));
+        assert!(
+            matches!(deserialized, Message::System { content } if content == "You are a helpful agent.")
+        );
     }
 
     #[test]

@@ -226,9 +226,7 @@ mod tests {
             },
         };
         match looped.kind {
-            AgentKind::Loop {
-                max_iterations, ..
-            } => assert_eq!(max_iterations, 10),
+            AgentKind::Loop { max_iterations, .. } => assert_eq!(max_iterations, 10),
             _ => panic!("Expected Loop"),
         }
     }

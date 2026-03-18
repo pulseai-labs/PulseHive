@@ -22,7 +22,6 @@ use crate::agent::{AgentKindTag, AgentOutcome};
 #[derive(Debug, Clone)]
 pub enum HiveEvent {
     // ── Agent lifecycle ──────────────────────────────────────────────
-
     /// An agent has started execution.
     AgentStarted {
         agent_id: String,
@@ -36,7 +35,6 @@ pub enum HiveEvent {
     },
 
     // ── LLM interactions ─────────────────────────────────────────────
-
     /// An LLM call has been initiated.
     LlmCallStarted {
         agent_id: String,
@@ -50,18 +48,11 @@ pub enum HiveEvent {
         duration_ms: u64,
     },
     /// A token was received from a streaming LLM response.
-    LlmTokenStreamed {
-        agent_id: String,
-        token: String,
-    },
+    LlmTokenStreamed { agent_id: String, token: String },
 
     // ── Tool execution ───────────────────────────────────────────────
-
     /// A tool call has started.
-    ToolCallStarted {
-        agent_id: String,
-        tool_name: String,
-    },
+    ToolCallStarted { agent_id: String, tool_name: String },
     /// A tool call has completed.
     ToolCallCompleted {
         agent_id: String,
@@ -76,16 +67,13 @@ pub enum HiveEvent {
     },
 
     // ── Substrate operations ─────────────────────────────────────────
-
     /// An experience was recorded in the substrate.
     ExperienceRecorded {
         experience_id: ExperienceId,
         agent_id: String,
     },
     /// A relationship was inferred between experiences.
-    RelationshipInferred {
-        relation_id: RelationId,
-    },
+    RelationshipInferred { relation_id: RelationId },
     /// An insight was synthesized from an experience cluster.
     InsightGenerated {
         insight_id: InsightId,
@@ -93,7 +81,6 @@ pub enum HiveEvent {
     },
 
     // ── Perception ───────────────────────────────────────────────────
-
     /// An agent perceived the substrate through its lens.
     SubstratePerceived {
         agent_id: String,

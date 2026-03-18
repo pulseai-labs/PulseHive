@@ -27,8 +27,7 @@ pub mod prelude {
 
     // ── Agent types ──────────────────────────────────────────────────
     pub use crate::agent::{
-        AgentDefinition, AgentKind, AgentKindTag, AgentOutcome, ExperienceExtractor,
-        LlmAgentConfig,
+        AgentDefinition, AgentKind, AgentKindTag, AgentOutcome, ExperienceExtractor, LlmAgentConfig,
     };
 
     // ── Approval types ───────────────────────────────────────────────

@@ -86,19 +86,31 @@ mod tests {
 
         let result = inner();
         assert!(result.is_err());
-        assert!(matches!(
-            result.unwrap_err(),
-            PulseHiveError::Substrate(_)
-        ));
+        assert!(matches!(result.unwrap_err(), PulseHiveError::Substrate(_)));
     }
 
     #[test]
     fn test_convenience_constructors() {
-        assert_eq!(PulseHiveError::llm("timeout").to_string(), "LLM error: timeout");
-        assert_eq!(PulseHiveError::tool("not found").to_string(), "Tool error: not found");
-        assert_eq!(PulseHiveError::agent("max iterations").to_string(), "Agent error: max iterations");
-        assert_eq!(PulseHiveError::config("no substrate").to_string(), "Configuration error: no substrate");
-        assert_eq!(PulseHiveError::validation("empty content").to_string(), "Validation error: empty content");
+        assert_eq!(
+            PulseHiveError::llm("timeout").to_string(),
+            "LLM error: timeout"
+        );
+        assert_eq!(
+            PulseHiveError::tool("not found").to_string(),
+            "Tool error: not found"
+        );
+        assert_eq!(
+            PulseHiveError::agent("max iterations").to_string(),
+            "Agent error: max iterations"
+        );
+        assert_eq!(
+            PulseHiveError::config("no substrate").to_string(),
+            "Configuration error: no substrate"
+        );
+        assert_eq!(
+            PulseHiveError::validation("empty content").to_string(),
+            "Validation error: empty content"
+        );
     }
 
     #[test]

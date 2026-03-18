@@ -172,9 +172,6 @@ mod tests {
             ToolResult::json(serde_json::json!({"a": 1})).to_content(),
             r#"{"a":1}"#
         );
-        assert_eq!(
-            ToolResult::error("oops").to_content(),
-            "Error: oops"
-        );
+        assert_eq!(ToolResult::error("oops").to_content(), "Error: oops");
     }
 }
