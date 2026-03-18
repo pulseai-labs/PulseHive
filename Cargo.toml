@@ -1,0 +1,53 @@
+[workspace]
+members = [
+    "pulsehive",
+    "pulsehive-core",
+    "pulsehive-runtime",
+    "pulsehive-openai",
+    "pulsehive-anthropic",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+license = "AGPL-3.0-only"
+repository = "https://github.com/pulsehive/pulsehive"
+
+[workspace.dependencies]
+# Async runtime
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Async traits (object-safe trait methods)
+async-trait = "0.1"
+
+# Error handling
+thiserror = "2"
+
+# Observability
+tracing = "0.1"
+
+# UUIDs (v7 = time-ordered)
+uuid = { version = "1", features = ["v7", "serde"] }
+
+# Stream trait + combinators
+futures-core = "0.3"
+futures = "0.3"
+
+# PulseDB storage substrate
+pulsehive-db = { version = "0.1", features = ["builtin-embeddings"] }
+
+# HTTP client (for LLM provider crates)
+reqwest = { version = "0.12", features = ["json", "stream"] }
+
+# Testing
+tempfile = "3"
+
+# Internal crate references
+pulsehive-core = { path = "pulsehive-core" }
+pulsehive-runtime = { path = "pulsehive-runtime" }
+pulsehive-openai = { path = "pulsehive-openai" }
+pulsehive-anthropic = { path = "pulsehive-anthropic" }
