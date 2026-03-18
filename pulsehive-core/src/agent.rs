@@ -76,16 +76,22 @@ pub struct LlmAgentConfig {
 
 /// Trait for extracting experiences from an agent's conversation history.
 ///
-/// The default implementation (provided by the framework in Sprint 2) analyzes
+/// The default implementation (provided by the framework in Sprint 3) analyzes
 /// the agent's conversation to identify learnings, patterns, and decisions
 /// worth recording in the substrate.
 ///
 /// Products can override this to customize what gets recorded.
 #[async_trait::async_trait]
 pub trait ExperienceExtractor: Send + Sync {
-    // Stub — will be fleshed out when the agentic loop is implemented in Sprint 2.
-    // The actual method signature will be:
-    // async fn extract(&self, conversation: &[Message]) -> Vec<NewExperience>;
+    /// Extract experiences from a completed agent conversation.
+    ///
+    /// Called after the agentic loop completes. Returns experiences to be
+    /// stored in the substrate for future perception by other agents.
+    async fn extract(
+        &self,
+        conversation: &[crate::llm::Message],
+        outcome: &AgentOutcome,
+    ) -> Vec<pulsedb::NewExperience>;
 }
 
 /// Outcome of an agent's execution.

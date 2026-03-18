@@ -13,6 +13,8 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 futures = { workspace = true }
 futures-core = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
 
 [dev-dependencies]
 async-trait = { workspace = true }
