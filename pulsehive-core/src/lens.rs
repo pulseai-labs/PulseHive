@@ -50,6 +50,21 @@ impl ExperienceTypeTag {
             Self::Generic,
         ]
     }
+
+    /// Maps a PulseDB `ExperienceType` to its compact tag for lens weighting.
+    pub fn from_experience_type(et: &pulsedb::ExperienceType) -> Self {
+        match et {
+            pulsedb::ExperienceType::Difficulty { .. } => Self::Difficulty,
+            pulsedb::ExperienceType::Solution { .. } => Self::Solution,
+            pulsedb::ExperienceType::ErrorPattern { .. } => Self::ErrorPattern,
+            pulsedb::ExperienceType::SuccessPattern { .. } => Self::SuccessPattern,
+            pulsedb::ExperienceType::UserPreference { .. } => Self::UserPreference,
+            pulsedb::ExperienceType::ArchitecturalDecision { .. } => Self::ArchitecturalDecision,
+            pulsedb::ExperienceType::TechInsight { .. } => Self::TechInsight,
+            pulsedb::ExperienceType::Fact { .. } => Self::Fact,
+            pulsedb::ExperienceType::Generic { .. } => Self::Generic,
+        }
+    }
 }
 
 /// Time decay function controlling how recency affects perception.

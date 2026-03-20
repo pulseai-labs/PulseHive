@@ -74,13 +74,22 @@ pub struct LlmAgentConfig {
     pub experience_extractor: Option<Box<dyn ExperienceExtractor>>,
 }
 
+/// Context passed to the experience extractor during the Record phase.
+#[derive(Debug, Clone)]
+pub struct ExtractionContext {
+    /// ID of the agent whose conversation is being extracted.
+    pub agent_id: String,
+    /// Collective where extracted experiences will be stored.
+    pub collective_id: pulsedb::CollectiveId,
+    /// Description of the task the agent was working on.
+    pub task_description: String,
+}
+
 /// Trait for extracting experiences from an agent's conversation history.
 ///
-/// The default implementation (provided by the framework in Sprint 3) analyzes
-/// the agent's conversation to identify learnings, patterns, and decisions
-/// worth recording in the substrate.
-///
-/// Products can override this to customize what gets recorded.
+/// The default implementation (provided by the framework) uses simple rules
+/// to create experiences from the agent's outcome. Products can override
+/// this to implement custom extraction logic (e.g., LLM-based summarization).
 #[async_trait::async_trait]
 pub trait ExperienceExtractor: Send + Sync {
     /// Extract experiences from a completed agent conversation.
@@ -91,6 +100,7 @@ pub trait ExperienceExtractor: Send + Sync {
         &self,
         conversation: &[crate::llm::Message],
         outcome: &AgentOutcome,
+        context: &ExtractionContext,
     ) -> Vec<pulsedb::NewExperience>;
 }
 

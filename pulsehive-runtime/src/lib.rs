@@ -4,4 +4,6 @@
 //! intelligence layer, and event streaming.
 
 pub mod agentic_loop;
+pub mod experience;
 pub mod hivemind;
+pub mod perception;

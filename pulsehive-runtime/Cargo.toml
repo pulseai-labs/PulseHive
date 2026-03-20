@@ -7,6 +7,7 @@ repository.workspace = true
 description = "Runtime execution engine for PulseHive multi-agent SDK"
 
 [dependencies]
+async-trait = { workspace = true }
 pulsehive-core = { workspace = true }
 pulsehive-db = { workspace = true }
 tokio = { workspace = true }

@@ -21,7 +21,9 @@ use std::sync::Arc;
 
 use futures::stream;
 use futures_core::Stream;
-use pulsedb::{CollectiveId, Config, PulseDB, PulseDBSubstrate, SubstrateProvider};
+use pulsedb::{
+    CollectiveId, Config, ExperienceId, NewExperience, PulseDB, PulseDBSubstrate, SubstrateProvider,
+};
 use tokio::sync::broadcast;
 
 use pulsehive_core::agent::{AgentDefinition, AgentKind, AgentKindTag};
@@ -87,6 +89,11 @@ impl HiveMind {
         HiveMindBuilder::new()
     }
 
+    /// Access the substrate provider for direct operations.
+    pub fn substrate(&self) -> &dyn SubstrateProvider {
+        self.substrate.as_ref()
+    }
+
     /// Deploy agents to execute tasks. Returns a stream of events.
     ///
     /// Each LLM agent is spawned as a Tokio task running the agentic loop.
@@ -104,7 +111,15 @@ impl HiveMind {
         }
 
         // Get the first task (or create a default one)
-        let task = tasks.into_iter().next().unwrap_or_else(|| Task::new(""));
+        let mut task = tasks.into_iter().next().unwrap_or_else(|| Task::new(""));
+
+        // Ensure the collective exists in the substrate
+        let collective_name = format!("collective-{}", task.collective_id);
+        let collective_id = self
+            .substrate
+            .get_or_create_collective(&collective_name)
+            .await?;
+        task.collective_id = collective_id;
 
         let rx = self.event_bus.subscribe();
 
@@ -114,6 +129,23 @@ impl HiveMind {
 
         // Convert broadcast::Receiver into a Stream
         Ok(Box::pin(BroadcastStream::new(rx)))
+    }
+
+    /// Record an experience in the substrate.
+    ///
+    /// Stores the experience via PulseDB and emits an `ExperienceRecorded` event.
+    /// In Builtin embedding mode, the embedding is computed automatically by PulseDB.
+    ///
+    /// This is the programmatic API — products can call it directly, and the
+    /// agentic loop's Record phase uses it internally.
+    pub async fn record_experience(&self, experience: NewExperience) -> Result<ExperienceId> {
+        let agent_id = experience.source_agent.0.clone();
+        let id = self.substrate.store_experience(experience).await?;
+        self.event_bus.emit(HiveEvent::ExperienceRecorded {
+            experience_id: id,
+            agent_id,
+        });
+        Ok(id)
     }
 
     /// Spawn a single agent as a Tokio task.
@@ -268,7 +300,7 @@ impl HiveMindBuilder {
         let substrate: Arc<dyn SubstrateProvider> = if let Some(s) = self.substrate {
             Arc::from(s)
         } else if let Some(path) = self.substrate_path {
-            let db = PulseDB::open(&path, Config::default())?;
+            let db = PulseDB::open(&path, Config::with_builtin_embeddings())?;
             Arc::new(PulseDBSubstrate::from_db(db))
         } else {
             return Err(PulseHiveError::config(
@@ -333,5 +365,84 @@ mod tests {
         let cid = CollectiveId::new();
         let task = Task::with_collective("Search for bugs", cid);
         assert_eq!(task.collective_id, cid);
+    }
+
+    /// Helper: create a HiveMind with Builtin embeddings and a collective for testing.
+    async fn build_hive_with_collective() -> (HiveMind, CollectiveId) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        // Leak tempdir so it lives long enough
+        let dir = Box::leak(Box::new(dir));
+        let _ = dir;
+        let hive = HiveMind::builder().substrate_path(&path).build().unwrap();
+        // Create collective via SubstrateProvider trait (no raw PulseDB needed!)
+        let cid = hive
+            .substrate
+            .get_or_create_collective("test")
+            .await
+            .unwrap();
+        (hive, cid)
+    }
+
+    #[tokio::test]
+    async fn test_record_experience_stores_and_emits_event() {
+        let (hive, cid) = build_hive_with_collective().await;
+        let mut rx = hive.event_bus.subscribe();
+
+        let exp = pulsedb::NewExperience {
+            collective_id: cid,
+            content: "Learned that Rust's ownership model prevents data races.".into(),
+            experience_type: pulsedb::ExperienceType::Generic {
+                category: Some("rust".into()),
+            },
+            embedding: None, // Builtin embeddings auto-compute
+            importance: 0.8,
+            confidence: 0.9,
+            domain: vec!["rust".into(), "concurrency".into()],
+            source_agent: pulsedb::AgentId("test-agent".into()),
+            source_task: None,
+            related_files: vec![],
+        };
+
+        let id = hive.record_experience(exp).await.unwrap();
+
+        // Verify event emitted
+        let event = rx.try_recv().unwrap();
+        match event {
+            HiveEvent::ExperienceRecorded {
+                experience_id,
+                agent_id,
+            } => {
+                assert_eq!(experience_id, id);
+                assert_eq!(agent_id, "test-agent");
+            }
+            other => panic!("Expected ExperienceRecorded, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_record_experience_retrievable() {
+        let (hive, cid) = build_hive_with_collective().await;
+
+        let exp = pulsedb::NewExperience {
+            collective_id: cid,
+            content: "Test experience for retrieval.".into(),
+            experience_type: pulsedb::ExperienceType::Generic { category: None },
+            embedding: None, // Builtin embeddings auto-compute
+            importance: 0.5,
+            confidence: 0.5,
+            domain: vec![],
+            source_agent: pulsedb::AgentId("agent-1".into()),
+            source_task: None,
+            related_files: vec![],
+        };
+
+        let id = hive.record_experience(exp).await.unwrap();
+
+        // Verify retrievable
+        let retrieved = hive.substrate.get_experience(id).await.unwrap();
+        assert!(retrieved.is_some());
+        let retrieved = retrieved.unwrap();
+        assert_eq!(retrieved.content, "Test experience for retrieval.");
     }
 }

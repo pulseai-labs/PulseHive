@@ -57,7 +57,8 @@ pub async fn run_agentic_loop(config: LlmAgentConfig, ctx: LoopContext<'_>) -> A
         .map(|t| ToolDefinition::from_tool(t.as_ref()))
         .collect();
 
-    // 1. PERCEIVE — query substrate through lens (stub for Sprint 2)
+    // 1. PERCEIVE — query substrate through lens
+    tracing::info!(agent_id = %ctx.agent_id, "Perceive phase");
     let context_messages = perceive(
         ctx.substrate.as_ref(),
         &lens,
@@ -84,16 +85,9 @@ pub async fn run_agentic_loop(config: LlmAgentConfig, ctx: LoopContext<'_>) -> A
     )
     .await;
 
-    // 4. RECORD — extract and store experiences (stub for Sprint 2)
-    record(
-        &messages,
-        &outcome,
-        ctx.substrate.as_ref(),
-        experience_extractor.as_deref(),
-        &ctx.event_emitter,
-        &ctx.agent_id,
-    )
-    .await;
+    // 4. RECORD — extract experiences and store in substrate
+    tracing::info!(agent_id = %ctx.agent_id, "Record phase");
+    record(&messages, &outcome, &ctx, experience_extractor.as_deref()).await;
 
     outcome
 }
@@ -108,7 +102,7 @@ async fn think_act_loop(
     ctx: &LoopContext<'_>,
 ) -> AgentOutcome {
     for iteration in 1..=ctx.max_iterations {
-        tracing::debug!(agent_id = %agent_id, iteration = iteration, "Think phase");
+        tracing::info!(agent_id = %agent_id, iteration = iteration, model = %llm_config.model, "Think phase");
 
         // ── THINK: call LLM ──────────────────────────────────────────
         ctx.event_emitter.emit(HiveEvent::LlmCallStarted {
@@ -159,6 +153,7 @@ async fn think_act_loop(
         ));
 
         for tool_call in &response.tool_calls {
+            tracing::info!(agent_id = %agent_id, tool = %tool_call.name, "Act phase");
             let result = execute_tool_call(
                 agent_id,
                 tool_call,
@@ -285,14 +280,9 @@ async fn execute_tool_inner(
     result
 }
 
-// ── Perceive Phase (Stub — Sprint 2) ────────────────────────────────
+// ── Perceive Phase ───────────────────────────────────────────────────
 
-/// Query the substrate through the agent's lens to build context.
-///
-/// **Sprint 2 stub**: Returns empty context. Full lens perception pipeline
-/// (embedding warping, search, re-ranking, intrinsic knowledge formatting)
-/// is implemented in Sprint 3.
-#[allow(unused_variables)]
+/// Query the substrate through the agent's lens and format as intrinsic knowledge.
 async fn perceive(
     substrate: &dyn SubstrateProvider,
     lens: &Lens,
@@ -300,30 +290,82 @@ async fn perceive(
     event_emitter: &EventEmitter,
     agent_id: &str,
 ) -> Vec<Message> {
+    use crate::perception;
+
+    let (candidates, activities) = match perception::query_substrate(
+        substrate,
+        lens,
+        task.collective_id,
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(e) => {
+            tracing::warn!(agent_id = %agent_id, error = %e, "Perception query failed, continuing without context");
+            (vec![], vec![])
+        }
+    };
+
+    let ranked = perception::rerank(candidates, lens);
+    let experiences: Vec<pulsedb::Experience> =
+        ranked.into_iter().map(|(exp, _score)| exp).collect();
+
     event_emitter.emit(HiveEvent::SubstratePerceived {
         agent_id: agent_id.to_string(),
-        experience_count: 0,
-        insight_count: 0,
+        experience_count: experiences.len(),
+        insight_count: 0, // Insights added in Phase 2
     });
-    vec![]
+
+    perception::format_as_intrinsic_knowledge(&experiences, &activities)
 }
 
-// ── Record Phase (Stub — Sprint 2) ──────────────────────────────────
+// ── Record Phase ─────────────────────────────────────────────────────
 
 /// Extract experiences from the conversation and store in substrate.
-///
-/// **Sprint 2 stub**: No-op. Full experience extraction is implemented
-/// in Sprint 3 via the `ExperienceExtractor` trait.
-#[allow(unused_variables)]
 async fn record(
     conversation: &[Message],
     outcome: &AgentOutcome,
-    substrate: &dyn SubstrateProvider,
+    ctx: &LoopContext<'_>,
     extractor: Option<&dyn ExperienceExtractor>,
-    event_emitter: &EventEmitter,
-    agent_id: &str,
 ) {
-    tracing::debug!(agent_id = %agent_id, "Record phase stub — no experiences recorded (Sprint 3)");
+    use crate::experience::DefaultExperienceExtractor;
+    use pulsehive_core::agent::ExtractionContext;
+
+    let extraction_ctx = ExtractionContext {
+        agent_id: ctx.agent_id.clone(),
+        collective_id: ctx.task.collective_id,
+        task_description: ctx.task.description.clone(),
+    };
+
+    let default_extractor = DefaultExperienceExtractor;
+    let extractor: &dyn ExperienceExtractor = extractor.unwrap_or(&default_extractor);
+
+    let experiences = extractor
+        .extract(conversation, outcome, &extraction_ctx)
+        .await;
+
+    let count = experiences.len();
+    for exp in experiences {
+        match ctx.substrate.store_experience(exp).await {
+            Ok(id) => {
+                ctx.event_emitter.emit(HiveEvent::ExperienceRecorded {
+                    experience_id: id,
+                    agent_id: ctx.agent_id.clone(),
+                });
+            }
+            Err(e) => {
+                tracing::warn!(
+                    agent_id = %ctx.agent_id,
+                    error = %e,
+                    "Failed to store experience"
+                );
+            }
+        }
+    }
+
+    if count > 0 {
+        tracing::debug!(agent_id = %ctx.agent_id, count = count, "Recorded experiences");
+    }
 }
 
 #[cfg(test)]
