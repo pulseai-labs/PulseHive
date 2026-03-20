@@ -57,7 +57,8 @@ pub async fn run_agentic_loop(config: LlmAgentConfig, ctx: LoopContext<'_>) -> A
         .map(|t| ToolDefinition::from_tool(t.as_ref()))
         .collect();
 
-    // 1. PERCEIVE — query substrate through lens (stub for Sprint 2)
+    // 1. PERCEIVE — query substrate through lens
+    tracing::info!(agent_id = %ctx.agent_id, "Perceive phase");
     let context_messages = perceive(
         ctx.substrate.as_ref(),
         &lens,
@@ -85,6 +86,7 @@ pub async fn run_agentic_loop(config: LlmAgentConfig, ctx: LoopContext<'_>) -> A
     .await;
 
     // 4. RECORD — extract experiences and store in substrate
+    tracing::info!(agent_id = %ctx.agent_id, "Record phase");
     record(&messages, &outcome, &ctx, experience_extractor.as_deref()).await;
 
     outcome
@@ -100,7 +102,7 @@ async fn think_act_loop(
     ctx: &LoopContext<'_>,
 ) -> AgentOutcome {
     for iteration in 1..=ctx.max_iterations {
-        tracing::debug!(agent_id = %agent_id, iteration = iteration, "Think phase");
+        tracing::info!(agent_id = %agent_id, iteration = iteration, model = %llm_config.model, "Think phase");
 
         // ── THINK: call LLM ──────────────────────────────────────────
         ctx.event_emitter.emit(HiveEvent::LlmCallStarted {
@@ -151,6 +153,7 @@ async fn think_act_loop(
         ));
 
         for tool_call in &response.tool_calls {
+            tracing::info!(agent_id = %agent_id, tool = %tool_call.name, "Act phase");
             let result = execute_tool_call(
                 agent_id,
                 tool_call,

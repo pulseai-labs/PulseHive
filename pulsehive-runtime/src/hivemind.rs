@@ -89,6 +89,11 @@ impl HiveMind {
         HiveMindBuilder::new()
     }
 
+    /// Access the substrate provider for direct operations.
+    pub fn substrate(&self) -> &dyn SubstrateProvider {
+        self.substrate.as_ref()
+    }
+
     /// Deploy agents to execute tasks. Returns a stream of events.
     ///
     /// Each LLM agent is spawned as a Tokio task running the agentic loop.

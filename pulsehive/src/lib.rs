@@ -23,6 +23,7 @@
 pub use pulsehive_core::*;
 
 // Re-export runtime types at top level for convenience
+pub use pulsehive_runtime::experience::DefaultExperienceExtractor;
 pub use pulsehive_runtime::hivemind::{HiveMind, HiveMindBuilder, Task};
 
 // Feature-gated provider re-exports
