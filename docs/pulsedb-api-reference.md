@@ -1,7 +1,7 @@
 # PulseDB API Reference for PulseHive
 
 > **Crate**: `pulsehive-db` (import as `use pulsedb::...`)
-> **Version**: 0.1.1
+> **Version**: 0.2.1
 > **docs.rs**: https://docs.rs/pulsehive-db
 
 This is a concise reference of PulseDB's public API surface relevant to PulseHive development. For full documentation, see docs.rs.
@@ -39,6 +39,11 @@ pub trait SubstrateProvider: Send + Sync {
 
     // Real-time watch
     async fn watch(&self, collective: CollectiveId) -> Result<Pin<Box<dyn Stream<Item = WatchEvent> + Send>>>;
+
+    // Collective lifecycle (added in v0.2.0)
+    async fn create_collective(&self, name: &str) -> Result<CollectiveId>;
+    async fn get_or_create_collective(&self, name: &str) -> Result<CollectiveId>;  // idempotent, recommended
+    async fn list_collectives(&self) -> Result<Vec<Collective>>;
 }
 ```
 
