@@ -79,6 +79,15 @@ pub struct LlmAgentConfig {
     /// Optional override for experience extraction logic.
     /// `None` uses the framework's default extractor.
     pub experience_extractor: Option<Arc<dyn ExperienceExtractor>>,
+
+    /// How often to re-perceive the substrate during the Think→Act loop.
+    ///
+    /// When set to `Some(n)`, the agent re-runs the Perceive phase every `n` tool calls,
+    /// picking up new experiences recorded by other agents in the same collective.
+    /// This enables real-time "shared consciousness" in parallel workflows.
+    ///
+    /// `None` disables mid-task refresh (perceive only once at start).
+    pub refresh_every_n_tool_calls: Option<usize>,
 }
 
 /// Context passed to the experience extractor during the Record phase.

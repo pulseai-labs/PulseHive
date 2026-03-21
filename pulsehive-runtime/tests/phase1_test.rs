@@ -146,6 +146,7 @@ async fn test_phase1_full_pipeline() {
             lens: Lens::new(["rust", "async"]),
             llm_config: LlmConfig::new("test", "test-model"),
             experience_extractor: None,
+            refresh_every_n_tool_calls: None,
         })),
     };
 

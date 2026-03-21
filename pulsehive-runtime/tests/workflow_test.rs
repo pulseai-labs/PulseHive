@@ -88,6 +88,7 @@ fn llm_agent(name: &str) -> AgentDefinition {
             lens: Lens::default(),
             llm_config: LlmConfig::new("mock", "test-model"),
             experience_extractor: None,
+            refresh_every_n_tool_calls: None,
         })),
     }
 }

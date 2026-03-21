@@ -45,6 +45,7 @@ pub async fn run_agentic_loop(config: LlmAgentConfig, ctx: LoopContext<'_>) -> A
         lens,
         llm_config,
         experience_extractor,
+        refresh_every_n_tool_calls: _, // Used in Ticket #52 (mid-task refresh)
     } = config;
 
     // Build tool lookup map and definitions for LLM
@@ -469,6 +470,7 @@ mod tests {
             lens: pulsehive_core::lens::Lens::default(),
             llm_config: LlmConfig::new("mock", "test-model"),
             experience_extractor: None,
+            refresh_every_n_tool_calls: None,
         }
     }
 

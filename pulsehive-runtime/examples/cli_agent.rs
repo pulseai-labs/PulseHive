@@ -82,6 +82,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             lens: Lens::new(["general"]),
             llm_config: LlmConfig::new("mock", "demo"),
             experience_extractor: None,
+            refresh_every_n_tool_calls: None,
         })),
     };
 

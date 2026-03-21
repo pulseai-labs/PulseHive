@@ -123,7 +123,8 @@ async fn test_agent_records_experience_after_completion() {
             tools: vec![],
             lens: Lens::default(),
             llm_config: LlmConfig::new("mock", "test"),
-            experience_extractor: None, // Uses DefaultExperienceExtractor
+            experience_extractor: None,
+            refresh_every_n_tool_calls: None,
         })),
     };
 
@@ -160,6 +161,7 @@ async fn test_empty_substrate_perception_works() {
             lens: Lens::default(),
             llm_config: LlmConfig::new("mock", "test"),
             experience_extractor: None,
+            refresh_every_n_tool_calls: None,
         })),
     };
 

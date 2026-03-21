@@ -387,6 +387,7 @@ mod tests {
                 lens: Lens::default(),
                 llm_config: LlmConfig::new("mock", "test-model"),
                 experience_extractor: None,
+                refresh_every_n_tool_calls: None,
             })),
         }
     }
@@ -452,6 +453,7 @@ mod tests {
                 lens: Lens::default(),
                 llm_config: LlmConfig::new("nonexistent", "model"),
                 experience_extractor: None,
+                refresh_every_n_tool_calls: None,
             })),
         };
 
