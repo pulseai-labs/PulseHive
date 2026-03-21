@@ -98,6 +98,8 @@ async fn run_sequential(
     children: Vec<AgentDefinition>,
     ctx: &WorkflowContext,
 ) -> AgentOutcome {
+    tracing::info!(child_count = children.len(), "Sequential workflow started");
+
     if children.is_empty() {
         return AgentOutcome::Complete {
             response: String::new(),
@@ -134,6 +136,8 @@ async fn run_parallel(
     children: Vec<AgentDefinition>,
     ctx: &WorkflowContext,
 ) -> AgentOutcome {
+    tracing::info!(child_count = children.len(), "Parallel workflow started");
+
     if children.is_empty() {
         return AgentOutcome::Complete {
             response: String::new(),
@@ -197,6 +201,8 @@ async fn run_loop(
     max_iterations: usize,
     ctx: &WorkflowContext,
 ) -> AgentOutcome {
+    tracing::info!(max_iterations, "Loop workflow started");
+
     if max_iterations == 0 {
         tracing::warn!("Loop with max_iterations=0, returning immediately");
         return AgentOutcome::Complete {
@@ -822,6 +828,63 @@ mod tests {
         assert!(
             matches!(&outcome, AgentOutcome::Complete { response } if response == "Iter 3"),
             "Loop should return last iteration's response, got: {outcome:?}"
+        );
+    }
+
+    // ── Ticket #50: Edge cases ───────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_single_child_sequential() {
+        let provider = MockLlm::new(vec![MockLlm::text_response("Solo")]);
+        let ctx = test_workflow_ctx(provider).await;
+
+        let agent = AgentDefinition {
+            name: "single-seq".into(),
+            kind: AgentKind::Sequential(vec![llm_agent_def("only-child")]),
+        };
+
+        let outcome = dispatch_agent(agent, &ctx).await;
+        assert!(
+            matches!(&outcome, AgentOutcome::Complete { response } if response == "Solo"),
+            "Single-child Sequential should work like running the child directly, got: {outcome:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_single_child_parallel() {
+        let provider = MockLlm::new(vec![MockLlm::text_response("Solo parallel")]);
+        let ctx = test_workflow_ctx(provider).await;
+
+        let agent = AgentDefinition {
+            name: "single-par".into(),
+            kind: AgentKind::Parallel(vec![llm_agent_def("only-child")]),
+        };
+
+        let outcome = dispatch_agent(agent, &ctx).await;
+        assert!(
+            matches!(&outcome, AgentOutcome::Complete { response } if response == "Solo parallel"),
+            "Single-child Parallel should work, got: {outcome:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_deep_nesting_no_stack_overflow() {
+        // 5 levels deep: Sequential(Sequential(Sequential(Sequential(Sequential(Llm)))))
+        let provider = MockLlm::new(vec![MockLlm::text_response("Deep!")]);
+        let ctx = test_workflow_ctx(provider).await;
+
+        let mut agent = llm_agent_def("leaf");
+        for i in 0..5 {
+            agent = AgentDefinition {
+                name: format!("level-{i}"),
+                kind: AgentKind::Sequential(vec![agent]),
+            };
+        }
+
+        let outcome = dispatch_agent(agent, &ctx).await;
+        assert!(
+            matches!(&outcome, AgentOutcome::Complete { response } if response == "Deep!"),
+            "5-level nesting should work without stack overflow, got: {outcome:?}"
         );
     }
 }
