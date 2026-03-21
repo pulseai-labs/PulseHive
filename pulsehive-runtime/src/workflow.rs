@@ -71,9 +71,9 @@ pub(crate) fn dispatch_agent(
         AgentKind::Llm(config) => run_llm_agent(&agent_id, *config, ctx).await,
         AgentKind::Sequential(children) => run_sequential(children, ctx).await,
         AgentKind::Parallel(children) => run_parallel(children, ctx).await,
-        AgentKind::Loop { .. } => AgentOutcome::Error {
-            error: "Loop workflow not yet implemented (coming in Ticket #45)".into(),
-        },
+        AgentKind::Loop { agent, max_iterations } => {
+            run_loop(*agent, max_iterations, ctx).await
+        }
     };
 
     // Emit lifecycle completion event
@@ -176,6 +176,55 @@ async fn run_parallel(
             response: responses.join("\n"),
         }
     }
+}
+
+/// Completion signal: if a child agent's response contains this string,
+/// the loop terminates early. This is a convention — the LLM is instructed
+/// to include `[LOOP_DONE]` when it's satisfied with the result.
+const LOOP_DONE_SIGNAL: &str = "[LOOP_DONE]";
+
+/// Execute a child agent repeatedly up to `max_iterations` times.
+///
+/// Each iteration clones the child definition (cheap: Arc bumps for tools)
+/// and dispatches it. The loop terminates early if:
+/// - The child's response contains `[LOOP_DONE]`
+/// - The child returns an error
+///
+/// Each iteration perceives cumulative experiences from all prior iterations
+/// via the shared substrate.
+async fn run_loop(
+    child: AgentDefinition,
+    max_iterations: usize,
+    ctx: &WorkflowContext,
+) -> AgentOutcome {
+    if max_iterations == 0 {
+        tracing::warn!("Loop with max_iterations=0, returning immediately");
+        return AgentOutcome::Complete {
+            response: String::new(),
+        };
+    }
+
+    let mut last_outcome = AgentOutcome::MaxIterationsReached;
+    for i in 0..max_iterations {
+        tracing::info!(iteration = i + 1, max = max_iterations, "Loop: starting iteration");
+        let outcome = dispatch_agent(child.clone(), ctx).await;
+
+        match &outcome {
+            AgentOutcome::Complete { response } if response.contains(LOOP_DONE_SIGNAL) => {
+                tracing::info!(iteration = i + 1, "Loop: completion signal received");
+                last_outcome = outcome;
+                break;
+            }
+            AgentOutcome::Error { .. } => {
+                tracing::warn!(iteration = i + 1, "Loop: child errored, stopping");
+                return outcome;
+            }
+            _ => {
+                last_outcome = outcome;
+            }
+        }
+    }
+    last_outcome
 }
 
 /// Execute an LLM agent through the agentic loop.
@@ -542,6 +591,98 @@ mod tests {
         assert!(
             matches!(&outcome, AgentOutcome::Error { .. }),
             "Parallel with one error should return Error, got: {outcome:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_loop_zero_iterations() {
+        let provider = MockLlm::new(vec![]);
+        let ctx = test_workflow_ctx(provider).await;
+
+        let agent = AgentDefinition {
+            name: "loop-0".into(),
+            kind: AgentKind::Loop {
+                agent: Box::new(llm_agent_def("child")),
+                max_iterations: 0,
+            },
+        };
+
+        let outcome = dispatch_agent(agent, &ctx).await;
+        assert!(
+            matches!(&outcome, AgentOutcome::Complete { response } if response.is_empty()),
+            "Loop with 0 iterations should return Complete empty, got: {outcome:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_loop_runs_n_times() {
+        let provider = MockLlm::new(vec![
+            MockLlm::text_response("Iteration 1"),
+            MockLlm::text_response("Iteration 2"),
+        ]);
+        let ctx = test_workflow_ctx(provider).await;
+
+        let agent = AgentDefinition {
+            name: "loop-2".into(),
+            kind: AgentKind::Loop {
+                agent: Box::new(llm_agent_def("worker")),
+                max_iterations: 2,
+            },
+        };
+
+        let outcome = dispatch_agent(agent, &ctx).await;
+        // After 2 iterations without [LOOP_DONE], returns MaxIterationsReached
+        // But since both completed successfully, last_outcome = last Complete
+        assert!(
+            matches!(&outcome, AgentOutcome::Complete { response } if response == "Iteration 2"),
+            "Loop should return last iteration's response, got: {outcome:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_loop_early_exit_on_done_signal() {
+        let provider = MockLlm::new(vec![
+            MockLlm::text_response("Still working..."),
+            MockLlm::text_response("All done [LOOP_DONE]"),
+            MockLlm::text_response("Should not reach this"),
+        ]);
+        let ctx = test_workflow_ctx(provider).await;
+
+        let agent = AgentDefinition {
+            name: "loop-done".into(),
+            kind: AgentKind::Loop {
+                agent: Box::new(llm_agent_def("worker")),
+                max_iterations: 5,
+            },
+        };
+
+        let outcome = dispatch_agent(agent, &ctx).await;
+        assert!(
+            matches!(&outcome, AgentOutcome::Complete { response } if response.contains("[LOOP_DONE]")),
+            "Loop should exit on LOOP_DONE signal, got: {outcome:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_loop_error_stops() {
+        // One response, then error (no more responses)
+        let provider = MockLlm::new(vec![
+            MockLlm::text_response("First iteration ok"),
+        ]);
+        let ctx = test_workflow_ctx(provider).await;
+
+        let agent = AgentDefinition {
+            name: "loop-err".into(),
+            kind: AgentKind::Loop {
+                agent: Box::new(llm_agent_def("worker")),
+                max_iterations: 5,
+            },
+        };
+
+        let outcome = dispatch_agent(agent, &ctx).await;
+        assert!(
+            matches!(&outcome, AgentOutcome::Error { .. }),
+            "Loop should stop on error, got: {outcome:?}"
         );
     }
 }
