@@ -70,9 +70,7 @@ pub(crate) fn dispatch_agent(
     let outcome = match agent.kind {
         AgentKind::Llm(config) => run_llm_agent(&agent_id, *config, ctx).await,
         AgentKind::Sequential(children) => run_sequential(children, ctx).await,
-        AgentKind::Parallel(_) => AgentOutcome::Error {
-            error: "Parallel workflow not yet implemented (coming in Ticket #44)".into(),
-        },
+        AgentKind::Parallel(children) => run_parallel(children, ctx).await,
         AgentKind::Loop { .. } => AgentOutcome::Error {
             error: "Loop workflow not yet implemented (coming in Ticket #45)".into(),
         },
@@ -121,6 +119,62 @@ async fn run_sequential(
     }
     AgentOutcome::Complete {
         response: last_response,
+    }
+}
+
+/// Execute child agents in parallel — all spawned as concurrent Tokio tasks.
+///
+/// Children share the substrate (via `Arc`) and can perceive each other's
+/// experiences as they're written. Each child gets a cloned `WorkflowContext`
+/// (cheap: just Arc reference count bumps).
+///
+/// Returns combined responses on success. If any child errors, reports all
+/// errors but still waits for all children to complete (no early cancellation).
+async fn run_parallel(
+    children: Vec<AgentDefinition>,
+    ctx: &WorkflowContext,
+) -> AgentOutcome {
+    if children.is_empty() {
+        return AgentOutcome::Complete {
+            response: String::new(),
+        };
+    }
+
+    let child_count = children.len();
+    tracing::info!(child_count, "Parallel: spawning children");
+
+    let mut join_set = tokio::task::JoinSet::new();
+    for child in children {
+        let child_ctx = ctx.clone();
+        join_set.spawn(async move {
+            dispatch_agent(child, &child_ctx).await
+        });
+    }
+
+    let mut responses = Vec::new();
+    let mut errors = Vec::new();
+    while let Some(result) = join_set.join_next().await {
+        match result {
+            Ok(AgentOutcome::Complete { response }) => {
+                responses.push(response);
+            }
+            Ok(outcome) => {
+                errors.push(format!("{outcome:?}"));
+            }
+            Err(join_err) => {
+                errors.push(format!("Task panic: {join_err}"));
+            }
+        }
+    }
+
+    if !errors.is_empty() {
+        AgentOutcome::Error {
+            error: errors.join("; "),
+        }
+    } else {
+        AgentOutcome::Complete {
+            response: responses.join("\n"),
+        }
     }
 }
 
@@ -420,5 +474,74 @@ mod tests {
         let provider = MockLlm::new(vec![]);
         let ctx = test_workflow_ctx(provider).await;
         let _cloned = ctx.clone(); // Compile-time proof that Clone works
+    }
+
+    #[tokio::test]
+    async fn test_parallel_empty_children() {
+        let provider = MockLlm::new(vec![]);
+        let ctx = test_workflow_ctx(provider).await;
+
+        let agent = AgentDefinition {
+            name: "par".into(),
+            kind: AgentKind::Parallel(vec![]),
+        };
+
+        let outcome = dispatch_agent(agent, &ctx).await;
+        assert!(
+            matches!(&outcome, AgentOutcome::Complete { response } if response.is_empty()),
+            "Empty Parallel should return Complete with empty response, got: {outcome:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_parallel_two_children_both_complete() {
+        let provider = MockLlm::new(vec![
+            MockLlm::text_response("Alpha result"),
+            MockLlm::text_response("Beta result"),
+        ]);
+        let ctx = test_workflow_ctx(provider).await;
+
+        let agent = AgentDefinition {
+            name: "par".into(),
+            kind: AgentKind::Parallel(vec![
+                llm_agent_def("alpha"),
+                llm_agent_def("beta"),
+            ]),
+        };
+
+        let outcome = dispatch_agent(agent, &ctx).await;
+        match &outcome {
+            AgentOutcome::Complete { response } => {
+                // Both responses should appear (order may vary due to concurrency)
+                assert!(
+                    response.contains("result"),
+                    "Should contain child responses, got: {response}"
+                );
+            }
+            other => panic!("Expected Complete, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_parallel_one_error_reports_all() {
+        // Only one response — one child succeeds, other errors
+        let provider = MockLlm::new(vec![
+            MockLlm::text_response("I succeeded"),
+        ]);
+        let ctx = test_workflow_ctx(provider).await;
+
+        let agent = AgentDefinition {
+            name: "par-err".into(),
+            kind: AgentKind::Parallel(vec![
+                llm_agent_def("will-succeed"),
+                llm_agent_def("will-error"),
+            ]),
+        };
+
+        let outcome = dispatch_agent(agent, &ctx).await;
+        assert!(
+            matches!(&outcome, AgentOutcome::Error { .. }),
+            "Parallel with one error should return Error, got: {outcome:?}"
+        );
     }
 }
