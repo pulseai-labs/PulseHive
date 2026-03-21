@@ -1,0 +1,340 @@
+// Allow dead code until HiveMind is wired to dispatch_agent in Ticket #42.
+#![allow(dead_code)]
+
+//! Workflow execution engine — Sequential, Parallel, Loop agent orchestration.
+//!
+//! This module provides [`dispatch_agent()`], the central routing function that handles
+//! all [`AgentKind`] variants. LLM agents are dispatched to the agentic loop; workflow
+//! agents will be dispatched to their respective executors in subsequent tickets.
+//!
+//! ## Architecture
+//!
+//! [`WorkflowContext`] carries all shared resources as owned/Arc types (no lifetimes).
+//! This is critical for the Parallel executor which needs to `tokio::spawn` child tasks
+//! (requiring `'static`). When dispatching to the agentic loop, a temporary
+//! [`LoopContext`] is created with borrows scoped to that call.
+
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use pulsedb::SubstrateProvider;
+
+use pulsehive_core::agent::{AgentDefinition, AgentKind, AgentKindTag, AgentOutcome, LlmAgentConfig};
+use pulsehive_core::approval::ApprovalHandler;
+use pulsehive_core::event::{EventBus, HiveEvent};
+use pulsehive_core::llm::LlmProvider;
+
+use crate::agentic_loop::{self, LoopContext, DEFAULT_MAX_ITERATIONS};
+use crate::hivemind::Task;
+
+/// Owned context for workflow execution.
+///
+/// All fields are owned or `Arc`-wrapped, making this `Clone`-able for cheap sharing
+/// across parallel child tasks. Cloning bumps reference counts — no deep copies.
+#[derive(Clone)]
+pub(crate) struct WorkflowContext {
+    /// The task being executed (description + collective ID).
+    pub task: Task,
+    /// Named LLM providers registered with HiveMind.
+    pub llm_providers: HashMap<String, Arc<dyn LlmProvider>>,
+    /// Shared substrate for experience storage and retrieval.
+    pub substrate: Arc<dyn SubstrateProvider>,
+    /// Handler for tool approval requests.
+    pub approval_handler: Arc<dyn ApprovalHandler>,
+    /// Event broadcaster for lifecycle and observability events.
+    pub event_emitter: EventBus,
+}
+
+/// Dispatch an agent to the appropriate executor based on its kind.
+///
+/// This is the central routing function for all agent types:
+/// - `Llm` → agentic loop (Perceive→Think→Act→Record)
+/// - `Sequential` / `Parallel` / `Loop` → workflow executors (not yet implemented)
+///
+/// Each call emits `AgentStarted` and `AgentCompleted` events, enabling
+/// observability at every nesting level.
+pub(crate) async fn dispatch_agent(
+    agent: AgentDefinition,
+    ctx: &WorkflowContext,
+) -> AgentOutcome {
+    let agent_id = uuid::Uuid::now_v7().to_string();
+
+    // Emit lifecycle start event
+    ctx.event_emitter.emit(HiveEvent::AgentStarted {
+        agent_id: agent_id.clone(),
+        name: agent.name.clone(),
+        kind: agent_kind_tag(&agent.kind),
+    });
+
+    let outcome = match agent.kind {
+        AgentKind::Llm(config) => run_llm_agent(&agent_id, *config, ctx).await,
+        AgentKind::Sequential(_) => AgentOutcome::Error {
+            error: "Sequential workflow not yet implemented (coming in Ticket #43)".into(),
+        },
+        AgentKind::Parallel(_) => AgentOutcome::Error {
+            error: "Parallel workflow not yet implemented (coming in Ticket #44)".into(),
+        },
+        AgentKind::Loop { .. } => AgentOutcome::Error {
+            error: "Loop workflow not yet implemented (coming in Ticket #45)".into(),
+        },
+    };
+
+    // Emit lifecycle completion event
+    ctx.event_emitter.emit(HiveEvent::AgentCompleted {
+        agent_id,
+        outcome: outcome.clone(),
+    });
+
+    outcome
+}
+
+/// Execute an LLM agent through the agentic loop.
+///
+/// Resolves the named LLM provider from the context, creates a scoped
+/// [`LoopContext`] with borrowed fields, and delegates to `run_agentic_loop`.
+async fn run_llm_agent(
+    agent_id: &str,
+    config: LlmAgentConfig,
+    ctx: &WorkflowContext,
+) -> AgentOutcome {
+    // Resolve the LLM provider by name
+    let provider_name = &config.llm_config.provider;
+    let provider = match ctx.llm_providers.get(provider_name) {
+        Some(p) => p.clone(),
+        None => {
+            return AgentOutcome::Error {
+                error: format!(
+                    "LLM provider '{}' not registered. Available: {:?}",
+                    provider_name,
+                    ctx.llm_providers.keys().collect::<Vec<_>>()
+                ),
+            };
+        }
+    };
+
+    // Create a scoped LoopContext — borrows from WorkflowContext are local to this call
+    agentic_loop::run_agentic_loop(
+        config,
+        LoopContext {
+            agent_id: agent_id.to_string(),
+            task: &ctx.task,
+            provider,
+            substrate: Arc::clone(&ctx.substrate),
+            approval_handler: ctx.approval_handler.as_ref(),
+            event_emitter: ctx.event_emitter.clone(),
+            max_iterations: DEFAULT_MAX_ITERATIONS,
+        },
+    )
+    .await
+}
+
+/// Extract a compact kind tag from an agent kind (for event reporting).
+fn agent_kind_tag(kind: &AgentKind) -> AgentKindTag {
+    match kind {
+        AgentKind::Llm(_) => AgentKindTag::Llm,
+        AgentKind::Sequential(_) => AgentKindTag::Sequential,
+        AgentKind::Parallel(_) => AgentKindTag::Parallel,
+        AgentKind::Loop { .. } => AgentKindTag::Loop,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    use async_trait::async_trait;
+    use pulsehive_core::lens::Lens;
+    use pulsehive_core::llm::*;
+
+    // ── Mock LLM ─────────────────────────────────────────────────────
+
+    struct MockLlm {
+        responses: Mutex<Vec<LlmResponse>>,
+    }
+
+    impl MockLlm {
+        fn new(responses: Vec<LlmResponse>) -> Self {
+            Self {
+                responses: Mutex::new(responses),
+            }
+        }
+
+        fn text_response(content: &str) -> LlmResponse {
+            LlmResponse {
+                content: Some(content.into()),
+                tool_calls: vec![],
+                usage: TokenUsage::default(),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl LlmProvider for MockLlm {
+        async fn chat(
+            &self,
+            _messages: Vec<Message>,
+            _tools: Vec<ToolDefinition>,
+            _config: &LlmConfig,
+        ) -> pulsehive_core::error::Result<LlmResponse> {
+            let mut responses = self.responses.lock().unwrap();
+            if responses.is_empty() {
+                Err(pulsehive_core::error::PulseHiveError::llm(
+                    "No more scripted responses",
+                ))
+            } else {
+                Ok(responses.remove(0))
+            }
+        }
+
+        async fn chat_stream(
+            &self,
+            _messages: Vec<Message>,
+            _tools: Vec<ToolDefinition>,
+            _config: &LlmConfig,
+        ) -> pulsehive_core::error::Result<
+            std::pin::Pin<Box<dyn futures_core::Stream<Item = pulsehive_core::error::Result<LlmChunk>> + Send>>,
+        > {
+            Err(pulsehive_core::error::PulseHiveError::llm(
+                "Streaming not used in tests",
+            ))
+        }
+    }
+
+    // ── Helpers ──────────────────────────────────────────────────────
+
+    fn test_substrate() -> Arc<dyn SubstrateProvider> {
+        let dir = tempfile::tempdir().unwrap();
+        let db = pulsedb::PulseDB::open(
+            dir.path().join("test.db"),
+            pulsedb::Config::default(),
+        )
+        .unwrap();
+        Box::leak(Box::new(dir));
+        Arc::new(pulsedb::PulseDBSubstrate::from_db(db))
+    }
+
+    async fn test_workflow_ctx(provider: MockLlm) -> WorkflowContext {
+        let substrate = test_substrate();
+        let collective_id = substrate
+            .get_or_create_collective("test-workflow")
+            .await
+            .unwrap();
+
+        let mut providers: HashMap<String, Arc<dyn LlmProvider>> = HashMap::new();
+        providers.insert("mock".into(), Arc::new(provider));
+
+        WorkflowContext {
+            task: Task::with_collective("Test task", collective_id),
+            llm_providers: providers,
+            substrate,
+            approval_handler: Arc::new(pulsehive_core::approval::AutoApprove),
+            event_emitter: EventBus::default(),
+        }
+    }
+
+    fn llm_agent_def(name: &str) -> AgentDefinition {
+        AgentDefinition {
+            name: name.into(),
+            kind: AgentKind::Llm(Box::new(LlmAgentConfig {
+                system_prompt: "You are a test agent.".into(),
+                tools: vec![],
+                lens: Lens::default(),
+                llm_config: LlmConfig::new("mock", "test-model"),
+                experience_extractor: None,
+            })),
+        }
+    }
+
+    // ── Tests ────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_dispatch_llm_agent_completes() {
+        let provider = MockLlm::new(vec![MockLlm::text_response("Hello from dispatch!")]);
+        let ctx = test_workflow_ctx(provider).await;
+
+        let agent = llm_agent_def("test-agent");
+        let outcome = dispatch_agent(agent, &ctx).await;
+
+        assert!(
+            matches!(&outcome, AgentOutcome::Complete { response } if response == "Hello from dispatch!"),
+            "Expected Complete, got: {outcome:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_dispatch_llm_agent_emits_events() {
+        let provider = MockLlm::new(vec![MockLlm::text_response("Done")]);
+        let ctx = test_workflow_ctx(provider).await;
+        let mut rx = ctx.event_emitter.subscribe();
+
+        let agent = llm_agent_def("evented-agent");
+        let _outcome = dispatch_agent(agent, &ctx).await;
+
+        // Collect all events
+        let mut events = vec![];
+        while let Ok(event) = rx.try_recv() {
+            events.push(event);
+        }
+
+        // First event should be AgentStarted
+        assert!(
+            matches!(&events[0], HiveEvent::AgentStarted { name, kind, .. }
+                if name == "evented-agent" && *kind == AgentKindTag::Llm),
+            "Expected AgentStarted, got: {:?}",
+            events.first()
+        );
+
+        // Last event should be AgentCompleted
+        assert!(
+            matches!(events.last(), Some(HiveEvent::AgentCompleted { outcome: AgentOutcome::Complete { .. }, .. })),
+            "Expected AgentCompleted, got: {:?}",
+            events.last()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_dispatch_missing_provider_returns_error() {
+        let provider = MockLlm::new(vec![]);
+        let ctx = test_workflow_ctx(provider).await;
+
+        // Agent uses a provider name that doesn't exist
+        let agent = AgentDefinition {
+            name: "bad-provider".into(),
+            kind: AgentKind::Llm(Box::new(LlmAgentConfig {
+                system_prompt: "test".into(),
+                tools: vec![],
+                lens: Lens::default(),
+                llm_config: LlmConfig::new("nonexistent", "model"),
+                experience_extractor: None,
+            })),
+        };
+
+        let outcome = dispatch_agent(agent, &ctx).await;
+        assert!(
+            matches!(&outcome, AgentOutcome::Error { error } if error.contains("nonexistent")),
+            "Expected provider error, got: {outcome:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_dispatch_sequential_placeholder() {
+        let provider = MockLlm::new(vec![]);
+        let ctx = test_workflow_ctx(provider).await;
+
+        let agent = AgentDefinition {
+            name: "seq".into(),
+            kind: AgentKind::Sequential(vec![]),
+        };
+
+        let outcome = dispatch_agent(agent, &ctx).await;
+        assert!(matches!(&outcome, AgentOutcome::Error { error } if error.contains("Sequential")));
+    }
+
+    #[tokio::test]
+    async fn test_workflow_context_is_clone() {
+        let provider = MockLlm::new(vec![]);
+        let ctx = test_workflow_ctx(provider).await;
+        let _cloned = ctx.clone(); // Compile-time proof that Clone works
+    }
+}
