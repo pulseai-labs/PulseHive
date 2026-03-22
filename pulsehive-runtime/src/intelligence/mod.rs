@@ -6,5 +6,6 @@
 //! 2. **InsightSynthesizer** detects clusters of related experiences and uses an
 //!    LLM to synthesize consolidated insights
 
+pub mod context;
 pub mod insight;
 pub mod relationship;
