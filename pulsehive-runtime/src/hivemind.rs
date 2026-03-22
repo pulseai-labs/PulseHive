@@ -99,6 +99,10 @@ impl HiveMind {
     /// Each agent is spawned as a Tokio task and dispatched via
     /// [`workflow::dispatch_agent()`] which handles all agent kinds
     /// (LLM, Sequential, Parallel, Loop).
+    ///
+    /// Automatically subscribes to the PulseDB Watch system for the collective,
+    /// forwarding substrate change events as [`HiveEvent::WatchNotification`].
+    /// If Watch subscription fails, agents still execute normally (graceful degradation).
     pub async fn deploy(
         &self,
         agents: Vec<AgentDefinition>,

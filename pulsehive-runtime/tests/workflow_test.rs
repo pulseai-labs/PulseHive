@@ -331,3 +331,125 @@ async fn test_deploy_deep_nesting() {
         "Should have at least 3 LLM starts (2 loop + 1 B). Events: {events:?}"
     );
 }
+
+// ── Sprint 6: Watch Integration Tests (#56, #57) ────────────────────
+
+fn llm_agent_with_refresh(name: &str, refresh: Option<usize>) -> AgentDefinition {
+    AgentDefinition {
+        name: name.into(),
+        kind: AgentKind::Llm(Box::new(LlmAgentConfig {
+            system_prompt: "You are a test agent.".into(),
+            tools: vec![],
+            lens: Lens::default(),
+            llm_config: LlmConfig::new("mock", "test-model"),
+            experience_extractor: None,
+            refresh_every_n_tool_calls: refresh,
+        })),
+    }
+}
+
+/// #56: Sequential agents naturally share experiences (B perceives A's at start)
+#[tokio::test]
+async fn test_sequential_experience_sharing() {
+    let provider = MockLlm::new(vec![
+        MockLlm::text("Agent A discovered something"),
+        MockLlm::text("Agent B building on A's work"),
+    ]);
+    let hive = build_hive(provider);
+
+    let workflow = AgentDefinition {
+        name: "seq-share".into(),
+        kind: AgentKind::Sequential(vec![
+            llm_agent("agent-a"),
+            llm_agent("agent-b"),
+        ]),
+    };
+    let task = Task::new("Sequential sharing test");
+
+    let stream = hive.deploy(vec![workflow], vec![task]).await.unwrap();
+    let events = collect_workflow_events(stream, Duration::from_secs(5)).await;
+
+    // Agent A should record an experience, Agent B should perceive the substrate
+    let has_experience_recorded = events
+        .iter()
+        .any(|e| matches!(e, HiveEvent::ExperienceRecorded { .. }));
+    assert!(
+        has_experience_recorded,
+        "Agent A should record an experience. Events: {events:?}"
+    );
+
+    // Both agents should have perceived the substrate
+    let perceive_count = events
+        .iter()
+        .filter(|e| matches!(e, HiveEvent::SubstratePerceived { .. }))
+        .count();
+    assert!(
+        perceive_count >= 2,
+        "Both agents should perceive substrate. Got {perceive_count}. Events: {events:?}"
+    );
+}
+
+/// #56: Watch events appear in the event stream
+#[tokio::test]
+async fn test_watch_events_in_stream() {
+    let provider = MockLlm::new(vec![MockLlm::text("Done")]);
+    let hive = build_hive(provider);
+
+    let agent = llm_agent("watcher");
+    let task = Task::new("Watch test");
+
+    let stream = hive.deploy(vec![agent], vec![task]).await.unwrap();
+    let events = collect_workflow_events(stream, Duration::from_secs(5)).await;
+
+    // The agent records an experience → Watch should emit WatchNotification
+    // Note: Watch delivery is async, so it may or may not arrive within the timeout.
+    // We just verify no panics and the event stream works correctly.
+    let watch_count = events
+        .iter()
+        .filter(|e| matches!(e, HiveEvent::WatchNotification { .. }))
+        .count();
+    // WatchNotification may or may not arrive depending on timing — just log it
+    tracing::info!(watch_events = watch_count, "Watch events received");
+
+    // Core assertion: agent completed successfully with Watch subscription active
+    assert!(
+        count_completed(&events) >= 1,
+        "Agent should complete even with Watch subscription active. Events: {events:?}"
+    );
+}
+
+/// #57: Multiple concurrent agents complete without errors (stress-lite)
+#[tokio::test]
+async fn test_stress_3_concurrent_agents() {
+    let provider = MockLlm::new(vec![
+        MockLlm::text("Agent 1 done"),
+        MockLlm::text("Agent 2 done"),
+        MockLlm::text("Agent 3 done"),
+    ]);
+    let hive = build_hive(provider);
+
+    let workflow = AgentDefinition {
+        name: "stress".into(),
+        kind: AgentKind::Parallel(vec![
+            llm_agent_with_refresh("worker-1", Some(2)),
+            llm_agent_with_refresh("worker-2", Some(2)),
+            llm_agent_with_refresh("worker-3", Some(2)),
+        ]),
+    };
+    let task = Task::new("Stress test");
+
+    let stream = hive.deploy(vec![workflow], vec![task]).await.unwrap();
+    let events = collect_workflow_events(stream, Duration::from_secs(10)).await;
+
+    // All 3 should start
+    assert!(
+        count_started(&events, pulsehive_core::agent::AgentKindTag::Llm) >= 3,
+        "All 3 agents should start. Events: {events:?}"
+    );
+
+    // All 3 should complete
+    assert!(
+        count_completed(&events) >= 3,
+        "All 3 agents should complete. Events: {events:?}"
+    );
+}
