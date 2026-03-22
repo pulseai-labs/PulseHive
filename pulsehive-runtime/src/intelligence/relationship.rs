@@ -5,6 +5,7 @@
 //! ExperienceType pair heuristics (e.g., Difficulty + Solution → Supports).
 
 use pulsedb::{Experience, NewExperienceRelation, RelationType, SubstrateProvider};
+use tracing::Instrument;
 
 /// Configuration for automatic relationship detection.
 #[derive(Debug, Clone)]
@@ -74,6 +75,7 @@ impl RelationshipDetector {
         // Search for top-20 similar experiences
         let similar = match substrate
             .search_similar(experience.collective_id, &experience.embedding, 20)
+            .instrument(tracing::debug_span!("infer_relations", experience_id = %experience.id))
             .await
         {
             Ok(results) => results,

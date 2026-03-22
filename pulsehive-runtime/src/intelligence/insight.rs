@@ -10,6 +10,7 @@ use std::time::Instant;
 
 use pulsedb::{CollectiveId, Experience, ExperienceId, InsightType, NewDerivedInsight, SubstrateProvider};
 use pulsehive_core::llm::{LlmConfig, LlmProvider, Message};
+use tracing::Instrument;
 
 /// Configuration for automatic insight synthesis.
 #[derive(Debug, Clone)]
@@ -124,6 +125,7 @@ impl InsightSynthesizer {
             }
         }
 
+        tracing::debug!(cluster_size = cluster.len(), experience_id = %start_id, "Cluster found");
         cluster
     }
 
@@ -167,7 +169,11 @@ impl InsightSynthesizer {
         ];
 
         // Call LLM for synthesis
-        let response = match provider.chat(messages, vec![], llm_config).await {
+        let response = match provider
+            .chat(messages, vec![], llm_config)
+            .instrument(tracing::debug_span!("synthesize_insight", cluster_size = cluster.len()))
+            .await
+        {
             Ok(r) => r,
             Err(e) => {
                 tracing::warn!(error = %e, "InsightSynthesizer: LLM call failed");

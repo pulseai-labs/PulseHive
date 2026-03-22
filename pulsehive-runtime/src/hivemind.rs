@@ -17,6 +17,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use futures::stream;
@@ -74,6 +75,8 @@ pub struct HiveMind {
     pub(crate) event_bus: EventBus,
     pub(crate) relationship_detector: Option<RelationshipDetector>,
     pub(crate) insight_synthesizer: Option<InsightSynthesizer>,
+    /// Shutdown signal for background tasks (Watch system).
+    shutdown: Arc<AtomicBool>,
 }
 
 impl std::fmt::Debug for HiveMind {
@@ -129,17 +132,24 @@ impl HiveMind {
 
         // Subscribe to Watch system for real-time substrate change notifications.
         // Runs as a background task — failure to subscribe doesn't block deployment.
+        // Respects the shutdown flag for graceful termination.
         let watch_substrate = Arc::clone(&self.substrate);
         let watch_emitter = self.event_bus.clone();
+        let watch_shutdown = Arc::clone(&self.shutdown);
         tokio::spawn(async move {
             match watch_substrate.watch(collective_id).await {
                 Ok(mut watch_stream) => {
-                    while let Some(event) = watch_stream.next().await {
-                        watch_emitter.emit(HiveEvent::WatchNotification {
-                            experience_id: event.experience_id,
-                            collective_id: event.collective_id,
-                            event_type: format!("{:?}", event.event_type),
-                        });
+                    while !watch_shutdown.load(Ordering::Relaxed) {
+                        match watch_stream.next().await {
+                            Some(event) => {
+                                watch_emitter.emit(HiveEvent::WatchNotification {
+                                    experience_id: event.experience_id,
+                                    collective_id: event.collective_id,
+                                    event_type: format!("{:?}", event.event_type),
+                                });
+                            }
+                            None => break,
+                        }
                     }
                 }
                 Err(e) => {
@@ -234,6 +244,51 @@ impl HiveMind {
         Ok(id)
     }
 
+    /// Signal shutdown to all background tasks (Watch system).
+    ///
+    /// Sets the shutdown flag, causing the Watch background task to stop
+    /// after processing its current event. This is non-blocking.
+    pub fn shutdown(&self) {
+        self.shutdown.store(true, Ordering::Relaxed);
+        tracing::info!("HiveMind shutdown signaled");
+    }
+
+    /// Returns true if shutdown has been signaled.
+    pub fn is_shutdown(&self) -> bool {
+        self.shutdown.load(Ordering::Relaxed)
+    }
+
+    /// Redeploy agents on the existing substrate and event bus.
+    ///
+    /// Use this to restart failed agents. Products typically call this when
+    /// they observe `AgentCompleted { outcome: Error { .. } }` on the event stream.
+    ///
+    /// The collective is created/resolved from the task, same as in [`deploy()`].
+    pub async fn redeploy(
+        &self,
+        agents: Vec<AgentDefinition>,
+        task: Task,
+    ) -> Result<()> {
+        if agents.is_empty() {
+            return Ok(());
+        }
+
+        // Ensure the collective exists
+        let mut task = task;
+        let collective_name = format!("collective-{}", task.collective_id);
+        let collective_id = self
+            .substrate
+            .get_or_create_collective(&collective_name)
+            .await?;
+        task.collective_id = collective_id;
+
+        for agent in agents {
+            self.spawn_agent(agent, task.clone());
+        }
+
+        Ok(())
+    }
+
     /// Spawn a single agent as a Tokio task.
     ///
     /// Builds a [`WorkflowContext`] from HiveMind's fields and delegates
@@ -250,6 +305,12 @@ impl HiveMind {
         tokio::spawn(async move {
             workflow::dispatch_agent(agent, &ctx).await;
         });
+    }
+}
+
+impl Drop for HiveMind {
+    fn drop(&mut self) {
+        self.shutdown.store(true, Ordering::Relaxed);
     }
 }
 
@@ -399,6 +460,7 @@ impl HiveMindBuilder {
             event_bus: EventBus::default(),
             relationship_detector,
             insight_synthesizer,
+            shutdown: Arc::new(AtomicBool::new(false)),
         })
     }
 }
@@ -525,5 +587,37 @@ mod tests {
         assert!(retrieved.is_some());
         let retrieved = retrieved.unwrap();
         assert_eq!(retrieved.content, "Test experience for retrieval.");
+    }
+
+    // ── Shutdown & Restart tests ─────────────────────────────────────
+
+    #[test]
+    fn test_shutdown_sets_flag() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        let hive = HiveMind::builder().substrate_path(&path).build().unwrap();
+
+        assert!(!hive.is_shutdown());
+        hive.shutdown();
+        assert!(hive.is_shutdown());
+    }
+
+    #[test]
+    fn test_drop_sets_shutdown_flag() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        let hive = HiveMind::builder().substrate_path(&path).build().unwrap();
+        let shutdown = Arc::clone(&hive.shutdown);
+
+        assert!(!shutdown.load(Ordering::Relaxed));
+        drop(hive);
+        assert!(shutdown.load(Ordering::Relaxed));
+    }
+
+    #[tokio::test]
+    async fn test_redeploy_empty_is_noop() {
+        let (hive, _cid) = build_hive_with_collective().await;
+        let task = Task::new("test");
+        assert!(hive.redeploy(vec![], task).await.is_ok());
     }
 }
