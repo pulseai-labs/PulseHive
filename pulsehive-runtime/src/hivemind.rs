@@ -32,6 +32,7 @@ use pulsehive_core::error::{PulseHiveError, Result};
 use pulsehive_core::event::{EventBus, HiveEvent};
 use pulsehive_core::llm::LlmProvider;
 
+use crate::intelligence::insight::InsightSynthesizer;
 use crate::intelligence::relationship::RelationshipDetector;
 use crate::workflow::{self, WorkflowContext};
 
@@ -72,6 +73,7 @@ pub struct HiveMind {
     pub(crate) approval_handler: Arc<dyn ApprovalHandler>,
     pub(crate) event_bus: EventBus,
     pub(crate) relationship_detector: Option<RelationshipDetector>,
+    pub(crate) insight_synthesizer: Option<InsightSynthesizer>,
 }
 
 impl std::fmt::Debug for HiveMind {
@@ -159,11 +161,11 @@ impl HiveMind {
     /// Record an experience in the substrate.
     ///
     /// Stores the experience via PulseDB, emits an `ExperienceRecorded` event,
-    /// and runs the RelationshipDetector to automatically infer relations with
-    /// existing experiences. Each detected relation is stored and emits a
-    /// `RelationshipInferred` event.
+    /// runs the RelationshipDetector to infer relations, and triggers the
+    /// InsightSynthesizer if a cluster exceeds the density threshold.
     pub async fn record_experience(&self, experience: NewExperience) -> Result<ExperienceId> {
         let agent_id = experience.source_agent.0.clone();
+        let collective_id = experience.collective_id;
         let id = self.substrate.store_experience(experience).await?;
         self.event_bus.emit(HiveEvent::ExperienceRecorded {
             experience_id: id,
@@ -172,7 +174,6 @@ impl HiveMind {
 
         // Run relationship inference if detector is configured
         if let Some(detector) = &self.relationship_detector {
-            // Retrieve the stored experience (with computed embedding)
             if let Ok(Some(stored)) = self.substrate.get_experience(id).await {
                 let relations = detector
                     .infer_relations(&stored, self.substrate.as_ref())
@@ -187,6 +188,43 @@ impl HiveMind {
                         }
                         Err(e) => {
                             tracing::warn!(error = %e, "Failed to store inferred relation");
+                        }
+                    }
+                }
+            }
+        }
+
+        // Run insight synthesis if synthesizer is configured
+        if let Some(synthesizer) = &self.insight_synthesizer {
+            if !synthesizer.is_debounced(collective_id) {
+                let cluster = synthesizer
+                    .find_cluster(id, self.substrate.as_ref())
+                    .await;
+
+                if synthesizer.should_synthesize(cluster.len()) {
+                    // Use the first available LLM provider for synthesis
+                    if let Some((provider_name, provider)) = self.llm_providers.iter().next() {
+                        let llm_config = pulsehive_core::llm::LlmConfig::new(
+                            provider_name,
+                            "default",
+                        );
+                        if let Some(insight) = synthesizer
+                            .synthesize_cluster(&cluster, collective_id, provider.as_ref(), &llm_config)
+                            .await
+                        {
+                            let source_count = insight.source_experience_ids.len();
+                            match self.substrate.store_insight(insight).await {
+                                Ok(insight_id) => {
+                                    synthesizer.mark_synthesized(collective_id);
+                                    self.event_bus.emit(HiveEvent::InsightGenerated {
+                                        insight_id,
+                                        source_count,
+                                    });
+                                }
+                                Err(e) => {
+                                    tracing::warn!(error = %e, "Failed to store synthesized insight");
+                                }
+                            }
                         }
                     }
                 }
@@ -257,6 +295,7 @@ pub struct HiveMindBuilder {
     llm_providers: HashMap<String, Arc<dyn LlmProvider>>,
     approval_handler: Option<Box<dyn ApprovalHandler>>,
     relationship_detector: Option<Option<RelationshipDetector>>,
+    insight_synthesizer: Option<Option<InsightSynthesizer>>,
 }
 
 impl HiveMindBuilder {
@@ -266,7 +305,8 @@ impl HiveMindBuilder {
             substrate_path: None,
             llm_providers: HashMap::new(),
             approval_handler: None,
-            relationship_detector: None, // Will default to Some(defaults) in build()
+            relationship_detector: None,
+            insight_synthesizer: None,
         }
     }
 
@@ -310,6 +350,18 @@ impl HiveMindBuilder {
         self
     }
 
+    /// Set a custom insight synthesizer. Default: enabled with default thresholds.
+    pub fn insight_synthesizer(mut self, synthesizer: InsightSynthesizer) -> Self {
+        self.insight_synthesizer = Some(Some(synthesizer));
+        self
+    }
+
+    /// Disable automatic insight synthesis.
+    pub fn no_insight_synthesizer(mut self) -> Self {
+        self.insight_synthesizer = Some(None);
+        self
+    }
+
     /// Build the HiveMind. Validates that a substrate is configured.
     pub fn build(self) -> Result<HiveMind> {
         let substrate: Arc<dyn SubstrateProvider> = if let Some(s) = self.substrate {
@@ -334,12 +386,19 @@ impl HiveMindBuilder {
             None => Some(RelationshipDetector::with_defaults()),
         };
 
+        // Default: insight synthesizer enabled with default thresholds
+        let insight_synthesizer = match self.insight_synthesizer {
+            Some(explicit) => explicit,
+            None => Some(InsightSynthesizer::with_defaults()),
+        };
+
         Ok(HiveMind {
             substrate,
             llm_providers: self.llm_providers,
             approval_handler: approval,
             event_bus: EventBus::default(),
             relationship_detector,
+            insight_synthesizer,
         })
     }
 }
