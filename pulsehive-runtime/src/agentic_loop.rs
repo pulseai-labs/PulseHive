@@ -734,4 +734,145 @@ mod tests {
             .iter()
             .any(|e| matches!(e, HiveEvent::ToolCallCompleted { .. })));
     }
+
+    // ── Mid-task refresh tests ───────────────────────────────────────
+
+    fn test_config_with_refresh(
+        tools: Vec<Arc<dyn Tool>>,
+        refresh: Option<usize>,
+    ) -> LlmAgentConfig {
+        let mut config = test_config(tools);
+        config.refresh_every_n_tool_calls = refresh;
+        config
+    }
+
+    #[tokio::test]
+    async fn test_refresh_disabled_no_extra_perception() {
+        // 1 tool call + final response, refresh=None → only 1 SubstratePerceived
+        let provider = Arc::new(MockLlm::new(vec![
+            MockLlm::tool_call_response("c1", "echo", serde_json::json!({"text": "a"})),
+            MockLlm::text_response("Done"),
+        ]));
+        let config = test_config_with_refresh(vec![Arc::new(EchoTool)], None);
+        let task = test_task();
+        let substrate = test_substrate();
+        let emitter = EventEmitter::default();
+        let mut rx = emitter.subscribe();
+        let approval = pulsehive_core::approval::AutoApprove;
+
+        let _outcome = run_agentic_loop(
+            config,
+            LoopContext {
+                agent_id: "agent-no-refresh".into(),
+                task: &task,
+                provider,
+                substrate,
+                approval_handler: &approval,
+                event_emitter: emitter,
+                max_iterations: DEFAULT_MAX_ITERATIONS,
+            },
+        )
+        .await;
+
+        let mut events = vec![];
+        while let Ok(e) = rx.try_recv() {
+            events.push(e);
+        }
+
+        let perceive_count = events
+            .iter()
+            .filter(|e| matches!(e, HiveEvent::SubstratePerceived { .. }))
+            .count();
+        assert_eq!(
+            perceive_count, 1,
+            "With refresh=None, should have exactly 1 SubstratePerceived (initial). Got {perceive_count}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_refresh_every_1_triggers_after_tool_call() {
+        // 2 tool calls + final response, refresh=Some(1) → 1 initial + 2 refresh = 3 SubstratePerceived
+        let provider = Arc::new(MockLlm::new(vec![
+            MockLlm::tool_call_response("c1", "echo", serde_json::json!({"text": "a"})),
+            MockLlm::tool_call_response("c2", "echo", serde_json::json!({"text": "b"})),
+            MockLlm::text_response("Done"),
+        ]));
+        let config = test_config_with_refresh(vec![Arc::new(EchoTool)], Some(1));
+        let task = test_task();
+        let substrate = test_substrate();
+        let emitter = EventEmitter::default();
+        let mut rx = emitter.subscribe();
+        let approval = pulsehive_core::approval::AutoApprove;
+
+        let _outcome = run_agentic_loop(
+            config,
+            LoopContext {
+                agent_id: "agent-refresh-1".into(),
+                task: &task,
+                provider,
+                substrate,
+                approval_handler: &approval,
+                event_emitter: emitter,
+                max_iterations: DEFAULT_MAX_ITERATIONS,
+            },
+        )
+        .await;
+
+        let mut events = vec![];
+        while let Ok(e) = rx.try_recv() {
+            events.push(e);
+        }
+
+        let perceive_count = events
+            .iter()
+            .filter(|e| matches!(e, HiveEvent::SubstratePerceived { .. }))
+            .count();
+        assert!(
+            perceive_count >= 3,
+            "With refresh=Some(1) and 2 tool calls, should have >= 3 SubstratePerceived. Got {perceive_count}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_refresh_not_triggered_below_threshold() {
+        // 1 tool call + final response, refresh=Some(10) → only 1 SubstratePerceived (threshold not reached)
+        let provider = Arc::new(MockLlm::new(vec![
+            MockLlm::tool_call_response("c1", "echo", serde_json::json!({"text": "a"})),
+            MockLlm::text_response("Done"),
+        ]));
+        let config = test_config_with_refresh(vec![Arc::new(EchoTool)], Some(10));
+        let task = test_task();
+        let substrate = test_substrate();
+        let emitter = EventEmitter::default();
+        let mut rx = emitter.subscribe();
+        let approval = pulsehive_core::approval::AutoApprove;
+
+        let _outcome = run_agentic_loop(
+            config,
+            LoopContext {
+                agent_id: "agent-high-threshold".into(),
+                task: &task,
+                provider,
+                substrate,
+                approval_handler: &approval,
+                event_emitter: emitter,
+                max_iterations: DEFAULT_MAX_ITERATIONS,
+            },
+        )
+        .await;
+
+        let mut events = vec![];
+        while let Ok(e) = rx.try_recv() {
+            events.push(e);
+        }
+
+        let perceive_count = events
+            .iter()
+            .filter(|e| matches!(e, HiveEvent::SubstratePerceived { .. }))
+            .count();
+        assert_eq!(
+            perceive_count, 1,
+            "With refresh=Some(10) and 1 tool call, should have exactly 1 SubstratePerceived. Got {perceive_count}"
+        );
+    }
 }
