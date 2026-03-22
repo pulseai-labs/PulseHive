@@ -22,6 +22,7 @@ async-trait = { workspace = true }
 criterion = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
+tracing-subscriber = { version = "0.3", features = ["fmt"] }
 
 [[bench]]
 name = "substrate_bench"

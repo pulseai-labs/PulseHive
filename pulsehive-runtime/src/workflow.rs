@@ -15,6 +15,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use pulsedb::SubstrateProvider;
+use tracing::Instrument;
 
 use pulsehive_core::agent::{AgentDefinition, AgentKind, AgentKindTag, AgentOutcome, LlmAgentConfig};
 use pulsehive_core::approval::ApprovalHandler;
@@ -57,6 +58,9 @@ pub(crate) fn dispatch_agent(
     agent: AgentDefinition,
     ctx: &WorkflowContext,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = AgentOutcome> + Send + '_>> {
+    let agent_name = agent.name.clone();
+    let kind_tag = agent_kind_tag(&agent.kind);
+    let span = tracing::info_span!("dispatch_agent", agent_name = %agent_name, kind = ?kind_tag);
     Box::pin(async move {
     let agent_id = uuid::Uuid::now_v7().to_string();
 
@@ -83,7 +87,7 @@ pub(crate) fn dispatch_agent(
     });
 
     outcome
-    }) // Box::pin
+    }.instrument(span)) // Box::pin
 }
 
 /// Execute child agents sequentially — each starts after the previous completes.

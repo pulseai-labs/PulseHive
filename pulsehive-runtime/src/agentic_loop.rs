@@ -10,6 +10,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use pulsedb::SubstrateProvider;
+use tracing::Instrument;
 
 use pulsehive_core::agent::{AgentOutcome, ExperienceExtractor, LlmAgentConfig};
 use pulsehive_core::approval::{ApprovalHandler, ApprovalResult, PendingAction};
@@ -59,7 +60,6 @@ pub async fn run_agentic_loop(config: LlmAgentConfig, ctx: LoopContext<'_>) -> A
         .collect();
 
     // 1. PERCEIVE — query substrate through lens
-    tracing::info!(agent_id = %ctx.agent_id, "Perceive phase");
     let context_messages = perceive(
         ctx.substrate.as_ref(),
         &lens,
@@ -67,6 +67,7 @@ pub async fn run_agentic_loop(config: LlmAgentConfig, ctx: LoopContext<'_>) -> A
         &ctx.event_emitter,
         &ctx.agent_id,
     )
+    .instrument(tracing::info_span!("perceive", agent_id = %ctx.agent_id))
     .await;
 
     // 2. Build initial conversation
@@ -89,8 +90,9 @@ pub async fn run_agentic_loop(config: LlmAgentConfig, ctx: LoopContext<'_>) -> A
     .await;
 
     // 4. RECORD — extract experiences and store in substrate
-    tracing::info!(agent_id = %ctx.agent_id, "Record phase");
-    record(&messages, &outcome, &ctx, experience_extractor.as_deref()).await;
+    record(&messages, &outcome, &ctx, experience_extractor.as_deref())
+        .instrument(tracing::info_span!("record", agent_id = %ctx.agent_id))
+        .await;
 
     outcome
 }
@@ -114,7 +116,13 @@ async fn think_act_loop(
     let mut tool_calls_since_refresh: usize = 0;
 
     for iteration in 1..=ctx.max_iterations {
-        tracing::info!(agent_id = %agent_id, iteration = iteration, model = %llm_config.model, "Think phase");
+        let think_span = tracing::info_span!(
+            "think",
+            agent_id = %agent_id,
+            iteration,
+            model = %llm_config.model,
+            message_count = messages.len(),
+        );
 
         // ── THINK: call LLM ──────────────────────────────────────────
         ctx.event_emitter.emit(HiveEvent::LlmCallStarted {
@@ -127,6 +135,7 @@ async fn think_act_loop(
         let response = ctx
             .provider
             .chat(messages.clone(), tool_defs.to_vec(), llm_config)
+            .instrument(think_span)
             .await;
         let duration_ms = start.elapsed().as_millis() as u64;
 
@@ -165,7 +174,6 @@ async fn think_act_loop(
         ));
 
         for tool_call in &response.tool_calls {
-            tracing::info!(agent_id = %agent_id, tool = %tool_call.name, "Act phase");
             let result = execute_tool_call(
                 agent_id,
                 tool_call,
@@ -175,6 +183,7 @@ async fn think_act_loop(
                 &ctx.event_emitter,
                 &ctx.task.collective_id,
             )
+            .instrument(tracing::info_span!("act", agent_id = %agent_id, tool = %tool_call.name))
             .await;
 
             messages.push(Message::tool_result(&tool_call.id, result.to_content()));
@@ -196,6 +205,7 @@ async fn think_act_loop(
                     &ctx.event_emitter,
                     agent_id,
                 )
+                .instrument(tracing::info_span!("perceive", agent_id = %agent_id, refresh = true))
                 .await;
                 messages.extend(refreshed);
                 tool_calls_since_refresh = 0;
@@ -296,15 +306,20 @@ async fn execute_tool_inner(
         event_emitter: event_emitter.clone(),
     };
 
-    let result = match tool.execute(params, &context).await {
+    let result = match tool
+        .execute(params, &context)
+        .instrument(tracing::debug_span!("tool_execute", tool = %tool_name))
+        .await
+    {
         Ok(result) => result,
         Err(e) => {
-            tracing::warn!(agent_id = %agent_id, tool = %tool_name, error = %e, "Tool execution failed");
+            tracing::warn!(tool = %tool_name, error = %e, "Tool execution failed");
             ToolResult::error(e.to_string())
         }
     };
 
     let duration_ms = start.elapsed().as_millis() as u64;
+    tracing::debug!(tool = %tool_name, duration_ms, "Tool completed");
     event_emitter.emit(HiveEvent::ToolCallCompleted {
         agent_id: agent_id.to_string(),
         tool_name: tool_name.to_string(),

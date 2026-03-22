@@ -7,6 +7,7 @@ use pulsedb::{Activity, CollectiveId, Experience, SubstrateProvider, Timestamp};
 use pulsehive_core::error::Result;
 use pulsehive_core::lens::{ExperienceTypeTag, Lens, RecencyCurve};
 use pulsehive_core::llm::Message;
+use tracing::Instrument;
 
 // ── Query Phase (#24) ────────────────────────────────────────────────
 
@@ -218,9 +219,15 @@ pub async fn assemble_context(
     collective_id: CollectiveId,
     budget: &pulsehive_core::context::ContextBudget,
 ) -> Result<Vec<Message>> {
-    let (candidates, activities) = query_substrate(substrate, lens, collective_id).await?;
+    let (candidates, activities) = query_substrate(substrate, lens, collective_id)
+        .instrument(tracing::debug_span!("query_substrate",
+            mode = if !lens.purpose_embedding.is_empty() { "semantic" } else { "recent" },
+        ))
+        .await?;
+    tracing::debug!(candidate_count = candidates.len(), activity_count = activities.len(), "Substrate queried");
     let ranked = rerank(candidates, lens);
     let packed = pack_within_budget(ranked, budget);
+    tracing::debug!(packed_count = packed.len(), "Context packed");
     Ok(format_as_intrinsic_knowledge(&packed, &activities))
 }
 

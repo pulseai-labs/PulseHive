@@ -42,7 +42,64 @@ pub enum ApprovalResult {
 /// The framework calls [`request_approval`](ApprovalHandler::request_approval)
 /// before executing any tool where `requires_approval()` returns `true`.
 ///
-/// # Example
+/// # Approval Flow
+///
+/// 1. Agent's agentic loop encounters a tool with `requires_approval() == true`
+/// 2. Framework emits `HiveEvent::ToolApprovalRequested` and calls your handler
+/// 3. Handler returns one of:
+///    - [`ApprovalResult::Approved`] — tool executes with original parameters
+///    - [`ApprovalResult::Denied`] — tool is blocked, LLM is informed of the reason
+///    - [`ApprovalResult::Modified`] — tool executes with modified parameters
+///
+/// # CLI Example
+///
+/// Interactive terminal approval with all three outcome paths:
+///
+/// ```rust,ignore
+/// use std::io::{self, Write};
+/// use async_trait::async_trait;
+/// use pulsehive_core::approval::*;
+/// use pulsehive_core::error::Result;
+///
+/// struct CLIApproval;
+///
+/// #[async_trait]
+/// impl ApprovalHandler for CLIApproval {
+///     async fn request_approval(&self, action: &PendingAction) -> Result<ApprovalResult> {
+///         println!("\n--- Approval Required ---");
+///         println!("Agent:  {}", action.agent_id);
+///         println!("Tool:   {}", action.tool_name);
+///         println!("Params: {}", action.params);
+///         println!("Desc:   {}", action.description);
+///         print!("[a]pprove / [d]eny / [m]odify: ");
+///         io::stdout().flush().unwrap();
+///
+///         let mut input = String::new();
+///         io::stdin().read_line(&mut input).unwrap();
+///
+///         match input.trim() {
+///             "a" | "approve" => Ok(ApprovalResult::Approved),
+///             "d" | "deny" => Ok(ApprovalResult::Denied {
+///                 reason: "Operator denied the action".into(),
+///             }),
+///             "m" | "modify" => {
+///                 // Example: force safe_mode on all approved actions
+///                 let mut params = action.params.clone();
+///                 if let Some(obj) = params.as_object_mut() {
+///                     obj.insert("safe_mode".into(), serde_json::Value::Bool(true));
+///                 }
+///                 Ok(ApprovalResult::Modified { new_params: params })
+///             }
+///             _ => Ok(ApprovalResult::Denied {
+///                 reason: "Unrecognized input — defaulting to deny".into(),
+///             }),
+///         }
+///     }
+/// }
+/// ```
+///
+/// # Slack / Webhook Example
+///
 /// ```rust,ignore
 /// struct SlackApproval { channel: String }
 ///
