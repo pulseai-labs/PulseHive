@@ -1,6 +1,20 @@
 # Rust build artifacts
 /target/
+pulsehive-py/target/
 Cargo.lock
+
+# Python artifacts
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+*.whl
+*.so
+*.dylib
+*.pyd
+*.dSYM/
+.venv/
 
 # Private - internal brainstorming and competitive analysis
 discussion.md

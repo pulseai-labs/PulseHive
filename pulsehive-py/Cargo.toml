@@ -1,0 +1,30 @@
+[package]
+name = "pulsehive-py"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Python bindings for PulseHive multi-agent SDK"
+
+[lib]
+name = "pulsehive_py"
+# cdylib for maturin (Python extension), rlib for cargo build/test (workspace compat)
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+pulsehive-core = { workspace = true }
+pulsehive-runtime = { workspace = true }
+pulsehive-openai = { workspace = true }
+pulsehive-anthropic = { workspace = true }
+pyo3 = { workspace = true }
+pyo3-async-runtimes = { version = "0.28", features = ["tokio-runtime"] }
+async-trait = { workspace = true }
+tokio = { workspace = true }
+futures = { workspace = true }
+futures-core = { workspace = true }
+serde_json = { workspace = true }
+
+[features]
+# extension-module is non-default to avoid linker errors in workspace builds.
+# Maturin activates it via pyproject.toml when building the Python wheel.
+extension-module = ["pyo3/extension-module"]
