@@ -148,7 +148,10 @@ fn count_completed(events: &[HiveEvent]) -> usize {
 
 #[tokio::test]
 async fn test_deploy_sequential_workflow() {
-    let provider = MockLlm::new(vec![MockLlm::text("Step 1 done"), MockLlm::text("Step 2 done")]);
+    let provider = MockLlm::new(vec![
+        MockLlm::text("Step 1 done"),
+        MockLlm::text("Step 2 done"),
+    ]);
     let hive = build_hive(provider);
 
     let workflow = AgentDefinition {
@@ -174,7 +177,10 @@ async fn test_deploy_sequential_workflow() {
 
 #[tokio::test]
 async fn test_deploy_parallel_workflow() {
-    let provider = MockLlm::new(vec![MockLlm::text("Alpha done"), MockLlm::text("Beta done")]);
+    let provider = MockLlm::new(vec![
+        MockLlm::text("Alpha done"),
+        MockLlm::text("Beta done"),
+    ]);
     let hive = build_hive(provider);
 
     let workflow = AgentDefinition {
@@ -359,10 +365,7 @@ async fn test_sequential_experience_sharing() {
 
     let workflow = AgentDefinition {
         name: "seq-share".into(),
-        kind: AgentKind::Sequential(vec![
-            llm_agent("agent-a"),
-            llm_agent("agent-b"),
-        ]),
+        kind: AgentKind::Sequential(vec![llm_agent("agent-a"), llm_agent("agent-b")]),
     };
     let task = Task::new("Sequential sharing test");
 

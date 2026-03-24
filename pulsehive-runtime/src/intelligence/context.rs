@@ -4,9 +4,9 @@
 //! context with the priority: insights > high-importance experiences > recent experiences.
 //! This ensures agents receive the most relevant, consolidated knowledge.
 
+use pulsedb::{Activity, DerivedInsight, Experience, Timestamp};
 use pulsehive_core::context::{estimate_tokens, ContextBudget};
 use pulsehive_core::llm::Message;
-use pulsedb::{Activity, DerivedInsight, Experience, Timestamp};
 
 /// Configuration for the context optimizer.
 #[derive(Debug, Clone)]
@@ -144,7 +144,10 @@ impl ContextOptimizer {
                 .iter()
                 .filter_map(|a| {
                     a.current_task.as_ref().map(|task| {
-                        format!("- You're aware that agent {} is working on: {}", a.agent_id, task)
+                        format!(
+                            "- You're aware that agent {} is working on: {}",
+                            a.agent_id, task
+                        )
                     })
                 })
                 .collect();

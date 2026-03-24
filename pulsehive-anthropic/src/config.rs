@@ -75,7 +75,10 @@ mod tests {
     #[test]
     fn test_messages_url() {
         let config = AnthropicConfig::new("sk-test");
-        assert_eq!(config.messages_url(), "https://api.anthropic.com/v1/messages");
+        assert_eq!(
+            config.messages_url(),
+            "https://api.anthropic.com/v1/messages"
+        );
     }
 
     #[test]

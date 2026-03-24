@@ -17,7 +17,9 @@ use std::sync::Arc;
 use pulsedb::SubstrateProvider;
 use tracing::Instrument;
 
-use pulsehive_core::agent::{AgentDefinition, AgentKind, AgentKindTag, AgentOutcome, LlmAgentConfig};
+use pulsehive_core::agent::{
+    AgentDefinition, AgentKind, AgentKindTag, AgentOutcome, LlmAgentConfig,
+};
 use pulsehive_core::approval::ApprovalHandler;
 use pulsehive_core::event::{EventBus, HiveEvent};
 use pulsehive_core::llm::LlmProvider;
@@ -61,33 +63,37 @@ pub(crate) fn dispatch_agent(
     let agent_name = agent.name.clone();
     let kind_tag = agent_kind_tag(&agent.kind);
     let span = tracing::info_span!("dispatch_agent", agent_name = %agent_name, kind = ?kind_tag);
-    Box::pin(async move {
-    let agent_id = uuid::Uuid::now_v7().to_string();
+    Box::pin(
+        async move {
+            let agent_id = uuid::Uuid::now_v7().to_string();
 
-    // Emit lifecycle start event
-    ctx.event_emitter.emit(HiveEvent::AgentStarted {
-        agent_id: agent_id.clone(),
-        name: agent.name.clone(),
-        kind: agent_kind_tag(&agent.kind),
-    });
+            // Emit lifecycle start event
+            ctx.event_emitter.emit(HiveEvent::AgentStarted {
+                agent_id: agent_id.clone(),
+                name: agent.name.clone(),
+                kind: agent_kind_tag(&agent.kind),
+            });
 
-    let outcome = match agent.kind {
-        AgentKind::Llm(config) => run_llm_agent(&agent_id, *config, ctx).await,
-        AgentKind::Sequential(children) => run_sequential(children, ctx).await,
-        AgentKind::Parallel(children) => run_parallel(children, ctx).await,
-        AgentKind::Loop { agent, max_iterations } => {
-            run_loop(*agent, max_iterations, ctx).await
+            let outcome = match agent.kind {
+                AgentKind::Llm(config) => run_llm_agent(&agent_id, *config, ctx).await,
+                AgentKind::Sequential(children) => run_sequential(children, ctx).await,
+                AgentKind::Parallel(children) => run_parallel(children, ctx).await,
+                AgentKind::Loop {
+                    agent,
+                    max_iterations,
+                } => run_loop(*agent, max_iterations, ctx).await,
+            };
+
+            // Emit lifecycle completion event
+            ctx.event_emitter.emit(HiveEvent::AgentCompleted {
+                agent_id,
+                outcome: outcome.clone(),
+            });
+
+            outcome
         }
-    };
-
-    // Emit lifecycle completion event
-    ctx.event_emitter.emit(HiveEvent::AgentCompleted {
-        agent_id,
-        outcome: outcome.clone(),
-    });
-
-    outcome
-    }.instrument(span)) // Box::pin
+        .instrument(span),
+    ) // Box::pin
 }
 
 /// Execute child agents sequentially — each starts after the previous completes.
@@ -98,10 +104,7 @@ pub(crate) fn dispatch_agent(
 ///
 /// Returns the last child's outcome. Stops early on error or `MaxIterationsReached`.
 /// Empty children list returns `Complete` with empty response.
-async fn run_sequential(
-    children: Vec<AgentDefinition>,
-    ctx: &WorkflowContext,
-) -> AgentOutcome {
+async fn run_sequential(children: Vec<AgentDefinition>, ctx: &WorkflowContext) -> AgentOutcome {
     tracing::info!(child_count = children.len(), "Sequential workflow started");
 
     if children.is_empty() {
@@ -136,10 +139,7 @@ async fn run_sequential(
 ///
 /// Returns combined responses on success. If any child errors, reports all
 /// errors but still waits for all children to complete (no early cancellation).
-async fn run_parallel(
-    children: Vec<AgentDefinition>,
-    ctx: &WorkflowContext,
-) -> AgentOutcome {
+async fn run_parallel(children: Vec<AgentDefinition>, ctx: &WorkflowContext) -> AgentOutcome {
     tracing::info!(child_count = children.len(), "Parallel workflow started");
 
     if children.is_empty() {
@@ -154,9 +154,7 @@ async fn run_parallel(
     let mut join_set = tokio::task::JoinSet::new();
     for child in children {
         let child_ctx = ctx.clone();
-        join_set.spawn(async move {
-            dispatch_agent(child, &child_ctx).await
-        });
+        join_set.spawn(async move { dispatch_agent(child, &child_ctx).await });
     }
 
     let mut responses = Vec::new();
@@ -216,7 +214,11 @@ async fn run_loop(
 
     let mut last_outcome = AgentOutcome::MaxIterationsReached;
     for i in 0..max_iterations {
-        tracing::info!(iteration = i + 1, max = max_iterations, "Loop: starting iteration");
+        tracing::info!(
+            iteration = i + 1,
+            max = max_iterations,
+            "Loop: starting iteration"
+        );
         let outcome = dispatch_agent(child.clone(), ctx).await;
 
         match &outcome {
@@ -342,7 +344,11 @@ mod tests {
             _tools: Vec<ToolDefinition>,
             _config: &LlmConfig,
         ) -> pulsehive_core::error::Result<
-            std::pin::Pin<Box<dyn futures_core::Stream<Item = pulsehive_core::error::Result<LlmChunk>> + Send>>,
+            std::pin::Pin<
+                Box<
+                    dyn futures_core::Stream<Item = pulsehive_core::error::Result<LlmChunk>> + Send,
+                >,
+            >,
         > {
             Err(pulsehive_core::error::PulseHiveError::llm(
                 "Streaming not used in tests",
@@ -354,11 +360,8 @@ mod tests {
 
     fn test_substrate() -> Arc<dyn SubstrateProvider> {
         let dir = tempfile::tempdir().unwrap();
-        let db = pulsedb::PulseDB::open(
-            dir.path().join("test.db"),
-            pulsedb::Config::default(),
-        )
-        .unwrap();
+        let db =
+            pulsedb::PulseDB::open(dir.path().join("test.db"), pulsedb::Config::default()).unwrap();
         Box::leak(Box::new(dir));
         Arc::new(pulsedb::PulseDBSubstrate::from_db(db))
     }
@@ -437,7 +440,13 @@ mod tests {
 
         // Last event should be AgentCompleted
         assert!(
-            matches!(events.last(), Some(HiveEvent::AgentCompleted { outcome: AgentOutcome::Complete { .. }, .. })),
+            matches!(
+                events.last(),
+                Some(HiveEvent::AgentCompleted {
+                    outcome: AgentOutcome::Complete { .. },
+                    ..
+                })
+            ),
             "Expected AgentCompleted, got: {:?}",
             events.last()
         );
@@ -495,10 +504,7 @@ mod tests {
 
         let agent = AgentDefinition {
             name: "pipeline".into(),
-            kind: AgentKind::Sequential(vec![
-                llm_agent_def("step-1"),
-                llm_agent_def("step-2"),
-            ]),
+            kind: AgentKind::Sequential(vec![llm_agent_def("step-1"), llm_agent_def("step-2")]),
         };
 
         let outcome = dispatch_agent(agent, &ctx).await;
@@ -564,10 +570,7 @@ mod tests {
 
         let agent = AgentDefinition {
             name: "par".into(),
-            kind: AgentKind::Parallel(vec![
-                llm_agent_def("alpha"),
-                llm_agent_def("beta"),
-            ]),
+            kind: AgentKind::Parallel(vec![llm_agent_def("alpha"), llm_agent_def("beta")]),
         };
 
         let outcome = dispatch_agent(agent, &ctx).await;
@@ -586,9 +589,7 @@ mod tests {
     #[tokio::test]
     async fn test_parallel_one_error_reports_all() {
         // Only one response — one child succeeds, other errors
-        let provider = MockLlm::new(vec![
-            MockLlm::text_response("I succeeded"),
-        ]);
+        let provider = MockLlm::new(vec![MockLlm::text_response("I succeeded")]);
         let ctx = test_workflow_ctx(provider).await;
 
         let agent = AgentDefinition {
@@ -678,9 +679,7 @@ mod tests {
     #[tokio::test]
     async fn test_loop_error_stops() {
         // One response, then error (no more responses)
-        let provider = MockLlm::new(vec![
-            MockLlm::text_response("First iteration ok"),
-        ]);
+        let provider = MockLlm::new(vec![MockLlm::text_response("First iteration ok")]);
         let ctx = test_workflow_ctx(provider).await;
 
         let agent = AgentDefinition {
@@ -711,10 +710,7 @@ mod tests {
 
         let agent = AgentDefinition {
             name: "seq-events".into(),
-            kind: AgentKind::Sequential(vec![
-                llm_agent_def("child-a"),
-                llm_agent_def("child-b"),
-            ]),
+            kind: AgentKind::Sequential(vec![llm_agent_def("child-a"), llm_agent_def("child-b")]),
         };
 
         let _outcome = dispatch_agent(agent, &ctx).await;
@@ -729,7 +725,11 @@ mod tests {
         let started_names: Vec<&str> = events
             .iter()
             .filter_map(|e| match e {
-                HiveEvent::AgentStarted { name, kind: AgentKindTag::Llm, .. } => Some(name.as_str()),
+                HiveEvent::AgentStarted {
+                    name,
+                    kind: AgentKindTag::Llm,
+                    ..
+                } => Some(name.as_str()),
                 _ => None,
             })
             .collect();
@@ -755,10 +755,7 @@ mod tests {
 
         let agent = AgentDefinition {
             name: "par-events".into(),
-            kind: AgentKind::Parallel(vec![
-                llm_agent_def("alpha"),
-                llm_agent_def("beta"),
-            ]),
+            kind: AgentKind::Parallel(vec![llm_agent_def("alpha"), llm_agent_def("beta")]),
         };
 
         let _outcome = dispatch_agent(agent, &ctx).await;
@@ -772,29 +769,48 @@ mod tests {
         let started_names: Vec<&str> = events
             .iter()
             .filter_map(|e| match e {
-                HiveEvent::AgentStarted { name, kind: AgentKindTag::Llm, .. } => Some(name.as_str()),
+                HiveEvent::AgentStarted {
+                    name,
+                    kind: AgentKindTag::Llm,
+                    ..
+                } => Some(name.as_str()),
                 _ => None,
             })
             .collect();
 
-        assert!(started_names.contains(&"alpha"), "alpha should have AgentStarted");
-        assert!(started_names.contains(&"beta"), "beta should have AgentStarted");
+        assert!(
+            started_names.contains(&"alpha"),
+            "alpha should have AgentStarted"
+        );
+        assert!(
+            started_names.contains(&"beta"),
+            "beta should have AgentStarted"
+        );
 
         // Both should have AgentCompleted events
         let completed_count = events
             .iter()
-            .filter(|e| matches!(e, HiveEvent::AgentCompleted { outcome: AgentOutcome::Complete { .. }, .. }))
+            .filter(|e| {
+                matches!(
+                    e,
+                    HiveEvent::AgentCompleted {
+                        outcome: AgentOutcome::Complete { .. },
+                        ..
+                    }
+                )
+            })
             .count();
-        assert!(completed_count >= 2, "Both children should complete, got {completed_count}");
+        assert!(
+            completed_count >= 2,
+            "Both children should complete, got {completed_count}"
+        );
     }
 
     // ── Ticket #48: Loop additional tests ────────────────────────────
 
     #[tokio::test]
     async fn test_loop_single_iteration() {
-        let provider = MockLlm::new(vec![
-            MockLlm::text_response("Only once"),
-        ]);
+        let provider = MockLlm::new(vec![MockLlm::text_response("Only once")]);
         let ctx = test_workflow_ctx(provider).await;
 
         let agent = AgentDefinition {

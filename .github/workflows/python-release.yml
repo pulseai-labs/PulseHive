@@ -40,6 +40,13 @@ jobs:
           target: ${{ matrix.target }}
           args: --release --out dist --manifest-path pulsehive-py/Cargo.toml
           manylinux: auto
+          # Install OpenSSL dev headers in manylinux container (needed by reqwest/native-tls)
+          before-script-linux: |
+            if command -v yum &> /dev/null; then
+              yum install -y openssl-devel perl-IPC-Cmd
+            elif command -v apk &> /dev/null; then
+              apk add openssl-dev perl
+            fi
 
       - name: Upload wheel
         uses: actions/upload-artifact@v4

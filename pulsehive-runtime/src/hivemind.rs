@@ -192,9 +192,8 @@ impl HiveMind {
                 for rel in relations {
                     match self.substrate.store_relation(rel).await {
                         Ok(relation_id) => {
-                            self.event_bus.emit(HiveEvent::RelationshipInferred {
-                                relation_id,
-                            });
+                            self.event_bus
+                                .emit(HiveEvent::RelationshipInferred { relation_id });
                         }
                         Err(e) => {
                             tracing::warn!(error = %e, "Failed to store inferred relation");
@@ -207,19 +206,20 @@ impl HiveMind {
         // Run insight synthesis if synthesizer is configured
         if let Some(synthesizer) = &self.insight_synthesizer {
             if !synthesizer.is_debounced(collective_id) {
-                let cluster = synthesizer
-                    .find_cluster(id, self.substrate.as_ref())
-                    .await;
+                let cluster = synthesizer.find_cluster(id, self.substrate.as_ref()).await;
 
                 if synthesizer.should_synthesize(cluster.len()) {
                     // Use the first available LLM provider for synthesis
                     if let Some((provider_name, provider)) = self.llm_providers.iter().next() {
-                        let llm_config = pulsehive_core::llm::LlmConfig::new(
-                            provider_name,
-                            "default",
-                        );
+                        let llm_config =
+                            pulsehive_core::llm::LlmConfig::new(provider_name, "default");
                         if let Some(insight) = synthesizer
-                            .synthesize_cluster(&cluster, collective_id, provider.as_ref(), &llm_config)
+                            .synthesize_cluster(
+                                &cluster,
+                                collective_id,
+                                provider.as_ref(),
+                                &llm_config,
+                            )
                             .await
                         {
                             let source_count = insight.source_experience_ids.len();
@@ -264,11 +264,7 @@ impl HiveMind {
     /// they observe `AgentCompleted { outcome: Error { .. } }` on the event stream.
     ///
     /// The collective is created/resolved from the task, same as in [`deploy()`].
-    pub async fn redeploy(
-        &self,
-        agents: Vec<AgentDefinition>,
-        task: Task,
-    ) -> Result<()> {
+    pub async fn redeploy(&self, agents: Vec<AgentDefinition>, task: Task) -> Result<()> {
         if agents.is_empty() {
             return Ok(());
         }

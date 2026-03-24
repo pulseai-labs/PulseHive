@@ -267,8 +267,7 @@ impl Tool for PythonToolBridge {
                 .map_err(|e| PulseHiveError::tool(format!("Failed to create context: {e}")))?;
 
             // Call Python execute(params, context)
-            let result = py_tool_ref
-                .call_method1(py, "execute", (params_py, context_py));
+            let result = py_tool_ref.call_method1(py, "execute", (params_py, context_py));
 
             match result {
                 Ok(py_result) => {
@@ -301,12 +300,10 @@ fn convert_python_result(obj: &Bound<'_, PyAny>) -> Result<ToolResult> {
 
     // dict → Json
     if let Ok(dict) = obj.cast::<PyDict>() {
-        let json_str = pythonize_dict(dict).map_err(|e| {
-            PulseHiveError::tool(format!("Failed to serialize dict result: {e}"))
-        })?;
-        let value: Value = serde_json::from_str(&json_str).map_err(|e| {
-            PulseHiveError::tool(format!("Failed to parse JSON: {e}"))
-        })?;
+        let json_str = pythonize_dict(dict)
+            .map_err(|e| PulseHiveError::tool(format!("Failed to serialize dict result: {e}")))?;
+        let value: Value = serde_json::from_str(&json_str)
+            .map_err(|e| PulseHiveError::tool(format!("Failed to parse JSON: {e}")))?;
         return Ok(ToolResult::json(value));
     }
 
@@ -335,9 +332,8 @@ fn pythonize_dict(dict: &Bound<'_, PyDict>) -> PyResult<String> {
 fn python_obj_to_json(py: Python<'_>, obj: &Bound<'_, PyAny>) -> PyResult<Value> {
     let json_mod = py.import("json")?;
     let json_str: String = json_mod.call_method1("dumps", (obj,))?.extract()?;
-    serde_json::from_str(&json_str).map_err(|e| {
-        PyTypeError::new_err(format!("Failed to parse parameters as JSON: {e}"))
-    })
+    serde_json::from_str(&json_str)
+        .map_err(|e| PyTypeError::new_err(format!("Failed to parse parameters as JSON: {e}")))
 }
 
 /// Convert serde_json::Value to a Python object via json.loads.

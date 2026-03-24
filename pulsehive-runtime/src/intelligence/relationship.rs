@@ -92,10 +92,8 @@ impl RelationshipDetector {
                 target.id != experience.id && *similarity >= self.config.auto_threshold
             })
             .map(|(target, similarity)| {
-                let relation_type = classify_relation_type(
-                    &experience.experience_type,
-                    &target.experience_type,
-                );
+                let relation_type =
+                    classify_relation_type(&experience.experience_type, &target.experience_type);
 
                 NewExperienceRelation {
                     source_id: experience.id,
@@ -154,8 +152,14 @@ mod tests {
             approach: "add retry".into(),
             worked: true,
         };
-        assert_eq!(classify_relation_type(&source, &target), RelationType::Supports);
-        assert_eq!(classify_relation_type(&target, &source), RelationType::Supports);
+        assert_eq!(
+            classify_relation_type(&source, &target),
+            RelationType::Supports
+        );
+        assert_eq!(
+            classify_relation_type(&target, &source),
+            RelationType::Supports
+        );
     }
 
     #[test]
@@ -170,7 +174,10 @@ mod tests {
             fix: "circuit breaker".into(),
             prevention: "backoff".into(),
         };
-        assert_eq!(classify_relation_type(&source, &target), RelationType::Supersedes);
+        assert_eq!(
+            classify_relation_type(&source, &target),
+            RelationType::Supersedes
+        );
     }
 
     #[test]
@@ -183,15 +190,24 @@ mod tests {
             technology: "tokio".into(),
             insight: "spawn_blocking for CPU".into(),
         };
-        assert_eq!(classify_relation_type(&source, &target), RelationType::Implies);
-        assert_eq!(classify_relation_type(&target, &source), RelationType::Implies);
+        assert_eq!(
+            classify_relation_type(&source, &target),
+            RelationType::Implies
+        );
+        assert_eq!(
+            classify_relation_type(&target, &source),
+            RelationType::Implies
+        );
     }
 
     #[test]
     fn test_classify_default_related_to() {
         let source = ExperienceType::Generic { category: None };
         let target = ExperienceType::Generic { category: None };
-        assert_eq!(classify_relation_type(&source, &target), RelationType::RelatedTo);
+        assert_eq!(
+            classify_relation_type(&source, &target),
+            RelationType::RelatedTo
+        );
     }
 
     #[test]

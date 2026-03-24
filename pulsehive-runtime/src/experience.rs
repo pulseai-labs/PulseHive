@@ -10,7 +10,6 @@ use pulsedb::{AgentId, ExperienceType, NewExperience, Severity};
 use pulsehive_core::agent::{AgentOutcome, ExperienceExtractor, ExtractionContext};
 use pulsehive_core::llm::Message;
 
-
 /// Default experience extractor using simple rule-based logic.
 ///
 /// Extraction rules:
@@ -260,7 +259,11 @@ mod tests {
             .await;
 
         // Should produce 2 experiences: partial_completion + error
-        assert_eq!(experiences.len(), 2, "Expected 2 experiences (partial + error)");
+        assert_eq!(
+            experiences.len(),
+            2,
+            "Expected 2 experiences (partial + error)"
+        );
 
         // First: partial completion
         assert!(matches!(

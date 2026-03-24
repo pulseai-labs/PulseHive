@@ -220,11 +220,20 @@ pub async fn assemble_context(
     budget: &pulsehive_core::context::ContextBudget,
 ) -> Result<Vec<Message>> {
     let (candidates, activities) = query_substrate(substrate, lens, collective_id)
-        .instrument(tracing::debug_span!("query_substrate",
-            mode = if !lens.purpose_embedding.is_empty() { "semantic" } else { "recent" },
+        .instrument(tracing::debug_span!(
+            "query_substrate",
+            mode = if !lens.purpose_embedding.is_empty() {
+                "semantic"
+            } else {
+                "recent"
+            },
         ))
         .await?;
-    tracing::debug!(candidate_count = candidates.len(), activity_count = activities.len(), "Substrate queried");
+    tracing::debug!(
+        candidate_count = candidates.len(),
+        activity_count = activities.len(),
+        "Substrate queried"
+    );
     let ranked = rerank(candidates, lens);
     let packed = pack_within_budget(ranked, budget);
     tracing::debug!(packed_count = packed.len(), "Context packed");

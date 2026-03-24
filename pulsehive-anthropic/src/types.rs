@@ -9,7 +9,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use pulsehive_core::llm::{Message, ToolCall, ToolDefinition, LlmResponse, TokenUsage};
+use pulsehive_core::llm::{LlmResponse, Message, TokenUsage, ToolCall, ToolDefinition};
 
 // ── Request Types ────────────────────────────────────────────────────
 
@@ -149,9 +149,7 @@ pub fn convert_messages(messages: &[Message]) -> (Option<String>, Vec<AnthropicM
                 if tool_calls.is_empty() {
                     anthropic_msgs.push(AnthropicMessage {
                         role: "assistant".into(),
-                        content: AnthropicContent::Text(
-                            content.clone().unwrap_or_default(),
-                        ),
+                        content: AnthropicContent::Text(content.clone().unwrap_or_default()),
                     });
                 } else {
                     // Assistant with tool calls → content blocks
@@ -222,10 +220,13 @@ pub fn convert_response(response: MessagesResponse) -> LlmResponse {
         Some(text_parts.join(""))
     };
 
-    let usage = response.usage.map(|u| TokenUsage {
-        input_tokens: u.input_tokens,
-        output_tokens: u.output_tokens,
-    }).unwrap_or_default();
+    let usage = response
+        .usage
+        .map(|u| TokenUsage {
+            input_tokens: u.input_tokens,
+            output_tokens: u.output_tokens,
+        })
+        .unwrap_or_default();
 
     LlmResponse {
         content,
@@ -240,10 +241,7 @@ mod tests {
 
     #[test]
     fn test_convert_messages_extracts_system() {
-        let messages = vec![
-            Message::system("You are helpful"),
-            Message::user("Hello"),
-        ];
+        let messages = vec![Message::system("You are helpful"), Message::user("Hello")];
         let (system, msgs) = convert_messages(&messages);
         assert_eq!(system, Some("You are helpful".into()));
         assert_eq!(msgs.len(), 1);
@@ -258,7 +256,9 @@ mod tests {
         assert_eq!(msgs[0].role, "user");
         match &msgs[0].content {
             AnthropicContent::Blocks(blocks) => {
-                assert!(matches!(&blocks[0], ContentBlock::ToolResult { tool_use_id, .. } if tool_use_id == "call_1"));
+                assert!(
+                    matches!(&blocks[0], ContentBlock::ToolResult { tool_use_id, .. } if tool_use_id == "call_1")
+                );
             }
             _ => panic!("Expected Blocks content"),
         }

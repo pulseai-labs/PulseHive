@@ -235,7 +235,9 @@ impl PyHiveMindBuilder {
         }
 
         match builder.build() {
-            Ok(hive) => Ok(PyHiveMind { inner: Arc::new(hive) }),
+            Ok(hive) => Ok(PyHiveMind {
+                inner: Arc::new(hive),
+            }),
             Err(e) => Err(PyRuntimeError::new_err(e.to_string())),
         }
     }
@@ -271,7 +273,11 @@ impl LlmProvider for ArcProvider {
         config: &pulsehive_core::llm::LlmConfig,
     ) -> pulsehive_core::error::Result<
         std::pin::Pin<
-            Box<dyn futures_core::Stream<Item = pulsehive_core::error::Result<pulsehive_core::llm::LlmChunk>> + Send>,
+            Box<
+                dyn futures_core::Stream<
+                        Item = pulsehive_core::error::Result<pulsehive_core::llm::LlmChunk>,
+                    > + Send,
+            >,
         >,
     > {
         self.0.chat_stream(messages, tools, config).await

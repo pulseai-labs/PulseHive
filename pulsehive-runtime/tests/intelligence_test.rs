@@ -12,10 +12,7 @@ fn build_hive() -> HiveMind {
     let path = dir.path().join("test.db");
     Box::leak(Box::new(dir));
 
-    HiveMind::builder()
-        .substrate_path(&path)
-        .build()
-        .unwrap()
+    HiveMind::builder().substrate_path(&path).build().unwrap()
 }
 
 #[tokio::test]
@@ -51,7 +48,8 @@ async fn test_record_experience_stores_and_infers_relations() {
     let id2 = hive
         .record_experience(pulsedb::NewExperience {
             collective_id: cid,
-            content: "Network timeout errors in the API gateway during peak traffic periods.".into(),
+            content: "Network timeout errors in the API gateway during peak traffic periods."
+                .into(),
             experience_type: pulsedb::ExperienceType::ErrorPattern {
                 signature: "gateway_timeout".into(),
                 fix: "retry with backoff".into(),
@@ -90,9 +88,24 @@ async fn test_record_experience_stores_and_infers_relations() {
         .unwrap();
 
     // Verify all 3 stored
-    assert!(hive.substrate().get_experience(id1).await.unwrap().is_some());
-    assert!(hive.substrate().get_experience(id2).await.unwrap().is_some());
-    assert!(hive.substrate().get_experience(id3).await.unwrap().is_some());
+    assert!(hive
+        .substrate()
+        .get_experience(id1)
+        .await
+        .unwrap()
+        .is_some());
+    assert!(hive
+        .substrate()
+        .get_experience(id2)
+        .await
+        .unwrap()
+        .is_some());
+    assert!(hive
+        .substrate()
+        .get_experience(id3)
+        .await
+        .unwrap()
+        .is_some());
 
     // Check if relations were created (depends on embedding similarity)
     // At minimum, the pipeline should not panic

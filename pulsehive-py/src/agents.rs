@@ -7,9 +7,7 @@ use std::sync::Arc;
 
 use pyo3::prelude::*;
 
-use pulsehive_core::agent::{
-    AgentDefinition, AgentKind, AgentOutcome, LlmAgentConfig,
-};
+use pulsehive_core::agent::{AgentDefinition, AgentKind, AgentOutcome, LlmAgentConfig};
 
 use crate::tool::PythonToolBridge;
 use crate::types::{PyLens, PyLlmConfig};
@@ -82,9 +80,7 @@ impl PyAgentKind {
     #[staticmethod]
     fn sequential(agents: Vec<PyAgentDefinition>) -> Self {
         Self {
-            inner: AgentKind::Sequential(
-                agents.into_iter().map(|a| a.inner).collect(),
-            ),
+            inner: AgentKind::Sequential(agents.into_iter().map(|a| a.inner).collect()),
         }
     }
 
@@ -95,9 +91,7 @@ impl PyAgentKind {
     #[staticmethod]
     fn parallel(agents: Vec<PyAgentDefinition>) -> Self {
         Self {
-            inner: AgentKind::Parallel(
-                agents.into_iter().map(|a| a.inner).collect(),
-            ),
+            inner: AgentKind::Parallel(agents.into_iter().map(|a| a.inner).collect()),
         }
     }
 
@@ -197,7 +191,11 @@ impl PyAgentDefinition {
     }
 
     fn __repr__(&self) -> String {
-        format!("AgentDefinition('{}', {})", self.inner.name, self.kind_tag())
+        format!(
+            "AgentDefinition('{}', {})",
+            self.inner.name,
+            self.kind_tag()
+        )
     }
 }
 

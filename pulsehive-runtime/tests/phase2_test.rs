@@ -180,7 +180,8 @@ async fn test_phase2_relationship_inference() {
     let _id1 = hive
         .record_experience(pulsedb::NewExperience {
             collective_id: cid,
-            content: "Network timeouts are a major reliability issue in distributed systems.".into(),
+            content: "Network timeouts are a major reliability issue in distributed systems."
+                .into(),
             experience_type: pulsedb::ExperienceType::Difficulty {
                 description: "Network timeouts".into(),
                 severity: pulsedb::Severity::High,
@@ -226,7 +227,11 @@ async fn test_phase2_relationship_inference() {
 
     // Pipeline ran without panics — that's the key validation
     assert!(
-        hive.substrate().get_experience(id2).await.unwrap().is_some(),
+        hive.substrate()
+            .get_experience(id2)
+            .await
+            .unwrap()
+            .is_some(),
         "Experience should be stored"
     );
 }

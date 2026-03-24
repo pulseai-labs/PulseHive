@@ -56,14 +56,21 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Install maturin and test deps
-        run: pip install maturin pytest pytest-asyncio
+      - name: Create virtualenv and install deps
+        run: |
+          python -m venv .venv
+          source .venv/bin/activate
+          pip install maturin pytest pytest-asyncio
 
       - name: Build Python bindings
-        run: cd pulsehive-py && maturin develop
+        run: |
+          source .venv/bin/activate
+          cd pulsehive-py && maturin develop
 
       - name: Run Python tests
-        run: pytest pulsehive-py/tests/ -v
+        run: |
+          source .venv/bin/activate
+          pytest pulsehive-py/tests/ -v
 
   deny:
     name: Cargo Deny

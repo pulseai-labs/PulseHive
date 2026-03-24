@@ -96,9 +96,7 @@ impl LlmProvider for AnthropicProvider {
             let status = response.status();
 
             // Retry on rate limit (429) or overloaded (529)
-            if status == reqwest::StatusCode::TOO_MANY_REQUESTS
-                || status.as_u16() == 529
-            {
+            if status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.as_u16() == 529 {
                 last_error = Some(PulseHiveError::llm(format!(
                     "Anthropic API rate limited ({}), attempt {}/{}",
                     status,
@@ -155,10 +153,7 @@ mod tests {
     #[test]
     fn test_build_request_basic() {
         let provider = AnthropicProvider::new("sk-test");
-        let messages = vec![
-            Message::system("You are helpful"),
-            Message::user("Hello"),
-        ];
+        let messages = vec![Message::system("You are helpful"), Message::user("Hello")];
         let config = LlmConfig::new("anthropic", "claude-sonnet-4-6");
         let request = provider.build_request(&messages, &[], &config, false);
 
@@ -203,8 +198,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_chat_with_invalid_url_returns_error() {
-        let config = AnthropicConfig::new("sk-test")
-            .with_base_url("http://localhost:1/invalid");
+        let config = AnthropicConfig::new("sk-test").with_base_url("http://localhost:1/invalid");
         let provider = AnthropicProvider::with_config(config);
 
         let result = provider

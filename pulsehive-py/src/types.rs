@@ -2,9 +2,9 @@
 
 use std::collections::HashMap;
 
-use pyo3::prelude::*;
 use pulsehive_core::lens::{ExperienceTypeTag, Lens, RecencyCurve};
 use pulsehive_core::llm::LlmConfig;
+use pyo3::prelude::*;
 
 // ── LlmConfig ────────────────────────────────────────────────────────
 

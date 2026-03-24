@@ -148,9 +148,7 @@ impl Tool for DangerousTool {
         let target = params["target"].as_str().unwrap_or("unknown");
         let safe_mode = params["safe_mode"].as_bool().unwrap_or(false);
         if safe_mode {
-            Ok(ToolResult::text(format!(
-                "Executed {target} in safe mode"
-            )))
+            Ok(ToolResult::text(format!("Executed {target} in safe mode")))
         } else {
             Ok(ToolResult::text(format!("Executed {target}")))
         }
@@ -179,10 +177,7 @@ impl Tool for SafeTool {
 
 // ── Helpers ──────────────────────────────────────────────────────────
 
-fn build_hive_with_handler(
-    provider: MockLlm,
-    handler: impl ApprovalHandler + 'static,
-) -> HiveMind {
+fn build_hive_with_handler(provider: MockLlm, handler: impl ApprovalHandler + 'static) -> HiveMind {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("test.db");
     Box::leak(Box::new(dir));
@@ -331,10 +326,7 @@ async fn test_modified_params_flow() {
     let dangerous_ref = Arc::clone(&dangerous_tool);
 
     let hive = build_hive_with_handler(provider, ModifyingHandler);
-    let agent = llm_agent(
-        "modify-test",
-        vec![dangerous_tool as Arc<dyn Tool>],
-    );
+    let agent = llm_agent("modify-test", vec![dangerous_tool as Arc<dyn Tool>]);
     let task = Task::new("Execute with modification");
 
     let stream = hive.deploy(vec![agent], vec![task]).await.unwrap();
@@ -390,10 +382,7 @@ async fn test_approved_tool_executes() {
 
     // AutoApprove always returns Approved
     let hive = build_hive_with_handler(provider, AutoApprove);
-    let agent = llm_agent(
-        "approve-test",
-        vec![dangerous_tool as Arc<dyn Tool>],
-    );
+    let agent = llm_agent("approve-test", vec![dangerous_tool as Arc<dyn Tool>]);
     let task = Task::new("Execute approved action");
 
     let stream = hive.deploy(vec![agent], vec![task]).await.unwrap();

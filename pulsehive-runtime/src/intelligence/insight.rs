@@ -8,7 +8,9 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Mutex;
 use std::time::Instant;
 
-use pulsedb::{CollectiveId, Experience, ExperienceId, InsightType, NewDerivedInsight, SubstrateProvider};
+use pulsedb::{
+    CollectiveId, Experience, ExperienceId, InsightType, NewDerivedInsight, SubstrateProvider,
+};
 use pulsehive_core::llm::{LlmConfig, LlmProvider, Message};
 use tracing::Instrument;
 
@@ -150,7 +152,11 @@ impl InsightSynthesizer {
             experience_list.push_str(&format!(
                 "{}. [{}] {}\n",
                 i + 1,
-                format!("{:?}", exp.experience_type).split('{').next().unwrap_or("Unknown").trim(),
+                format!("{:?}", exp.experience_type)
+                    .split('{')
+                    .next()
+                    .unwrap_or("Unknown")
+                    .trim(),
                 exp.content
             ));
         }
@@ -164,14 +170,19 @@ impl InsightSynthesizer {
         );
 
         let messages = vec![
-            Message::system("You are a knowledge synthesis expert. Provide concise, actionable insights."),
+            Message::system(
+                "You are a knowledge synthesis expert. Provide concise, actionable insights.",
+            ),
             Message::user(&prompt),
         ];
 
         // Call LLM for synthesis
         let response = match provider
             .chat(messages, vec![], llm_config)
-            .instrument(tracing::debug_span!("synthesize_insight", cluster_size = cluster.len()))
+            .instrument(tracing::debug_span!(
+                "synthesize_insight",
+                cluster_size = cluster.len()
+            ))
             .await
         {
             Ok(r) => r,
@@ -236,7 +247,10 @@ mod tests {
         let synth = InsightSynthesizer::with_defaults(); // debounce = 60s
         let cid = CollectiveId::new();
 
-        assert!(!synth.is_debounced(cid), "Should not be debounced initially");
+        assert!(
+            !synth.is_debounced(cid),
+            "Should not be debounced initially"
+        );
 
         synth.mark_synthesized(cid);
         assert!(synth.is_debounced(cid), "Should be debounced after marking");
@@ -250,7 +264,10 @@ mod tests {
 
         synth.mark_synthesized(cid_a);
         assert!(synth.is_debounced(cid_a));
-        assert!(!synth.is_debounced(cid_b), "Different collective should not be debounced");
+        assert!(
+            !synth.is_debounced(cid_b),
+            "Different collective should not be debounced"
+        );
     }
 
     #[test]
