@@ -9,6 +9,7 @@ pub mod agents;
 pub mod events;
 pub mod hivemind;
 pub mod stream;
+pub mod tool;
 pub mod types;
 
 /// PulseHive Python module — shared consciousness SDK for multi-agent AI systems.
@@ -33,6 +34,7 @@ fn _pulsehive_py(m: &Bound<'_, PyModule>) -> PyResult<()> {
     events::register(m)?;
     hivemind::register(m)?;
     stream::register(m)?;
+    tool::register(m)?;
     Ok(())
 }
 

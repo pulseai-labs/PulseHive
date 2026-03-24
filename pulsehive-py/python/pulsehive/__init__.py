@@ -24,6 +24,9 @@ from pulsehive._pulsehive_py import (
     LlmProviderProxy,
     openai_provider,
     anthropic_provider,
+    # Tool types (Sprint 11)
+    ToolContext,
+    ToolResult,
 )
 
 __all__ = [
@@ -41,4 +44,6 @@ __all__ = [
     "LlmProviderProxy",
     "openai_provider",
     "anthropic_provider",
+    "ToolContext",
+    "ToolResult",
 ]

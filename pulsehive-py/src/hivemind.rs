@@ -1,6 +1,5 @@
 //! Python bindings for HiveMind, HiveMindBuilder, Task, and LLM provider factories.
 
-use std::pin::Pin;
 use std::sync::Arc;
 
 use pyo3::exceptions::PyRuntimeError;
