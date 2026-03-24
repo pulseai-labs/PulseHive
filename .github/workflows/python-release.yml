@@ -1,0 +1,90 @@
+name: Python Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-wheels:
+    name: Build wheels (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            platform: macOS-arm64
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            platform: Linux-x86_64
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            platform: Windows-x86_64
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build wheel
+        uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          args: --release --out dist --manifest-path pulsehive-py/Cargo.toml
+          manylinux: auto
+
+      - name: Upload wheel
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheel-${{ matrix.platform }}
+          path: dist/*.whl
+
+  build-sdist:
+    name: Build sdist
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build sdist
+        uses: PyO3/maturin-action@v1
+        with:
+          command: sdist
+          args: --out dist --manifest-path pulsehive-py/Cargo.toml
+
+      - name: Upload sdist
+        uses: actions/upload-artifact@v4
+        with:
+          name: sdist
+          path: dist/*.tar.gz
+
+  # TODO: Uncomment when PyPI account is configured
+  # publish:
+  #   name: Publish to PyPI
+  #   needs: [build-wheels, build-sdist]
+  #   runs-on: ubuntu-latest
+  #   # Only publish on tag push (not workflow_dispatch)
+  #   if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+  #   environment: pypi
+  #   permissions:
+  #     id-token: write  # For trusted publishing
+  #   steps:
+  #     - name: Download all artifacts
+  #       uses: actions/download-artifact@v4
+  #       with:
+  #         path: dist
+  #         merge-multiple: true
+  #
+  #     - name: Publish to PyPI
+  #       uses: pypa/gh-action-pypi-publish@release/v1
+  #       with:
+  #         # Uses trusted publishing (OIDC) — no API token needed
+  #         # Configure at: https://pypi.org/manage/project/pulsehive/settings/publishing/
+  #         packages-dir: dist/

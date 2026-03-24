@@ -18,7 +18,7 @@ class TestVersion:
     def test_version_returns_string(self):
         v = version()
         assert isinstance(v, str)
-        assert v == "0.1.0"
+        assert v.startswith("0.3.0")
 
 
 class TestLlmConfig:
