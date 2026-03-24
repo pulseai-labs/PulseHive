@@ -3,12 +3,15 @@
 //! Uses the tagged-class pattern since PyO3 doesn't support Rust enums with data fields.
 //! AgentKind variants are created via static factory methods (`.llm()`, `.sequential()`, etc.).
 
+use std::sync::Arc;
+
 use pyo3::prelude::*;
 
 use pulsehive_core::agent::{
     AgentDefinition, AgentKind, AgentOutcome, LlmAgentConfig,
 };
 
+use crate::tool::PythonToolBridge;
 use crate::types::{PyLens, PyLlmConfig};
 
 // ── AgentKind ────────────────────────────────────────────────────────
@@ -34,25 +37,42 @@ impl PyAgentKind {
     ///     system_prompt: System prompt configuring agent behavior
     ///     lens: Perception filter for substrate access
     ///     llm_config: LLM provider selection and generation parameters
+    ///     tools: List of Python tool objects (optional). Each must implement
+    ///         name(), description(), parameters(), execute(params, context).
     ///     refresh_every_n_tool_calls: Re-perceive substrate every N tool calls (optional)
     #[staticmethod]
-    #[pyo3(signature = (system_prompt, lens, llm_config, refresh_every_n_tool_calls=None))]
+    #[pyo3(signature = (system_prompt, lens, llm_config, tools=None, refresh_every_n_tool_calls=None))]
     fn llm(
+        py: Python<'_>,
         system_prompt: String,
         lens: PyLens,
         llm_config: PyLlmConfig,
+        tools: Option<Vec<Bound<'_, PyAny>>>,
         refresh_every_n_tool_calls: Option<usize>,
-    ) -> Self {
-        Self {
+    ) -> PyResult<Self> {
+        // Convert Python tool objects to Rust Tool trait objects
+        let rust_tools = match tools {
+            Some(py_tools) => {
+                let mut converted = Vec::with_capacity(py_tools.len());
+                for tool_obj in &py_tools {
+                    let bridge = PythonToolBridge::new(py, tool_obj)?;
+                    converted.push(Arc::new(bridge) as Arc<dyn pulsehive_core::tool::Tool>);
+                }
+                converted
+            }
+            None => vec![],
+        };
+
+        Ok(Self {
             inner: AgentKind::Llm(Box::new(LlmAgentConfig {
                 system_prompt,
-                tools: vec![], // Tools deferred to Sprint 11
+                tools: rust_tools,
                 lens: lens.inner,
                 llm_config: llm_config.inner,
                 experience_extractor: None,
                 refresh_every_n_tool_calls,
             })),
-        }
+        })
     }
 
     /// Create a sequential workflow — children execute in order.
