@@ -4,9 +4,15 @@ build-backend = "maturin"
 
 [project]
 name = "pulsehive"
-version = "0.1.0"
+version = "0.3.0b1"
 requires-python = ">=3.9"
+description = "Python bindings for PulseHive — shared consciousness SDK for multi-agent AI systems"
+readme = "README.md"
+license = {text = "AGPL-3.0-only"}
+authors = [{name = "PulseHive Team"}]
+keywords = ["ai", "agents", "multi-agent", "llm", "pulsehive", "rust", "pyo3"]
 classifiers = [
+    "Development Status :: 4 - Beta",
     "Programming Language :: Rust",
     "Programming Language :: Python :: Implementation :: CPython",
     "Programming Language :: Python :: 3",
@@ -14,7 +20,11 @@ classifiers = [
     "Intended Audience :: Developers",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
-description = "Python bindings for PulseHive — shared consciousness SDK for multi-agent AI systems"
+
+[project.urls]
+Homepage = "https://github.com/pulsehive/pulsehive"
+Repository = "https://github.com/pulsehive/pulsehive"
+"Bug Tracker" = "https://github.com/pulsehive/pulsehive/issues"
 
 [tool.maturin]
 # Activate extension-module feature only during maturin builds (not cargo build)

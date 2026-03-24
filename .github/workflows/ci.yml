@@ -42,6 +42,29 @@ jobs:
       - name: Doc
         run: cargo doc --no-deps --workspace
 
+  python-tests:
+    name: Python Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install maturin and test deps
+        run: pip install maturin pytest pytest-asyncio
+
+      - name: Build Python bindings
+        run: cd pulsehive-py && maturin develop
+
+      - name: Run Python tests
+        run: pytest pulsehive-py/tests/ -v
+
   deny:
     name: Cargo Deny
     runs-on: ubuntu-latest
