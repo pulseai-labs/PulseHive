@@ -62,16 +62,52 @@ pub async fn query_substrate(
 
 /// Re-rank experiences through the lens using domain, type, and temporal weighting.
 ///
+/// When `attractor_config` is provided, high-importance experiences additionally
+/// boost nearby experiences via attractor dynamics (additive to the multiplicative base score).
+///
 /// Returns experiences sorted by composite score (descending), truncated to
 /// `lens.attention_budget`.
-pub fn rerank(experiences: Vec<Experience>, lens: &Lens) -> Vec<(Experience, f32)> {
+pub fn rerank(
+    experiences: Vec<Experience>,
+    lens: &Lens,
+    attractor_config: Option<&crate::field::AttractorConfig>,
+) -> Vec<(Experience, f32)> {
     let now = Timestamp::now();
+
+    // Pre-compute attractor dynamics and cache embeddings if config provided
+    let attractors: Vec<(crate::field::AttractorDynamics, Vec<f32>)> = match attractor_config {
+        Some(config) => experiences
+            .iter()
+            .map(|exp| {
+                (
+                    crate::field::AttractorDynamics::from_experience(exp, config),
+                    exp.embedding.clone(),
+                )
+            })
+            .collect(),
+        None => vec![],
+    };
 
     let mut scored: Vec<(Experience, f32)> = experiences
         .into_iter()
-        .map(|exp| {
-            let score = compute_score(&exp, lens, now);
-            (exp, score)
+        .enumerate()
+        .map(|(idx, exp)| {
+            let base_score = compute_score(&exp, lens, now);
+
+            // Add attractor influence: sum of how much nearby high-strength
+            // experiences attract this one. Additive boost (never reduces score).
+            let attractor_boost = if !attractors.is_empty() && !exp.embedding.is_empty() {
+                attractors
+                    .iter()
+                    .enumerate()
+                    .filter(|(j, _)| *j != idx)
+                    .map(|(_, (attr, attr_emb))| attr.influence_at(&exp.embedding, attr_emb))
+                    .sum::<f32>()
+            } else {
+                0.0
+            };
+
+            (exp, base_score + attractor_boost)
         })
         .collect();
 
@@ -234,7 +270,7 @@ pub async fn assemble_context(
         activity_count = activities.len(),
         "Substrate queried"
     );
-    let ranked = rerank(candidates, lens);
+    let ranked = rerank(candidates, lens, None);
     let packed = pack_within_budget(ranked, budget);
     tracing::debug!(packed_count = packed.len(), "Context packed");
     Ok(format_as_intrinsic_knowledge(&packed, &activities))
@@ -296,7 +332,7 @@ mod tests {
         ];
 
         let lens = Lens::new(["safety"]);
-        let ranked = rerank(experiences, &lens);
+        let ranked = rerank(experiences, &lens, None);
 
         // Safety-domain experience should rank higher (1.5x boost)
         assert_eq!(ranked[0].0.content, "safety issue");
@@ -333,7 +369,7 @@ mod tests {
             .insert(ExperienceTypeTag::ErrorPattern, 3.0);
         // Fact has default weight 1.0
 
-        let ranked = rerank(experiences, &lens);
+        let ranked = rerank(experiences, &lens, None);
         assert_eq!(ranked[0].0.content, "an error"); // 3x type weight
     }
 
@@ -357,7 +393,7 @@ mod tests {
         ];
 
         let lens = Lens::default(); // Exponential 72h half-life
-        let ranked = rerank(experiences, &lens);
+        let ranked = rerank(experiences, &lens, None);
         assert_eq!(ranked[0].0.content, "recent"); // Recent decays less
     }
 
@@ -380,7 +416,7 @@ mod tests {
             ..Lens::default()
         };
 
-        let ranked = rerank(experiences, &lens);
+        let ranked = rerank(experiences, &lens, None);
         assert_eq!(ranked.len(), 5);
     }
 
@@ -408,7 +444,7 @@ mod tests {
             ..Lens::default()
         };
 
-        let ranked = rerank(experiences, &lens);
+        let ranked = rerank(experiences, &lens, None);
         // Uniform: no time decay, importance wins
         assert_eq!(ranked[0].0.content, "old high importance");
     }

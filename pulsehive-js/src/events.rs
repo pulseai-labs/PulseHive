@@ -209,6 +209,16 @@ impl From<HiveEvent> for JsHiveEvent {
                 fields.insert("insightCount".into(), EventValue::Num(insight_count as u64));
                 ("substrate_perceived", Some(agent_id))
             }
+            HiveEvent::EmbeddingComputed {
+                agent_id,
+                dimensions,
+                duration_ms,
+            } => {
+                fields.insert("agentId".into(), EventValue::Str(agent_id.clone()));
+                fields.insert("dimensions".into(), EventValue::Num(dimensions as u64));
+                fields.insert("durationMs".into(), EventValue::Num(duration_ms));
+                ("embedding_computed", Some(agent_id))
+            }
             HiveEvent::WatchNotification {
                 experience_id,
                 collective_id,

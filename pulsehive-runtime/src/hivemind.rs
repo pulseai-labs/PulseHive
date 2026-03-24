@@ -29,6 +29,7 @@ use tokio::sync::broadcast;
 
 use pulsehive_core::agent::AgentDefinition;
 use pulsehive_core::approval::{ApprovalHandler, AutoApprove};
+use pulsehive_core::embedding::EmbeddingProvider;
 use pulsehive_core::error::{PulseHiveError, Result};
 use pulsehive_core::event::{EventBus, HiveEvent};
 use pulsehive_core::llm::LlmProvider;
@@ -75,6 +76,9 @@ pub struct HiveMind {
     pub(crate) event_bus: EventBus,
     pub(crate) relationship_detector: Option<RelationshipDetector>,
     pub(crate) insight_synthesizer: Option<InsightSynthesizer>,
+    /// Optional embedding provider for domain-specific models.
+    /// When set, embeddings are computed via this provider before PulseDB storage.
+    pub(crate) embedding_provider: Option<Arc<dyn EmbeddingProvider>>,
     /// Shutdown signal for background tasks (Watch system).
     shutdown: Arc<AtomicBool>,
 }
@@ -176,6 +180,22 @@ impl HiveMind {
     pub async fn record_experience(&self, experience: NewExperience) -> Result<ExperienceId> {
         let agent_id = experience.source_agent.0.clone();
         let collective_id = experience.collective_id;
+
+        // Compute embedding via provider if available and not already set
+        let mut experience = experience;
+        if let Some(provider) = &self.embedding_provider {
+            if experience.embedding.is_none() {
+                match provider.embed(&experience.content).await {
+                    Ok(embedding) => {
+                        experience.embedding = Some(embedding);
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "Failed to compute embedding in record_experience, storing without");
+                    }
+                }
+            }
+        }
+
         let id = self.substrate.store_experience(experience).await?;
         self.event_bus.emit(HiveEvent::ExperienceRecorded {
             experience_id: id,
@@ -296,6 +316,7 @@ impl HiveMind {
             substrate: Arc::clone(&self.substrate),
             approval_handler: Arc::clone(&self.approval_handler),
             event_emitter: self.event_bus.clone(),
+            embedding_provider: self.embedding_provider.clone(),
         };
 
         tokio::spawn(async move {
@@ -353,6 +374,7 @@ pub struct HiveMindBuilder {
     approval_handler: Option<Box<dyn ApprovalHandler>>,
     relationship_detector: Option<Option<RelationshipDetector>>,
     insight_synthesizer: Option<Option<InsightSynthesizer>>,
+    embedding_provider: Option<Arc<dyn EmbeddingProvider>>,
 }
 
 impl HiveMindBuilder {
@@ -364,6 +386,7 @@ impl HiveMindBuilder {
             approval_handler: None,
             relationship_detector: None,
             insight_synthesizer: None,
+            embedding_provider: None,
         }
     }
 
@@ -419,12 +442,29 @@ impl HiveMindBuilder {
         self
     }
 
+    /// Set a custom embedding provider for domain-specific models.
+    ///
+    /// When set, PulseHive computes embeddings via this provider before storing
+    /// experiences in PulseDB (External mode). When not set, PulseDB uses its
+    /// built-in all-MiniLM-L6-v2 model (384d).
+    pub fn embedding_provider(mut self, provider: impl EmbeddingProvider + 'static) -> Self {
+        self.embedding_provider = Some(Arc::new(provider));
+        self
+    }
+
     /// Build the HiveMind. Validates that a substrate is configured.
     pub fn build(self) -> Result<HiveMind> {
         let substrate: Arc<dyn SubstrateProvider> = if let Some(s) = self.substrate {
             Arc::from(s)
         } else if let Some(path) = self.substrate_path {
-            let db = PulseDB::open(&path, Config::with_builtin_embeddings())?;
+            let config = if self.embedding_provider.is_some() {
+                // External mode: PulseHive computes embeddings via the provider
+                Config::new()
+            } else {
+                // Builtin mode: PulseDB computes embeddings internally
+                Config::with_builtin_embeddings()
+            };
+            let db = PulseDB::open(&path, config)?;
             Arc::new(PulseDBSubstrate::from_db(db))
         } else {
             return Err(PulseHiveError::config(
@@ -456,6 +496,7 @@ impl HiveMindBuilder {
             event_bus: EventBus::default(),
             relationship_detector,
             insight_synthesizer,
+            embedding_provider: self.embedding_provider,
             shutdown: Arc::new(AtomicBool::new(false)),
         })
     }

@@ -5,6 +5,7 @@
 
 pub mod agentic_loop;
 pub mod experience;
+pub mod field;
 pub mod hivemind;
 pub mod intelligence;
 pub mod perception;

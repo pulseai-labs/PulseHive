@@ -43,6 +43,8 @@ pub(crate) struct WorkflowContext {
     pub approval_handler: Arc<dyn ApprovalHandler>,
     /// Event broadcaster for lifecycle and observability events.
     pub event_emitter: EventBus,
+    /// Optional embedding provider for computing embeddings before storage.
+    pub embedding_provider: Option<Arc<dyn pulsehive_core::embedding::EmbeddingProvider>>,
 }
 
 /// Dispatch an agent to the appropriate executor based on its kind.
@@ -274,6 +276,7 @@ async fn run_llm_agent(
             approval_handler: ctx.approval_handler.as_ref(),
             event_emitter: ctx.event_emitter.clone(),
             max_iterations: DEFAULT_MAX_ITERATIONS,
+            embedding_provider: ctx.embedding_provider.clone(),
         },
     )
     .await
@@ -382,6 +385,7 @@ mod tests {
             substrate,
             approval_handler: Arc::new(pulsehive_core::approval::AutoApprove),
             event_emitter: EventBus::default(),
+            embedding_provider: None,
         }
     }
 

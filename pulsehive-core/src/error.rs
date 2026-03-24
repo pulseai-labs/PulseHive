@@ -33,6 +33,10 @@ pub enum PulseHiveError {
     /// Input validation failure.
     #[error("Validation error: {0}")]
     Validation(String),
+
+    /// Error from an embedding provider.
+    #[error("Embedding error: {0}")]
+    Embedding(String),
 }
 
 impl PulseHiveError {
@@ -59,6 +63,11 @@ impl PulseHiveError {
     /// Creates a validation error.
     pub fn validation(msg: impl Into<String>) -> Self {
         Self::Validation(msg.into())
+    }
+
+    /// Creates an embedding error.
+    pub fn embedding(msg: impl Into<String>) -> Self {
+        Self::Embedding(msg.into())
     }
 }
 
@@ -110,6 +119,10 @@ mod tests {
         assert_eq!(
             PulseHiveError::validation("empty content").to_string(),
             "Validation error: empty content"
+        );
+        assert_eq!(
+            PulseHiveError::embedding("dimension mismatch").to_string(),
+            "Embedding error: dimension mismatch"
         );
     }
 

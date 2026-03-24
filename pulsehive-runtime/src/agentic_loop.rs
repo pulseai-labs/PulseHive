@@ -33,6 +33,8 @@ pub struct LoopContext<'a> {
     pub approval_handler: &'a dyn ApprovalHandler,
     pub event_emitter: EventEmitter,
     pub max_iterations: usize,
+    /// Optional embedding provider for computing embeddings before storage.
+    pub embedding_provider: Option<Arc<dyn pulsehive_core::embedding::EmbeddingProvider>>,
 }
 
 /// Run the agentic loop for a single LLM agent.
@@ -389,7 +391,33 @@ async fn record(
         .await;
 
     let count = experiences.len();
-    for exp in experiences {
+    for mut exp in experiences {
+        // Compute embedding via provider if available and not already set
+        if let Some(provider) = &ctx.embedding_provider {
+            if exp.embedding.is_none() {
+                let start = std::time::Instant::now();
+                match provider.embed(&exp.content).await {
+                    Ok(embedding) => {
+                        let duration_ms = start.elapsed().as_millis() as u64;
+                        let dimensions = embedding.len();
+                        exp.embedding = Some(embedding);
+                        ctx.event_emitter.emit(HiveEvent::EmbeddingComputed {
+                            agent_id: ctx.agent_id.clone(),
+                            dimensions,
+                            duration_ms,
+                        });
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            agent_id = %ctx.agent_id,
+                            error = %e,
+                            "Failed to compute embedding, storing without"
+                        );
+                    }
+                }
+            }
+        }
+
         match ctx.substrate.store_experience(exp).await {
             Ok(id) => {
                 ctx.event_emitter.emit(HiveEvent::ExperienceRecorded {
@@ -563,6 +591,7 @@ mod tests {
                 approval_handler: &approval,
                 event_emitter: emitter,
                 max_iterations: DEFAULT_MAX_ITERATIONS,
+                embedding_provider: None,
             },
         )
         .await;
@@ -594,6 +623,7 @@ mod tests {
                 approval_handler: &approval,
                 event_emitter: emitter,
                 max_iterations: DEFAULT_MAX_ITERATIONS,
+                embedding_provider: None,
             },
         )
         .await;
@@ -633,6 +663,7 @@ mod tests {
                 approval_handler: &approval,
                 event_emitter: emitter,
                 max_iterations: 3, // Only 3 iterations
+                embedding_provider: None,
             },
         )
         .await;
@@ -663,6 +694,7 @@ mod tests {
                 approval_handler: &approval,
                 event_emitter: emitter,
                 max_iterations: DEFAULT_MAX_ITERATIONS,
+                embedding_provider: None,
             },
         )
         .await;
@@ -691,6 +723,7 @@ mod tests {
                 approval_handler: &approval,
                 event_emitter: emitter,
                 max_iterations: DEFAULT_MAX_ITERATIONS,
+                embedding_provider: None,
             },
         )
         .await;
@@ -721,6 +754,7 @@ mod tests {
                 approval_handler: &approval,
                 event_emitter: emitter,
                 max_iterations: DEFAULT_MAX_ITERATIONS,
+                embedding_provider: None,
             },
         )
         .await;
@@ -785,6 +819,7 @@ mod tests {
                 approval_handler: &approval,
                 event_emitter: emitter,
                 max_iterations: DEFAULT_MAX_ITERATIONS,
+                embedding_provider: None,
             },
         )
         .await;
@@ -829,6 +864,7 @@ mod tests {
                 approval_handler: &approval,
                 event_emitter: emitter,
                 max_iterations: DEFAULT_MAX_ITERATIONS,
+                embedding_provider: None,
             },
         )
         .await;
@@ -872,6 +908,7 @@ mod tests {
                 approval_handler: &approval,
                 event_emitter: emitter,
                 max_iterations: DEFAULT_MAX_ITERATIONS,
+                embedding_provider: None,
             },
         )
         .await;

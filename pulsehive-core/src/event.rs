@@ -88,6 +88,14 @@ pub enum HiveEvent {
         insight_count: usize,
     },
 
+    // ── Embedding ─────────────────────────────────────────────────
+    /// An embedding was computed via the EmbeddingProvider.
+    EmbeddingComputed {
+        agent_id: String,
+        dimensions: usize,
+        duration_ms: u64,
+    },
+
     // ── Watch system ───────────────────────────────────────────────
     /// A real-time Watch event from the substrate.
     ///

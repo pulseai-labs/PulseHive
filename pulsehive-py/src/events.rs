@@ -222,6 +222,16 @@ impl From<HiveEvent> for PyHiveEvent {
                 fields.insert("insight_count".into(), PyEventValue::Uint(insight_count));
                 ("substrate_perceived", Some(agent_id))
             }
+            HiveEvent::EmbeddingComputed {
+                agent_id,
+                dimensions,
+                duration_ms,
+            } => {
+                fields.insert("agent_id".into(), PyEventValue::Str(agent_id.clone()));
+                fields.insert("dimensions".into(), PyEventValue::Uint(dimensions));
+                fields.insert("duration_ms".into(), PyEventValue::Int(duration_ms));
+                ("embedding_computed", Some(agent_id))
+            }
             HiveEvent::WatchNotification {
                 experience_id,
                 collective_id,

@@ -27,3 +27,7 @@ tracing-subscriber = { version = "0.3", features = ["fmt"] }
 [[bench]]
 name = "substrate_bench"
 harness = false
+
+[[bench]]
+name = "field_bench"
+harness = false
