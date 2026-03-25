@@ -1,10 +1,15 @@
 [package]
 name = "pulsehive-runtime"
-version = "1.0.0"
+version = "1.0.1"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Runtime execution engine for PulseHive multi-agent SDK"
+readme = "README.md"
+homepage = "https://github.com/pulsehive/pulsehive"
+documentation = "https://docs.rs/pulsehive-runtime"
+keywords = ["ai", "agent", "orchestration", "workflow", "runtime"]
+categories = ["science", "asynchronous"]
 
 [dependencies]
 async-trait = { workspace = true }

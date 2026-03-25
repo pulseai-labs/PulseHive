@@ -1,10 +1,15 @@
 [package]
 name = "pulsehive-anthropic"
-version = "1.0.0"
+version = "1.0.1"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Anthropic Claude LLM provider for PulseHive"
+readme = "README.md"
+homepage = "https://github.com/pulsehive/pulsehive"
+documentation = "https://docs.rs/pulsehive-anthropic"
+keywords = ["anthropic", "claude", "llm", "ai", "agent"]
+categories = ["science", "web-programming::http-client"]
 
 [dependencies]
 pulsehive-core = { workspace = true }
