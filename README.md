@@ -146,11 +146,11 @@ Other agents immediately perceive the new experiences via PulseDB's Watch system
 
 ```toml
 [dependencies]
-pulsehive = { version = "0.1", features = ["openai"] }
+pulsehive = { version = "1.0", features = ["openai"] }
 # or
-pulsehive = { version = "0.1", features = ["anthropic"] }
+pulsehive = { version = "1.0", features = ["anthropic"] }
 # or both
-pulsehive = { version = "0.1", features = ["openai", "anthropic"] }
+pulsehive = { version = "1.0", features = ["openai", "anthropic"] }
 ```
 
 ## Documentation
@@ -161,19 +161,22 @@ pulsehive = { version = "0.1", features = ["openai", "anthropic"] }
 - [**Architecture**](docs/03-Architecture.md) — C4 model, data flows, architecture decisions
 - [**Data Model**](docs/04-Data-Model.md) — PulseDB entities and relationships
 - [**API Specification**](docs/05-API-Spec.md) — Public traits, structs, and methods
+- [**Getting Started**](docs/getting-started.md) — Setup and first steps for Rust, Python, and TypeScript
 - [**Testing Strategy**](docs/08-Testing.md) — Unit, integration, property-based, and benchmarks
+- [**Performance Benchmarks**](docs/benchmarks.md) — Latency results at 1K–10K experience scales
 - [**PulseDB API Reference**](docs/pulsedb-api-reference.md) — Storage substrate API surface
+- [**Contributing**](CONTRIBUTING.md) — Development setup, code quality, and PR process
 
 ## Project Status
 
-PulseHive is in **active development** (Phase 1: Foundation).
+PulseHive **v1.0.0** is released — production-ready with Rust, Python, and TypeScript support.
 
 | Phase | Status | Deliverable |
 |-------|--------|-------------|
-| Phase 1: Foundation | In Progress | Single agent + tools + substrate persistence |
-| Phase 2: Multi-Agent | Planned | Parallel agents + shared consciousness + intelligence |
-| Phase 3: Python Bindings | Planned | `pip install pulsehive` |
-| Phase 4: Ecosystem | Planned | TypeScript bindings + advanced features + v1.0 |
+| Phase 1: Foundation | Complete | Single agent + tools + substrate persistence |
+| Phase 2: Multi-Agent | Complete | Parallel agents + shared consciousness + intelligence |
+| Phase 3: Python Bindings | Complete | `pip install pulsehive` |
+| Phase 4: Ecosystem | Complete | TypeScript bindings + EmbeddingProvider + AttractorDynamics + v1.0 |
 
 ## Related Projects
 

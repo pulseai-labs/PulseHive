@@ -6,7 +6,7 @@
 //! # Quick Start
 //! ```toml
 //! [dependencies]
-//! pulsehive = { version = "0.1", features = ["openai"] }
+//! pulsehive = { version = "1.0", features = ["openai"] }
 //! ```
 //!
 //! ```rust,ignore

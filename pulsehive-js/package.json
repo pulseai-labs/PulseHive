@@ -1,6 +1,6 @@
 {
   "name": "@pulsehive/sdk",
-  "version": "0.4.0-alpha.1",
+  "version": "1.0.0",
   "description": "TypeScript/Node.js bindings for PulseHive multi-agent SDK",
   "main": "wrapper.js",
   "types": "wrapper.d.ts",
