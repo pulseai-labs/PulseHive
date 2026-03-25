@@ -5,6 +5,43 @@ All notable changes to PulseHive will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.0] - 2026-03-25
+
+### Production Release — PulseHive v1.0.0
+
+PulseHive is production-ready with full support for Rust, Python, and TypeScript. 16 sprints, 138 tickets, 224 Rust tests + 52 Python tests + 47 TypeScript tests.
+
+#### Advanced Features (Sprint 15)
+- `EmbeddingProvider` trait: `embed()`, `embed_batch()`, `dimensions()` for domain-specific embedding models
+- `HiveMindBuilder::embedding_provider()` registration — PulseDB External mode when provider set
+- Embedding computation in experience recording pipeline with graceful degradation
+- `AttractorDynamics` struct: `strength`, `radius`, `warp_factor` computed at query time
+- `influence_at()` with cosine distance, linear falloff within radius
+- `AttractorConfig` with configurable defaults (radius=0.3, warp=1.0, boost=0.1)
+- Perception `rerank()` enhanced with optional attractor boost (additive)
+- `PulseHiveError::Embedding` variant + `HiveEvent::EmbeddingComputed` (14 event variants)
+- `cosine_distance()` helper for embedding space computation
+- `field_bench.rs` benchmark suite for field dynamics
+- 5 embedding integration tests (mock provider, builtin fallback, graceful degradation)
+- Python + TypeScript event bindings updated for `EmbeddingComputed` variant
+
+#### Documentation and Release (Sprint 16)
+- 3 Rust example applications: `cli_agent`, `multi_agent_workflow`, `custom_tool`
+- Rustdoc completeness pass: zero `cargo doc` warnings across all crates
+- Getting Started guide for Rust, Python, and TypeScript (`docs/getting-started.md`)
+- `CONTRIBUTING.md` with development setup, code quality, PR process
+- Performance benchmarks published (`docs/benchmarks.md`) — all targets met
+- Version bump: all crates 0.1.0 → 1.0.0, pulsehive-py 0.3.0-beta.1 → 1.0.0, pulsehive-js 0.4.0-alpha.1 → 1.0.0
+
+#### Performance Results (v1.0.0)
+| Operation | 1K experiences | 10K experiences | Target (1K) |
+|-----------|---------------|-----------------|-------------|
+| `search_similar(k=20)` | 200 µs | 279 µs | < 1 ms |
+| `get_recent(k=20)` | 95 µs | 588 µs | < 10 ms |
+| `store_experience` | 7.0 ms | — | < 15 ms |
+| `cosine_distance(384d)` | 357 ns | — | < 1 µs |
+| `rerank(100 exp)` | 26 µs | — | < 1 ms |
+
 ## [0.4.0-alpha.1] - 2026-03-24
 
 ### Added — Phase 4: Ecosystem Expansion — TypeScript Bindings (Sprints 13-14)
