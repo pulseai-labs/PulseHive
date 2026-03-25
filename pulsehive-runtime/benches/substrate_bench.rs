@@ -73,7 +73,7 @@ fn bench_get_recent(c: &mut Criterion) {
     let rt = tokio::runtime::Runtime::new().unwrap();
     let mut group = c.benchmark_group("get_recent");
 
-    for size in [100, 500, 1000] {
+    for size in [100, 500, 1000, 10_000] {
         let dir = tempfile::tempdir().unwrap();
         let (substrate, cid) = create_substrate(&dir.path().join("recent.db"));
         seed_experiences(&rt, substrate.as_ref(), cid, size);
@@ -93,7 +93,7 @@ fn bench_search_similar(c: &mut Criterion) {
     let rt = tokio::runtime::Runtime::new().unwrap();
     let mut group = c.benchmark_group("search_similar");
 
-    for size in [100, 500, 1000] {
+    for size in [100, 500, 1000, 10_000] {
         let dir = tempfile::tempdir().unwrap();
         let (substrate, cid) = create_substrate(&dir.path().join("search.db"));
         seed_experiences(&rt, substrate.as_ref(), cid, size);
