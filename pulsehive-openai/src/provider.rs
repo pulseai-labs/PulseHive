@@ -58,10 +58,36 @@ impl OpenAICompatibleProvider {
         config: &LlmConfig,
         stream: bool,
     ) -> Result<ChatCompletionRequest> {
-        let message_values: Vec<Value> = messages
+        let mut message_values: Vec<Value> = messages
             .iter()
             .map(|m| serde_json::to_value(m).map_err(|e| PulseHiveError::llm(e.to_string())))
             .collect::<Result<Vec<_>>>()?;
+
+        // Transform tool_calls in assistant messages to OpenAI wire format.
+        // The internal ToolCall format (id, name, arguments:Value) must become
+        // the wire format (id, type:"function", function:{name, arguments:String}).
+        for msg in &mut message_values {
+            if let Some(obj) = msg.as_object_mut() {
+                if obj.get("role").and_then(|r| r.as_str()) == Some("assistant") {
+                    if let Some(Value::Array(tool_calls)) = obj.get_mut("tool_calls") {
+                        let fixed: Vec<Value> = tool_calls
+                            .iter()
+                            .map(|tc| {
+                                serde_json::json!({
+                                    "id": tc["id"],
+                                    "type": "function",
+                                    "function": {
+                                        "name": tc["name"],
+                                        "arguments": tc["arguments"].to_string()
+                                    }
+                                })
+                            })
+                            .collect();
+                        *tool_calls = fixed;
+                    }
+                }
+            }
+        }
 
         let openai_tools: Vec<OpenAITool> = tools.iter().map(OpenAITool::from_tool_def).collect();
 
@@ -338,6 +364,7 @@ fn parse_retry_after(response: &reqwest::Response) -> Option<Duration> {
 mod tests {
     use super::*;
     use crate::OpenAIConfig;
+    use pulsehive_core::llm::ToolCall;
 
     #[test]
     fn test_provider_construction() {
@@ -389,6 +416,47 @@ mod tests {
             )
             .unwrap();
         assert!(req.stream);
+    }
+
+    #[test]
+    fn test_build_request_with_tool_calls_wire_format() {
+        let config = OpenAIConfig::new("sk-test", "gpt-4");
+        let provider = OpenAICompatibleProvider::new(config);
+        let messages = vec![
+            Message::system("You are helpful"),
+            Message::user("Search for something"),
+            Message::assistant_with_tool_calls(vec![ToolCall {
+                id: "call_1".into(),
+                name: "search".into(),
+                arguments: serde_json::json!({"query": "test"}),
+            }]),
+            Message::tool_result("call_1", "Found it"),
+        ];
+        let llm_config = LlmConfig::new("openai", "gpt-4");
+        let req = provider
+            .build_request(&messages, &[], &llm_config, false)
+            .unwrap();
+
+        // The assistant message (index 2) should have wire-format tool_calls
+        let assistant_msg = &req.messages[2];
+        let tool_calls = assistant_msg["tool_calls"].as_array().unwrap();
+        assert_eq!(tool_calls.len(), 1);
+
+        let tc = &tool_calls[0];
+        // Must have "type": "function"
+        assert_eq!(tc["type"], "function", "Missing type:function wrapper");
+        // Must have nested "function" object
+        assert!(tc["function"].is_object(), "Missing function nesting");
+        assert_eq!(tc["function"]["name"], "search");
+        // arguments must be a JSON STRING, not an object
+        assert!(
+            tc["function"]["arguments"].is_string(),
+            "arguments should be a JSON string, got: {}",
+            tc["function"]["arguments"]
+        );
+        let args_str = tc["function"]["arguments"].as_str().unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(args_str).unwrap();
+        assert_eq!(parsed["query"], "test");
     }
 
     // ── SSE parsing tests ────────────────────────────────────────────
