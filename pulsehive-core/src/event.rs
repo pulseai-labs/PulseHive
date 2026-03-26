@@ -9,11 +9,14 @@
 //!
 //! Built on `tokio::sync::broadcast` for multi-consumer support.
 
+use std::sync::Arc;
+
 use pulsedb::{ExperienceId, InsightId, RelationId};
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 
 use crate::agent::{AgentKindTag, AgentOutcome};
+use crate::export::EventExporter;
 
 /// Returns the current time as epoch milliseconds.
 ///
@@ -176,18 +179,41 @@ pub enum HiveEvent {
 #[derive(Clone)]
 pub struct EventEmitter {
     sender: broadcast::Sender<HiveEvent>,
+    exporter: Option<Arc<dyn EventExporter>>,
 }
 
 impl EventEmitter {
     /// Creates a new emitter with the given channel capacity.
     pub fn new(capacity: usize) -> Self {
         let (sender, _) = broadcast::channel(capacity);
-        Self { sender }
+        Self {
+            sender,
+            exporter: None,
+        }
     }
 
-    /// Emits an event to all subscribers. Fire-and-forget — if no
-    /// subscribers exist, the event is silently dropped.
+    /// Creates a new emitter with an event exporter for external observability.
+    ///
+    /// When set, every emitted event is also forwarded to the exporter
+    /// via a fire-and-forget `tokio::spawn` — zero latency on the emit path.
+    pub fn with_exporter(capacity: usize, exporter: Arc<dyn EventExporter>) -> Self {
+        let (sender, _) = broadcast::channel(capacity);
+        Self {
+            sender,
+            exporter: Some(exporter),
+        }
+    }
+
+    /// Emits an event to all subscribers and the exporter (if set).
+    /// Fire-and-forget — if no subscribers exist, the event is silently dropped.
     pub fn emit(&self, event: HiveEvent) {
+        if let Some(exporter) = &self.exporter {
+            let exporter = Arc::clone(exporter);
+            let event_clone = event.clone();
+            tokio::spawn(async move {
+                exporter.export(&event_clone).await;
+            });
+        }
         let _ = self.sender.send(event);
     }
 

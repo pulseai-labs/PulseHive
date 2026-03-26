@@ -32,6 +32,7 @@ use pulsehive_core::approval::{ApprovalHandler, AutoApprove};
 use pulsehive_core::embedding::EmbeddingProvider;
 use pulsehive_core::error::{PulseHiveError, Result};
 use pulsehive_core::event::{EventBus, HiveEvent};
+use pulsehive_core::export::EventExporter;
 use pulsehive_core::llm::LlmProvider;
 
 use crate::intelligence::insight::InsightSynthesizer;
@@ -401,6 +402,7 @@ pub struct HiveMindBuilder {
     relationship_detector: Option<Option<RelationshipDetector>>,
     insight_synthesizer: Option<Option<InsightSynthesizer>>,
     embedding_provider: Option<Arc<dyn EmbeddingProvider>>,
+    event_exporter: Option<Arc<dyn EventExporter>>,
 }
 
 impl HiveMindBuilder {
@@ -413,6 +415,7 @@ impl HiveMindBuilder {
             relationship_detector: None,
             insight_synthesizer: None,
             embedding_provider: None,
+            event_exporter: None,
         }
     }
 
@@ -478,6 +481,17 @@ impl HiveMindBuilder {
         self
     }
 
+    /// Set an event exporter for streaming events to external observability systems.
+    ///
+    /// When set, every `HiveEvent` emission is also forwarded to the exporter
+    /// via a fire-and-forget `tokio::spawn` call — zero latency on the emit path.
+    ///
+    /// Use this to connect PulseHive to PulseVision or custom dashboards.
+    pub fn event_exporter(mut self, exporter: impl EventExporter + 'static) -> Self {
+        self.event_exporter = Some(Arc::new(exporter));
+        self
+    }
+
     /// Build the HiveMind. Validates that a substrate is configured.
     pub fn build(self) -> Result<HiveMind> {
         let substrate: Arc<dyn SubstrateProvider> = if let Some(s) = self.substrate {
@@ -515,11 +529,16 @@ impl HiveMindBuilder {
             None => Some(InsightSynthesizer::with_defaults()),
         };
 
+        let event_bus = match self.event_exporter {
+            Some(exporter) => EventBus::with_exporter(256, exporter),
+            None => EventBus::default(),
+        };
+
         Ok(HiveMind {
             substrate,
             llm_providers: self.llm_providers,
             approval_handler: approval,
-            event_bus: EventBus::default(),
+            event_bus,
             relationship_detector,
             insight_synthesizer,
             embedding_provider: self.embedding_provider,
