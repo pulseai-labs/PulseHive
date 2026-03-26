@@ -157,7 +157,7 @@ impl ToolDefinition {
 }
 
 /// Token usage statistics from an LLM call.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TokenUsage {
     /// Tokens consumed by the input (prompt + context).
     pub input_tokens: u32,

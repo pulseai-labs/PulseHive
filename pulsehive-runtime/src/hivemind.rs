@@ -149,6 +149,7 @@ impl HiveMind {
                         match watch_stream.next().await {
                             Some(event) => {
                                 watch_emitter.emit(HiveEvent::WatchNotification {
+                                    timestamp_ms: pulsehive_core::event::now_ms(),
                                     experience_id: event.experience_id,
                                     collective_id: event.collective_id,
                                     event_type: format!("{:?}", event.event_type),
@@ -199,10 +200,19 @@ impl HiveMind {
             }
         }
 
+        // Capture metadata before move
+        let content_preview: String = experience.content.chars().take(200).collect();
+        let experience_type_str = format!("{:?}", experience.experience_type);
+        let importance = experience.importance;
+
         let id = self.substrate.store_experience(experience).await?;
         self.event_bus.emit(HiveEvent::ExperienceRecorded {
+            timestamp_ms: pulsehive_core::event::now_ms(),
             experience_id: id,
-            agent_id,
+            agent_id: agent_id.clone(),
+            content_preview,
+            experience_type: experience_type_str,
+            importance,
         });
 
         // Run relationship inference if detector is configured
@@ -215,8 +225,11 @@ impl HiveMind {
                 for rel in relations {
                     match self.substrate.store_relation(rel).await {
                         Ok(relation_id) => {
-                            self.event_bus
-                                .emit(HiveEvent::RelationshipInferred { relation_id });
+                            self.event_bus.emit(HiveEvent::RelationshipInferred {
+                                timestamp_ms: pulsehive_core::event::now_ms(),
+                                relation_id,
+                                agent_id: agent_id.clone(),
+                            });
                         }
                         Err(e) => {
                             tracing::warn!(error = %e, "Failed to store inferred relation");
@@ -250,8 +263,10 @@ impl HiveMind {
                                 Ok(insight_id) => {
                                     synthesizer.mark_synthesized(collective_id);
                                     self.event_bus.emit(HiveEvent::InsightGenerated {
+                                        timestamp_ms: pulsehive_core::event::now_ms(),
                                         insight_id,
                                         source_count,
+                                        agent_id: agent_id.clone(),
                                     });
                                 }
                                 Err(e) => {
@@ -605,6 +620,7 @@ mod tests {
             HiveEvent::ExperienceRecorded {
                 experience_id,
                 agent_id,
+                ..
             } => {
                 assert_eq!(experience_id, id);
                 assert_eq!(agent_id, "test-agent");

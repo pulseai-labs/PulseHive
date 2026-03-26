@@ -17,7 +17,7 @@ PulseHive is a Rust SDK for building multi-agent AI systems where agents share c
 ```toml
 # Cargo.toml
 [dependencies]
-pulsehive = { version = "1.0", features = ["openai"] }
+pulsehive = { version = "2.0", features = ["openai"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 ```
 

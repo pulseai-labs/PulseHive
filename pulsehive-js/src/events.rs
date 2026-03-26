@@ -27,6 +27,7 @@ pub struct JsHiveEvent {
 pub(crate) enum EventValue {
     Str(String),
     Num(u64),
+    Float(f64),
 }
 
 #[cfg_attr(feature = "napi", napi)]
@@ -58,6 +59,7 @@ impl JsHiveEvent {
                 let val = match v {
                     EventValue::Str(s) => s.clone(),
                     EventValue::Num(n) => n.to_string(),
+                    EventValue::Float(f) => f.to_string(),
                 };
                 (k.clone(), val)
             })
@@ -75,6 +77,7 @@ impl JsHiveEvent {
                 EventValue::Str(s) if s.len() > 30 => format!("{k}='{}'...", &s[..30]),
                 EventValue::Str(s) => format!("{k}='{s}'"),
                 EventValue::Num(n) => format!("{k}={n}"),
+                EventValue::Float(f) => format!("{k}={f}"),
             })
             .collect();
 
@@ -88,16 +91,23 @@ impl From<HiveEvent> for JsHiveEvent {
 
         let (event_type, agent_id) = match event {
             HiveEvent::AgentStarted {
+                timestamp_ms,
                 agent_id,
                 name,
                 kind,
             } => {
+                fields.insert("timestampMs".into(), EventValue::Num(timestamp_ms));
                 fields.insert("agentId".into(), EventValue::Str(agent_id.clone()));
                 fields.insert("name".into(), EventValue::Str(name));
                 fields.insert("kind".into(), EventValue::Str(format!("{kind:?}")));
                 ("agent_started", Some(agent_id))
             }
-            HiveEvent::AgentCompleted { agent_id, outcome } => {
+            HiveEvent::AgentCompleted {
+                timestamp_ms,
+                agent_id,
+                outcome,
+            } => {
+                fields.insert("timestampMs".into(), EventValue::Num(timestamp_ms));
                 fields.insert("agentId".into(), EventValue::Str(agent_id.clone()));
                 match &outcome {
                     AgentOutcome::Complete { response } => {
@@ -118,89 +128,132 @@ impl From<HiveEvent> for JsHiveEvent {
                 ("agent_completed", Some(agent_id))
             }
             HiveEvent::LlmCallStarted {
+                timestamp_ms,
                 agent_id,
                 model,
                 message_count,
             } => {
+                fields.insert("timestampMs".into(), EventValue::Num(timestamp_ms));
                 fields.insert("agentId".into(), EventValue::Str(agent_id.clone()));
                 fields.insert("model".into(), EventValue::Str(model));
                 fields.insert("messageCount".into(), EventValue::Num(message_count as u64));
                 ("llm_call_started", Some(agent_id))
             }
             HiveEvent::LlmCallCompleted {
+                timestamp_ms,
                 agent_id,
                 model,
                 duration_ms,
+                input_tokens,
+                output_tokens,
             } => {
+                fields.insert("timestampMs".into(), EventValue::Num(timestamp_ms));
                 fields.insert("agentId".into(), EventValue::Str(agent_id.clone()));
                 fields.insert("model".into(), EventValue::Str(model));
                 fields.insert("durationMs".into(), EventValue::Num(duration_ms));
+                fields.insert("inputTokens".into(), EventValue::Num(input_tokens as u64));
+                fields.insert("outputTokens".into(), EventValue::Num(output_tokens as u64));
                 ("llm_call_completed", Some(agent_id))
             }
-            HiveEvent::LlmTokenStreamed { agent_id, token } => {
+            HiveEvent::LlmTokenStreamed {
+                timestamp_ms,
+                agent_id,
+                token,
+            } => {
+                fields.insert("timestampMs".into(), EventValue::Num(timestamp_ms));
                 fields.insert("agentId".into(), EventValue::Str(agent_id.clone()));
                 fields.insert("token".into(), EventValue::Str(token));
                 ("llm_token_streamed", Some(agent_id))
             }
             HiveEvent::ToolCallStarted {
+                timestamp_ms,
                 agent_id,
                 tool_name,
+                params,
             } => {
+                fields.insert("timestampMs".into(), EventValue::Num(timestamp_ms));
                 fields.insert("agentId".into(), EventValue::Str(agent_id.clone()));
                 fields.insert("toolName".into(), EventValue::Str(tool_name));
+                fields.insert("params".into(), EventValue::Str(params));
                 ("tool_call_started", Some(agent_id))
             }
             HiveEvent::ToolCallCompleted {
+                timestamp_ms,
                 agent_id,
                 tool_name,
                 duration_ms,
+                result_preview,
             } => {
+                fields.insert("timestampMs".into(), EventValue::Num(timestamp_ms));
                 fields.insert("agentId".into(), EventValue::Str(agent_id.clone()));
                 fields.insert("toolName".into(), EventValue::Str(tool_name));
                 fields.insert("durationMs".into(), EventValue::Num(duration_ms));
+                fields.insert("resultPreview".into(), EventValue::Str(result_preview));
                 ("tool_call_completed", Some(agent_id))
             }
             HiveEvent::ToolApprovalRequested {
+                timestamp_ms,
                 agent_id,
                 tool_name,
                 description,
             } => {
+                fields.insert("timestampMs".into(), EventValue::Num(timestamp_ms));
                 fields.insert("agentId".into(), EventValue::Str(agent_id.clone()));
                 fields.insert("toolName".into(), EventValue::Str(tool_name));
                 fields.insert("description".into(), EventValue::Str(description));
                 ("tool_approval_requested", Some(agent_id))
             }
             HiveEvent::ExperienceRecorded {
+                timestamp_ms,
                 experience_id,
                 agent_id,
+                content_preview,
+                experience_type,
+                importance,
             } => {
+                fields.insert("timestampMs".into(), EventValue::Num(timestamp_ms));
                 fields.insert(
                     "experienceId".into(),
                     EventValue::Str(experience_id.to_string()),
                 );
                 fields.insert("agentId".into(), EventValue::Str(agent_id.clone()));
+                fields.insert("contentPreview".into(), EventValue::Str(content_preview));
+                fields.insert("experienceType".into(), EventValue::Str(experience_type));
+                fields.insert("importance".into(), EventValue::Float(importance as f64));
                 ("experience_recorded", Some(agent_id))
             }
-            HiveEvent::RelationshipInferred { relation_id } => {
+            HiveEvent::RelationshipInferred {
+                timestamp_ms,
+                relation_id,
+                agent_id,
+            } => {
+                fields.insert("timestampMs".into(), EventValue::Num(timestamp_ms));
                 fields.insert(
                     "relationId".into(),
                     EventValue::Str(relation_id.to_string()),
                 );
-                ("relationship_inferred", None)
+                fields.insert("agentId".into(), EventValue::Str(agent_id.clone()));
+                ("relationship_inferred", Some(agent_id))
             }
             HiveEvent::InsightGenerated {
+                timestamp_ms,
                 insight_id,
                 source_count,
+                agent_id,
             } => {
+                fields.insert("timestampMs".into(), EventValue::Num(timestamp_ms));
                 fields.insert("insightId".into(), EventValue::Str(insight_id.to_string()));
                 fields.insert("sourceCount".into(), EventValue::Num(source_count as u64));
-                ("insight_generated", None)
+                fields.insert("agentId".into(), EventValue::Str(agent_id.clone()));
+                ("insight_generated", Some(agent_id))
             }
             HiveEvent::SubstratePerceived {
+                timestamp_ms,
                 agent_id,
                 experience_count,
                 insight_count,
             } => {
+                fields.insert("timestampMs".into(), EventValue::Num(timestamp_ms));
                 fields.insert("agentId".into(), EventValue::Str(agent_id.clone()));
                 fields.insert(
                     "experienceCount".into(),
@@ -210,20 +263,24 @@ impl From<HiveEvent> for JsHiveEvent {
                 ("substrate_perceived", Some(agent_id))
             }
             HiveEvent::EmbeddingComputed {
+                timestamp_ms,
                 agent_id,
                 dimensions,
                 duration_ms,
             } => {
+                fields.insert("timestampMs".into(), EventValue::Num(timestamp_ms));
                 fields.insert("agentId".into(), EventValue::Str(agent_id.clone()));
                 fields.insert("dimensions".into(), EventValue::Num(dimensions as u64));
                 fields.insert("durationMs".into(), EventValue::Num(duration_ms));
                 ("embedding_computed", Some(agent_id))
             }
             HiveEvent::WatchNotification {
+                timestamp_ms,
                 experience_id,
                 collective_id,
                 event_type,
             } => {
+                fields.insert("timestampMs".into(), EventValue::Num(timestamp_ms));
                 fields.insert(
                     "experienceId".into(),
                     EventValue::Str(experience_id.to_string()),

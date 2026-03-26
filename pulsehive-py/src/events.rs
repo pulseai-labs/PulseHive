@@ -33,6 +33,7 @@ enum PyEventValue {
     Str(String),
     Int(u64),
     Uint(usize),
+    Float(f32),
 }
 
 impl PyEventValue {
@@ -41,6 +42,7 @@ impl PyEventValue {
             PyEventValue::Str(s) => s.into_pyobject(py).unwrap().into_any().unbind(),
             PyEventValue::Int(n) => n.into_pyobject(py).unwrap().into_any().unbind(),
             PyEventValue::Uint(n) => n.into_pyobject(py).unwrap().into_any().unbind(),
+            PyEventValue::Float(f) => f.into_pyobject(py).unwrap().into_any().unbind(),
         }
     }
 }
@@ -85,6 +87,7 @@ impl PyHiveEvent {
                 PyEventValue::Str(s) => format!("{k}='{s}'"),
                 PyEventValue::Int(n) => format!("{k}={n}"),
                 PyEventValue::Uint(n) => format!("{k}={n}"),
+                PyEventValue::Float(f) => format!("{k}={f}"),
             })
             .collect();
 
@@ -98,16 +101,23 @@ impl From<HiveEvent> for PyHiveEvent {
 
         let (event_type, agent_id) = match event {
             HiveEvent::AgentStarted {
+                timestamp_ms,
                 agent_id,
                 name,
                 kind,
             } => {
+                fields.insert("timestamp_ms".into(), PyEventValue::Int(timestamp_ms));
                 fields.insert("agent_id".into(), PyEventValue::Str(agent_id.clone()));
                 fields.insert("name".into(), PyEventValue::Str(name));
                 fields.insert("kind".into(), PyEventValue::Str(format!("{kind:?}")));
                 ("agent_started", Some(agent_id))
             }
-            HiveEvent::AgentCompleted { agent_id, outcome } => {
+            HiveEvent::AgentCompleted {
+                timestamp_ms,
+                agent_id,
+                outcome,
+            } => {
+                fields.insert("timestamp_ms".into(), PyEventValue::Int(timestamp_ms));
                 fields.insert("agent_id".into(), PyEventValue::Str(agent_id.clone()));
                 match &outcome {
                     AgentOutcome::Complete { response } => {
@@ -128,92 +138,141 @@ impl From<HiveEvent> for PyHiveEvent {
                 ("agent_completed", Some(agent_id))
             }
             HiveEvent::LlmCallStarted {
+                timestamp_ms,
                 agent_id,
                 model,
                 message_count,
             } => {
+                fields.insert("timestamp_ms".into(), PyEventValue::Int(timestamp_ms));
                 fields.insert("agent_id".into(), PyEventValue::Str(agent_id.clone()));
                 fields.insert("model".into(), PyEventValue::Str(model));
                 fields.insert("message_count".into(), PyEventValue::Uint(message_count));
                 ("llm_call_started", Some(agent_id))
             }
             HiveEvent::LlmCallCompleted {
+                timestamp_ms,
                 agent_id,
                 model,
                 duration_ms,
+                input_tokens,
+                output_tokens,
             } => {
+                fields.insert("timestamp_ms".into(), PyEventValue::Int(timestamp_ms));
                 fields.insert("agent_id".into(), PyEventValue::Str(agent_id.clone()));
                 fields.insert("model".into(), PyEventValue::Str(model));
                 fields.insert("duration_ms".into(), PyEventValue::Int(duration_ms));
+                fields.insert(
+                    "input_tokens".into(),
+                    PyEventValue::Int(input_tokens as u64),
+                );
+                fields.insert(
+                    "output_tokens".into(),
+                    PyEventValue::Int(output_tokens as u64),
+                );
                 ("llm_call_completed", Some(agent_id))
             }
-            HiveEvent::LlmTokenStreamed { agent_id, token } => {
+            HiveEvent::LlmTokenStreamed {
+                timestamp_ms,
+                agent_id,
+                token,
+            } => {
+                fields.insert("timestamp_ms".into(), PyEventValue::Int(timestamp_ms));
                 fields.insert("agent_id".into(), PyEventValue::Str(agent_id.clone()));
                 fields.insert("token".into(), PyEventValue::Str(token));
                 ("llm_token_streamed", Some(agent_id))
             }
             HiveEvent::ToolCallStarted {
+                timestamp_ms,
                 agent_id,
                 tool_name,
+                params,
             } => {
+                fields.insert("timestamp_ms".into(), PyEventValue::Int(timestamp_ms));
                 fields.insert("agent_id".into(), PyEventValue::Str(agent_id.clone()));
                 fields.insert("tool_name".into(), PyEventValue::Str(tool_name));
+                fields.insert("params".into(), PyEventValue::Str(params));
                 ("tool_call_started", Some(agent_id))
             }
             HiveEvent::ToolCallCompleted {
+                timestamp_ms,
                 agent_id,
                 tool_name,
                 duration_ms,
+                result_preview,
             } => {
+                fields.insert("timestamp_ms".into(), PyEventValue::Int(timestamp_ms));
                 fields.insert("agent_id".into(), PyEventValue::Str(agent_id.clone()));
                 fields.insert("tool_name".into(), PyEventValue::Str(tool_name));
                 fields.insert("duration_ms".into(), PyEventValue::Int(duration_ms));
+                fields.insert("result_preview".into(), PyEventValue::Str(result_preview));
                 ("tool_call_completed", Some(agent_id))
             }
             HiveEvent::ToolApprovalRequested {
+                timestamp_ms,
                 agent_id,
                 tool_name,
                 description,
             } => {
+                fields.insert("timestamp_ms".into(), PyEventValue::Int(timestamp_ms));
                 fields.insert("agent_id".into(), PyEventValue::Str(agent_id.clone()));
                 fields.insert("tool_name".into(), PyEventValue::Str(tool_name));
                 fields.insert("description".into(), PyEventValue::Str(description));
                 ("tool_approval_requested", Some(agent_id))
             }
             HiveEvent::ExperienceRecorded {
+                timestamp_ms,
                 experience_id,
                 agent_id,
+                content_preview,
+                experience_type,
+                importance,
             } => {
+                fields.insert("timestamp_ms".into(), PyEventValue::Int(timestamp_ms));
                 fields.insert(
                     "experience_id".into(),
                     PyEventValue::Str(experience_id.to_string()),
                 );
                 fields.insert("agent_id".into(), PyEventValue::Str(agent_id.clone()));
+                fields.insert("content_preview".into(), PyEventValue::Str(content_preview));
+                fields.insert("experience_type".into(), PyEventValue::Str(experience_type));
+                fields.insert("importance".into(), PyEventValue::Float(importance));
                 ("experience_recorded", Some(agent_id))
             }
-            HiveEvent::RelationshipInferred { relation_id } => {
+            HiveEvent::RelationshipInferred {
+                timestamp_ms,
+                relation_id,
+                agent_id,
+            } => {
+                fields.insert("timestamp_ms".into(), PyEventValue::Int(timestamp_ms));
                 fields.insert(
                     "relation_id".into(),
                     PyEventValue::Str(relation_id.to_string()),
                 );
-                ("relationship_inferred", None)
+                fields.insert("agent_id".into(), PyEventValue::Str(agent_id.clone()));
+                ("relationship_inferred", Some(agent_id))
             }
             HiveEvent::InsightGenerated {
+                timestamp_ms,
                 insight_id,
                 source_count,
+                agent_id,
             } => {
+                fields.insert("timestamp_ms".into(), PyEventValue::Int(timestamp_ms));
                 fields.insert(
                     "insight_id".into(),
                     PyEventValue::Str(insight_id.to_string()),
                 );
                 fields.insert("source_count".into(), PyEventValue::Uint(source_count));
-                ("insight_generated", None)
+                fields.insert("agent_id".into(), PyEventValue::Str(agent_id.clone()));
+                ("insight_generated", Some(agent_id))
             }
             HiveEvent::SubstratePerceived {
+                timestamp_ms,
                 agent_id,
                 experience_count,
                 insight_count,
             } => {
+                fields.insert("timestamp_ms".into(), PyEventValue::Int(timestamp_ms));
                 fields.insert("agent_id".into(), PyEventValue::Str(agent_id.clone()));
                 fields.insert(
                     "experience_count".into(),
@@ -223,20 +282,24 @@ impl From<HiveEvent> for PyHiveEvent {
                 ("substrate_perceived", Some(agent_id))
             }
             HiveEvent::EmbeddingComputed {
+                timestamp_ms,
                 agent_id,
                 dimensions,
                 duration_ms,
             } => {
+                fields.insert("timestamp_ms".into(), PyEventValue::Int(timestamp_ms));
                 fields.insert("agent_id".into(), PyEventValue::Str(agent_id.clone()));
                 fields.insert("dimensions".into(), PyEventValue::Uint(dimensions));
                 fields.insert("duration_ms".into(), PyEventValue::Int(duration_ms));
                 ("embedding_computed", Some(agent_id))
             }
             HiveEvent::WatchNotification {
+                timestamp_ms,
                 experience_id,
                 collective_id,
                 event_type,
             } => {
+                fields.insert("timestamp_ms".into(), PyEventValue::Int(timestamp_ms));
                 fields.insert(
                     "experience_id".into(),
                     PyEventValue::Str(experience_id.to_string()),

@@ -128,6 +128,7 @@ async fn think_act_loop(
 
         // ── THINK: call LLM ──────────────────────────────────────────
         ctx.event_emitter.emit(HiveEvent::LlmCallStarted {
+            timestamp_ms: pulsehive_core::event::now_ms(),
             agent_id: agent_id.to_string(),
             model: llm_config.model.clone(),
             message_count: messages.len(),
@@ -141,10 +142,17 @@ async fn think_act_loop(
             .await;
         let duration_ms = start.elapsed().as_millis() as u64;
 
+        let (input_tokens, output_tokens) = match &response {
+            Ok(r) => (r.usage.input_tokens, r.usage.output_tokens),
+            Err(_) => (0, 0),
+        };
         ctx.event_emitter.emit(HiveEvent::LlmCallCompleted {
+            timestamp_ms: pulsehive_core::event::now_ms(),
             agent_id: agent_id.to_string(),
             model: llm_config.model.clone(),
             duration_ms,
+            input_tokens,
+            output_tokens,
         });
 
         let response = match response {
@@ -237,6 +245,7 @@ async fn execute_tool_call(
     // Check approval if required
     if tool.requires_approval() {
         event_emitter.emit(HiveEvent::ToolApprovalRequested {
+            timestamp_ms: pulsehive_core::event::now_ms(),
             agent_id: agent_id.to_string(),
             tool_name: tool_call.name.clone(),
             description: format!("Execute {} with {:?}", tool_call.name, tool_call.arguments),
@@ -295,9 +304,12 @@ async fn execute_tool_inner(
     event_emitter: &EventEmitter,
     collective_id: &pulsedb::CollectiveId,
 ) -> ToolResult {
+    let params_str = serde_json::to_string(&params).unwrap_or_default();
     event_emitter.emit(HiveEvent::ToolCallStarted {
+        timestamp_ms: pulsehive_core::event::now_ms(),
         agent_id: agent_id.to_string(),
         tool_name: tool_name.to_string(),
+        params: params_str,
     });
 
     let start = Instant::now();
@@ -322,10 +334,13 @@ async fn execute_tool_inner(
 
     let duration_ms = start.elapsed().as_millis() as u64;
     tracing::debug!(tool = %tool_name, duration_ms, "Tool completed");
+    let result_preview: String = result.to_content().chars().take(200).collect();
     event_emitter.emit(HiveEvent::ToolCallCompleted {
+        timestamp_ms: pulsehive_core::event::now_ms(),
         agent_id: agent_id.to_string(),
         tool_name: tool_name.to_string(),
         duration_ms,
+        result_preview,
     });
 
     result
@@ -355,8 +370,15 @@ async fn perceive(
         }
     };
 
-    let experience_count = if messages.is_empty() { 0 } else { 1 }; // At least 1 context message
+    // Count context messages that contain experience data (non-system, non-empty)
+    let experience_count = messages
+        .iter()
+        .filter(|m| matches!(m, pulsehive_core::llm::Message::System { content } if !content.is_empty()))
+        .count()
+        .max(1)
+        .saturating_sub(1); // Subtract the system message itself
     event_emitter.emit(HiveEvent::SubstratePerceived {
+        timestamp_ms: pulsehive_core::event::now_ms(),
         agent_id: agent_id.to_string(),
         experience_count,
         insight_count: 0,
@@ -402,6 +424,7 @@ async fn record(
                         let dimensions = embedding.len();
                         exp.embedding = Some(embedding);
                         ctx.event_emitter.emit(HiveEvent::EmbeddingComputed {
+                            timestamp_ms: pulsehive_core::event::now_ms(),
                             agent_id: ctx.agent_id.clone(),
                             dimensions,
                             duration_ms,
@@ -418,11 +441,20 @@ async fn record(
             }
         }
 
+        // Capture metadata before move into store_experience
+        let content_preview: String = exp.content.chars().take(200).collect();
+        let experience_type = format!("{:?}", exp.experience_type);
+        let importance = exp.importance;
+
         match ctx.substrate.store_experience(exp).await {
             Ok(id) => {
                 ctx.event_emitter.emit(HiveEvent::ExperienceRecorded {
+                    timestamp_ms: pulsehive_core::event::now_ms(),
                     experience_id: id,
                     agent_id: ctx.agent_id.clone(),
+                    content_preview,
+                    experience_type,
+                    importance,
                 });
             }
             Err(e) => {

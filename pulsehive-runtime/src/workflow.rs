@@ -71,6 +71,7 @@ pub(crate) fn dispatch_agent(
 
             // Emit lifecycle start event
             ctx.event_emitter.emit(HiveEvent::AgentStarted {
+                timestamp_ms: pulsehive_core::event::now_ms(),
                 agent_id: agent_id.clone(),
                 name: agent.name.clone(),
                 kind: agent_kind_tag(&agent.kind),
@@ -88,6 +89,7 @@ pub(crate) fn dispatch_agent(
 
             // Emit lifecycle completion event
             ctx.event_emitter.emit(HiveEvent::AgentCompleted {
+                timestamp_ms: pulsehive_core::event::now_ms(),
                 agent_id,
                 outcome: outcome.clone(),
             });

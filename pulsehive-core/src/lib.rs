@@ -12,6 +12,7 @@ pub mod context;
 pub mod embedding;
 pub mod error;
 pub mod event;
+pub mod export;
 pub mod lens;
 pub mod llm;
 pub mod tool;
@@ -25,6 +26,7 @@ pub mod prelude {
     // ── Core traits ──────────────────────────────────────────────────
     pub use crate::approval::ApprovalHandler;
     pub use crate::embedding::EmbeddingProvider;
+    pub use crate::export::EventExporter;
     pub use crate::llm::LlmProvider;
     pub use crate::tool::Tool;
 

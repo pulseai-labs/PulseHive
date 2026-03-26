@@ -4,32 +4,51 @@
 //! substrate operations, and perception. [`EventEmitter`] provides a
 //! fire-and-forget broadcast mechanism for event distribution.
 //!
+//! Events are serializable to JSON for transmission to observability tools
+//! like PulseVision via [`EventExporter`](crate::export::EventExporter).
+//!
 //! Built on `tokio::sync::broadcast` for multi-consumer support.
 
 use pulsedb::{ExperienceId, InsightId, RelationId};
+use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 
 use crate::agent::{AgentKindTag, AgentOutcome};
 
+/// Returns the current time as epoch milliseconds.
+///
+/// Used by event emitters to timestamp events at creation time.
+pub fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
 /// Events emitted during agent execution.
 ///
 /// Covers the full lifecycle: agent start/stop, LLM calls, tool execution,
-/// substrate operations, and perception. All variants include `agent_id`
-/// where applicable for correlation.
+/// substrate operations, and perception. All variants include `timestamp_ms`
+/// (epoch milliseconds) and `agent_id` where applicable for correlation.
+///
+/// Serializes to tagged JSON: `{"type": "llm_call_completed", "agent_id": "...", ...}`
 ///
 /// Must be `Clone` because [`EventEmitter`] uses `tokio::sync::broadcast`
 /// which requires cloneable values.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
 pub enum HiveEvent {
     // ── Agent lifecycle ──────────────────────────────────────────────
     /// An agent has started execution.
     AgentStarted {
+        timestamp_ms: u64,
         agent_id: String,
         name: String,
         kind: AgentKindTag,
     },
     /// An agent has completed execution.
     AgentCompleted {
+        timestamp_ms: u64,
         agent_id: String,
         outcome: AgentOutcome,
     },
@@ -37,30 +56,50 @@ pub enum HiveEvent {
     // ── LLM interactions ─────────────────────────────────────────────
     /// An LLM call has been initiated.
     LlmCallStarted {
+        timestamp_ms: u64,
         agent_id: String,
         model: String,
         message_count: usize,
     },
     /// An LLM call has completed.
     LlmCallCompleted {
+        timestamp_ms: u64,
         agent_id: String,
         model: String,
         duration_ms: u64,
+        /// Prompt tokens consumed (0 if not reported by provider).
+        input_tokens: u32,
+        /// Completion tokens generated (0 if not reported by provider).
+        output_tokens: u32,
     },
     /// A token was received from a streaming LLM response.
-    LlmTokenStreamed { agent_id: String, token: String },
+    LlmTokenStreamed {
+        timestamp_ms: u64,
+        agent_id: String,
+        token: String,
+    },
 
     // ── Tool execution ───────────────────────────────────────────────
     /// A tool call has started.
-    ToolCallStarted { agent_id: String, tool_name: String },
+    ToolCallStarted {
+        timestamp_ms: u64,
+        agent_id: String,
+        tool_name: String,
+        /// Tool arguments as a JSON string.
+        params: String,
+    },
     /// A tool call has completed.
     ToolCallCompleted {
+        timestamp_ms: u64,
         agent_id: String,
         tool_name: String,
         duration_ms: u64,
+        /// Tool result preview (truncated to 200 chars).
+        result_preview: String,
     },
     /// A tool requires human approval before execution.
     ToolApprovalRequested {
+        timestamp_ms: u64,
         agent_id: String,
         tool_name: String,
         description: String,
@@ -69,20 +108,36 @@ pub enum HiveEvent {
     // ── Substrate operations ─────────────────────────────────────────
     /// An experience was recorded in the substrate.
     ExperienceRecorded {
+        timestamp_ms: u64,
         experience_id: ExperienceId,
         agent_id: String,
+        /// First 200 characters of the experience content.
+        content_preview: String,
+        /// Experience type as a string (e.g., "Generic", "Solution").
+        experience_type: String,
+        /// Importance score (0.0-1.0).
+        importance: f32,
     },
     /// A relationship was inferred between experiences.
-    RelationshipInferred { relation_id: RelationId },
+    RelationshipInferred {
+        timestamp_ms: u64,
+        relation_id: RelationId,
+        /// Agent that triggered the inference.
+        agent_id: String,
+    },
     /// An insight was synthesized from an experience cluster.
     InsightGenerated {
+        timestamp_ms: u64,
         insight_id: InsightId,
         source_count: usize,
+        /// Agent that triggered the synthesis.
+        agent_id: String,
     },
 
     // ── Perception ───────────────────────────────────────────────────
     /// An agent perceived the substrate through its lens.
     SubstratePerceived {
+        timestamp_ms: u64,
         agent_id: String,
         experience_count: usize,
         insight_count: usize,
@@ -91,6 +146,7 @@ pub enum HiveEvent {
     // ── Embedding ─────────────────────────────────────────────────
     /// An embedding was computed via the EmbeddingProvider.
     EmbeddingComputed {
+        timestamp_ms: u64,
         agent_id: String,
         dimensions: usize,
         duration_ms: u64,
@@ -103,6 +159,7 @@ pub enum HiveEvent {
     /// by other agents in the same collective. Forwarded from PulseDB's
     /// Watch system into the HiveEvent stream.
     WatchNotification {
+        timestamp_ms: u64,
         experience_id: ExperienceId,
         collective_id: pulsedb::CollectiveId,
         /// The type of change: "Created", "Updated", "Archived", or "Deleted".
@@ -165,6 +222,7 @@ mod tests {
     #[test]
     fn test_hive_event_is_debug_clone() {
         let event = HiveEvent::AgentStarted {
+            timestamp_ms: now_ms(),
             agent_id: "a1".into(),
             name: "researcher".into(),
             kind: AgentKindTag::Llm,
@@ -174,12 +232,53 @@ mod tests {
         assert!(debug.contains("researcher"));
     }
 
+    #[test]
+    fn test_hive_event_serializes_to_json() {
+        let event = HiveEvent::LlmCallCompleted {
+            timestamp_ms: 1711500000000,
+            agent_id: "agent-1".into(),
+            model: "gpt-4".into(),
+            duration_ms: 1500,
+            input_tokens: 200,
+            output_tokens: 50,
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains("\"type\":\"llm_call_completed\""));
+        assert!(json.contains("\"input_tokens\":200"));
+        assert!(json.contains("\"output_tokens\":50"));
+
+        // Roundtrip
+        let deserialized: HiveEvent = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            deserialized,
+            HiveEvent::LlmCallCompleted {
+                input_tokens: 200,
+                output_tokens: 50,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn test_hive_event_serialize_tool_call() {
+        let event = HiveEvent::ToolCallStarted {
+            timestamp_ms: now_ms(),
+            agent_id: "a1".into(),
+            tool_name: "search".into(),
+            params: r#"{"query":"test"}"#.into(),
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains("\"params\""));
+        assert!(json.contains("\"tool_call_started\""));
+    }
+
     #[tokio::test]
     async fn test_event_emitter_send_receive() {
         let emitter = EventEmitter::new(16);
         let mut rx = emitter.subscribe();
 
         emitter.emit(HiveEvent::AgentStarted {
+            timestamp_ms: now_ms(),
             agent_id: "a1".into(),
             name: "test".into(),
             kind: AgentKindTag::Llm,
@@ -196,8 +295,10 @@ mod tests {
         let mut rx2 = emitter.subscribe();
 
         emitter.emit(HiveEvent::ToolCallStarted {
+            timestamp_ms: now_ms(),
             agent_id: "a1".into(),
             tool_name: "search".into(),
+            params: "{}".into(),
         });
 
         let e1 = rx1.recv().await.unwrap();
@@ -209,10 +310,13 @@ mod tests {
     #[test]
     fn test_event_emitter_no_subscribers_no_panic() {
         let emitter = EventEmitter::new(16);
-        // Should not panic even with no subscribers
         emitter.emit(HiveEvent::ExperienceRecorded {
+            timestamp_ms: now_ms(),
             experience_id: ExperienceId::new(),
             agent_id: "a1".into(),
+            content_preview: "test".into(),
+            experience_type: "Generic".into(),
+            importance: 0.5,
         });
     }
 
@@ -220,14 +324,13 @@ mod tests {
     fn test_event_emitter_clone_is_cheap() {
         let emitter = EventEmitter::default();
         let cloned = emitter.clone();
-        // Both share the same channel
         let mut rx = cloned.subscribe();
         emitter.emit(HiveEvent::SubstratePerceived {
+            timestamp_ms: now_ms(),
             agent_id: "a1".into(),
             experience_count: 10,
             insight_count: 2,
         });
-        // rx should receive the event emitted via the original
         assert!(rx.try_recv().is_ok());
     }
 
@@ -240,71 +343,104 @@ mod tests {
 
     #[test]
     fn test_all_event_variants_clone() {
-        // Verify every variant can be cloned (compile-time check)
         let events: Vec<HiveEvent> = vec![
             HiveEvent::AgentStarted {
+                timestamp_ms: 0,
                 agent_id: "a".into(),
                 name: "n".into(),
                 kind: AgentKindTag::Llm,
             },
             HiveEvent::AgentCompleted {
+                timestamp_ms: 0,
                 agent_id: "a".into(),
                 outcome: AgentOutcome::Complete {
                     response: "done".into(),
                 },
             },
             HiveEvent::LlmCallStarted {
+                timestamp_ms: 0,
                 agent_id: "a".into(),
                 model: "gpt-4".into(),
                 message_count: 3,
             },
             HiveEvent::LlmCallCompleted {
+                timestamp_ms: 0,
                 agent_id: "a".into(),
                 model: "gpt-4".into(),
                 duration_ms: 1500,
+                input_tokens: 100,
+                output_tokens: 50,
             },
             HiveEvent::LlmTokenStreamed {
+                timestamp_ms: 0,
                 agent_id: "a".into(),
                 token: "hello".into(),
             },
             HiveEvent::ToolCallStarted {
+                timestamp_ms: 0,
                 agent_id: "a".into(),
                 tool_name: "search".into(),
+                params: "{}".into(),
             },
             HiveEvent::ToolCallCompleted {
+                timestamp_ms: 0,
                 agent_id: "a".into(),
                 tool_name: "search".into(),
                 duration_ms: 200,
+                result_preview: "found it".into(),
             },
             HiveEvent::ToolApprovalRequested {
+                timestamp_ms: 0,
                 agent_id: "a".into(),
                 tool_name: "delete".into(),
                 description: "Delete file".into(),
             },
             HiveEvent::ExperienceRecorded {
+                timestamp_ms: 0,
                 experience_id: ExperienceId::new(),
                 agent_id: "a".into(),
+                content_preview: "test".into(),
+                experience_type: "Generic".into(),
+                importance: 0.5,
             },
             HiveEvent::RelationshipInferred {
+                timestamp_ms: 0,
                 relation_id: RelationId::new(),
+                agent_id: "a".into(),
             },
             HiveEvent::InsightGenerated {
+                timestamp_ms: 0,
                 insight_id: InsightId::new(),
                 source_count: 5,
+                agent_id: "a".into(),
             },
             HiveEvent::SubstratePerceived {
+                timestamp_ms: 0,
                 agent_id: "a".into(),
                 experience_count: 10,
                 insight_count: 2,
             },
+            HiveEvent::EmbeddingComputed {
+                timestamp_ms: 0,
+                agent_id: "a".into(),
+                dimensions: 384,
+                duration_ms: 100,
+            },
             HiveEvent::WatchNotification {
+                timestamp_ms: 0,
                 experience_id: ExperienceId::new(),
                 collective_id: pulsedb::CollectiveId::new(),
                 event_type: "Created".into(),
             },
         ];
-        // Clone all — if any variant isn't Clone, this won't compile
         let _cloned: Vec<HiveEvent> = events.to_vec();
-        assert_eq!(events.len(), 13);
+        assert_eq!(events.len(), 14);
+    }
+
+    #[test]
+    fn test_now_ms_returns_nonzero() {
+        let ts = now_ms();
+        assert!(ts > 0, "Timestamp should be non-zero");
+        assert!(ts > 1_700_000_000_000, "Timestamp should be after 2023");
     }
 }

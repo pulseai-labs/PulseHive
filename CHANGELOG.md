@@ -5,6 +5,33 @@ All notable changes to PulseHive will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.0.0] - 2026-03-26
+
+### Breaking Changes — PulseVision-Ready Events
+
+#### HiveEvent Enrichment (BREAKING)
+- All 14 `HiveEvent` variants now include `timestamp_ms: u64` (epoch milliseconds)
+- `HiveEvent` now derives `Serialize, Deserialize` — events are JSON-serializable for WebSocket transmission
+- `AgentOutcome` and `AgentKindTag` now derive `Serialize, Deserialize`
+- `LlmCallCompleted`: added `input_tokens: u32`, `output_tokens: u32` (token usage tracking)
+- `ToolCallStarted`: added `params: String` (JSON-stringified tool arguments)
+- `ToolCallCompleted`: added `result_preview: String` (first 200 chars of tool result)
+- `ExperienceRecorded`: added `content_preview: String`, `experience_type: String`, `importance: f32`
+- `RelationshipInferred`: added `agent_id: String` (was missing — couldn't correlate to agent)
+- `InsightGenerated`: added `agent_id: String` (same)
+
+#### New: EventExporter Trait
+- `pulsehive_core::export::EventExporter` trait for streaming events to external systems (PulseVision)
+- `HiveMindBuilder::event_exporter()` registration method
+- Fire-and-forget export via `tokio::spawn` — zero latency on emit path
+
+#### Other Changes
+- Upgraded `pulsehive-db` dependency from 0.2 → 0.4 (PulseVision-ready APIs)
+- `TokenUsage` now derives `Serialize, Deserialize`
+- `now_ms()` public helper for epoch millisecond timestamps
+- Python + JS bindings updated with all new event fields
+- 233 Rust tests (up from 229), all passing
+
 ## [1.0.0] - 2026-03-25
 
 ### Production Release — PulseHive v1.0.0

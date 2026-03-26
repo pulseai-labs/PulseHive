@@ -146,11 +146,11 @@ Other agents immediately perceive the new experiences via PulseDB's Watch system
 
 ```toml
 [dependencies]
-pulsehive = { version = "1.0", features = ["openai"] }
+pulsehive = { version = "2.0", features = ["openai"] }
 # or
-pulsehive = { version = "1.0", features = ["anthropic"] }
+pulsehive = { version = "2.0", features = ["anthropic"] }
 # or both
-pulsehive = { version = "1.0", features = ["openai", "anthropic"] }
+pulsehive = { version = "2.0", features = ["openai", "anthropic"] }
 ```
 
 ## Documentation

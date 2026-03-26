@@ -121,7 +121,8 @@ pub trait ExperienceExtractor: Send + Sync {
 }
 
 /// Outcome of an agent's execution.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
 pub enum AgentOutcome {
     /// Agent completed successfully with a final response.
     Complete { response: String },
@@ -137,7 +138,8 @@ pub enum AgentOutcome {
 /// Compact tag for agent kind, used in [`HiveEvent`](crate::event::HiveEvent) variants.
 ///
 /// Carries no data — just identifies the type of agent for event reporting.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum AgentKindTag {
     Llm,
     Sequential,
