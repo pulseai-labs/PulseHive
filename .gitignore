@@ -30,7 +30,7 @@ opencode.json
 
 # Environment and data
 .env
-.env.*
+.env.local
 *.db
 
 # IDE

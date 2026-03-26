@@ -25,6 +25,8 @@ uuid = { workspace = true }
 [dev-dependencies]
 async-trait = { workspace = true }
 criterion = { workspace = true }
+dotenvy = "0.15"
+pulsehive-openai = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 tracing-subscriber = { version = "0.3", features = ["fmt"] }

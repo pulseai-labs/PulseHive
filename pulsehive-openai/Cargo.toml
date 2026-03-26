@@ -21,3 +21,8 @@ futures = { workspace = true }
 futures-core = { workspace = true }
 async-trait = { workspace = true }
 tracing = { workspace = true }
+
+[dev-dependencies]
+dotenvy = "0.15"
+tokio = { workspace = true, features = ["test-util"] }
+futures = { workspace = true }

@@ -89,6 +89,24 @@ npm test
 cargo bench -p pulsehive-runtime
 ```
 
+## Running Live API Tests
+
+Live tests call a real LLM API (GLM via OpenAI-compatible endpoint) and are skipped by default.
+
+```bash
+# 1. Copy .env.example to .env and fill in your API key
+cp .env.example .env
+
+# 2. Run all live tests
+cargo test -- --ignored
+
+# 3. Run specific live test suites
+cargo test -p pulsehive-openai --test live_api_test -- --ignored
+cargo test -p pulsehive-runtime --test live_integration_test -- --ignored
+```
+
+Live tests validate: single-turn chat, multi-turn tool calling, streaming, error handling, full agentic loop with tools, and multi-agent sequential workflows.
+
 ## Pull Request Process
 
 1. **Branch naming**: `feature/short-description`, `fix/issue-name`, or `docs/topic`
