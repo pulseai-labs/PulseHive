@@ -1,10 +1,11 @@
 # PulseVision — Product Specification
 
-> **Version:** 0.1.0-spec
-> **Status:** Design — ready for review
+> **Version:** 0.2.0-spec
+> **Status:** Design — SDK prerequisites complete, ready for implementation
 > **Created:** March 2026
+> **Updated:** March 2026
 > **Product type:** Real-time observability and visualization platform
-> **Dependencies:** PulseHive SDK v1.0+, PulseDB v0.2+
+> **Dependencies:** PulseHive SDK v2.0.0+ (enriched events, EventExporter), PulseDB v0.4.0+ (list APIs, read-only mode)
 
 ---
 
@@ -124,36 +125,35 @@ A directed acyclic graph (DAG) where each node is an agent, tool call, or LLM in
 
 Clicking any node opens a side panel showing:
 
-**For Agent nodes:**
-- System prompt
-- Lens configuration (domains, attention_budget, recency_curve)
-- Outcome (Complete/Error/MaxIterationsReached)
-- Full response text
-- Total tokens (prompt + completion)
-- Total wall time
+**For Agent nodes** (from `agent_started` + `agent_completed` events):
+- Agent name, kind (Llm/Sequential/Parallel/Loop)
+- Outcome (Complete with response / Error with message / MaxIterationsReached)
+- Total wall time (computed from timestamps)
+- Total tokens (summed from child LLM calls)
 - Experiences recorded during this agent's run
+- *Note: system_prompt and lens config are NOT in events (deferred to v2.1) — PulseVision can fetch via PulseDB if needed*
 
-**For LLM Call nodes:**
+**For LLM Call nodes** (from `llm_call_started` + `llm_call_completed` events):
 - Model name
 - Message count sent
 - Duration (ms)
-- Token usage (prompt tokens, completion tokens)
-- Cost estimate (based on model pricing)
+- Token usage: `input_tokens` + `output_tokens` (available in v2.0.0 events)
+- Cost estimate (computed from model pricing × token counts)
 
-**For Tool Call nodes:**
+**For Tool Call nodes** (from `tool_call_started` + `tool_call_completed` events):
 - Tool name
-- Parameters (JSON, pretty-printed)
-- Result (text/json/error)
+- Parameters: `params` field (JSON string, pretty-printed in panel)
+- Result preview: `result_preview` (first 200 chars — available in v2.0.0 events)
 - Duration (ms)
-- Approval status (approved/denied/modified)
+- Approval status (from `tool_approval_requested` event if present)
 
-**For Experience Recorded nodes:**
+**For Experience Recorded nodes** (from `experience_recorded` event):
 - Experience ID
-- Content (full text)
-- Type (Generic, Solution, ErrorPattern, etc.)
-- Importance, Confidence
-- Domain tags
-- Embedding dimensions
+- Content preview: `content_preview` (first 200 chars — available in v2.0.0 events)
+- Type: `experience_type` (e.g., "Generic", "Solution" — available in v2.0.0 events)
+- Importance: `importance` (f32 — available in v2.0.0 events)
+- Full content: fetch via PulseDB `get_experience(id)` on click
+- Embedding dimensions: fetch via PulseDB on demand
 
 ### Real-Time Animation
 
@@ -282,68 +282,90 @@ PulseDB stores 384-dimensional embeddings. To render in 3D:
 
 ---
 
-## 5. PulseHive SDK Changes Required
+## 5. SDK Prerequisites (Implemented)
 
-### New Trait: `EventExporter`
+All SDK changes needed by PulseVision are **shipped and published**. No further SDK work is required before building PulseVision.
 
+### PulseHive v2.0.0 (Published on crates.io)
+
+**HiveEvent is now JSON-serializable** — `#[derive(Serialize, Deserialize)]` with `#[serde(tag = "type", rename_all = "snake_case")]`. Every event can be transmitted over WebSocket with a single `serde_json::to_string(&event)`.
+
+**All 14 events include `timestamp_ms: u64`** — epoch milliseconds, enabling accurate timeline reconstruction and animation.
+
+**Enriched event data** — PulseVision gets everything it needs without follow-up queries:
+
+| Event | New Fields (v2.0.0) | PulseVision Use |
+|-------|---------------------|-----------------|
+| `LlmCallCompleted` | `input_tokens`, `output_tokens` | Token counter, cost estimation |
+| `ToolCallStarted` | `params` (JSON string) | Tool call inspection panel |
+| `ToolCallCompleted` | `result_preview` (200 chars) | Tool result display |
+| `ExperienceRecorded` | `content_preview`, `experience_type`, `importance` | 3D node rendering (size, color, label) |
+| `RelationshipInferred` | `agent_id` | Agent correlation in flow view |
+| `InsightGenerated` | `agent_id` | Agent correlation in flow view |
+
+**EventExporter trait** (`pulsehive_core::export::EventExporter`):
 ```rust
-// pulsehive-core/src/export.rs (new file)
-
 #[async_trait]
 pub trait EventExporter: Send + Sync {
-    /// Export a single HiveEvent to the external system.
     async fn export(&self, event: &HiveEvent);
-
-    /// Flush any buffered events.
     async fn flush(&self);
 }
 ```
 
-### WebSocket Exporter (New Crate: `pulsehive-vision`)
-
+Register with HiveMind:
 ```rust
-// pulsehive-vision/src/lib.rs (new optional crate)
+let hive = HiveMind::builder()
+    .substrate_path("my.db")
+    .llm_provider("openai", provider)
+    .event_exporter(my_ws_exporter)  // ← PulseVision connector
+    .build()?;
+```
 
-pub struct WebSocketExporter {
-    url: String,
-    sender: tokio::sync::broadcast::Sender<String>,
-}
+### PulseDB v0.4.0 (Published on crates.io)
 
-impl WebSocketExporter {
-    pub fn new(url: &str) -> Self { ... }
+**List APIs for full substrate enumeration:**
+```rust
+// All have default impls returning empty vecs (backward-compatible)
+async fn list_experiences(&self, collective: CollectiveId, limit: usize, offset: usize) -> Result<Vec<Experience>>;
+async fn list_relations(&self, collective: CollectiveId, limit: usize, offset: usize) -> Result<Vec<ExperienceRelation>>;
+async fn list_insights(&self, collective: CollectiveId, limit: usize, offset: usize) -> Result<Vec<DerivedInsight>>;
+```
+
+**Read-only mode** — PulseVision opens the DB safely:
+```rust
+let config = Config::read_only();
+let db = PulseDB::open("substrate.db", config)?;
+// All mutations return PulseDBError::ReadOnly
+```
+
+**Enriched WatchEvent** — includes full Experience data on Created/Updated:
+```rust
+pub struct WatchEvent {
+    pub experience_id: ExperienceId,
+    pub collective_id: CollectiveId,
+    pub event_type: WatchEventType,
+    pub timestamp: Timestamp,
+    pub experience: Option<Experience>,  // Populated for Created/Updated
 }
+```
+
+### What PulseVision Needs to Implement
+
+PulseVision only needs to provide a `WebSocketExporter` implementing `EventExporter`:
+```rust
+struct WebSocketExporter { /* tokio-tungstenite sender */ }
 
 #[async_trait]
 impl EventExporter for WebSocketExporter {
     async fn export(&self, event: &HiveEvent) {
         let json = serde_json::to_string(event).unwrap();
-        let _ = self.sender.send(json);
+        self.sender.send(json).await.ok();
     }
     async fn flush(&self) {}
 }
 ```
 
-### HiveMind Builder Integration
-
-```rust
-// Existing HiveMindBuilder gains:
-pub fn event_exporter(mut self, exporter: impl EventExporter + 'static) -> Self {
-    self.event_exporter = Some(Arc::new(exporter));
-    self
-}
-```
-
-When set, every `event_bus.emit(event)` also calls `exporter.export(&event)`.
-
-### Feature Flag
-
-```toml
-# pulsehive/Cargo.toml
-[features]
-vision = ["dep:pulsehive-vision"]
-```
-
-Zero overhead when `vision` feature is not enabled.
+This lives in PulseVision's server crate, not in PulseHive.
 
 ---
 
@@ -368,21 +390,45 @@ WS  /ws/events          → Real-time HiveEvent stream (from PulseHive)
 WS  /ws/substrate        → Real-time substrate changes (from PulseDB Watch)
 ```
 
-### Event Wire Format
+### Event Wire Format (PulseHive v2.0.0 actual format)
+
+Events arrive as flat JSON with `type` discriminator (no nested `data` object):
 
 ```json
 {
-  "type": "agent_started",
-  "timestamp": "2026-03-26T10:00:00Z",
-  "data": {
-    "agent_id": "019d...",
-    "name": "explorer",
-    "kind": "Llm"
-  }
+  "type": "llm_call_completed",
+  "timestamp_ms": 1711500000000,
+  "agent_id": "019d2475-ab8c-7ea2-ae48-32236c1ddfea",
+  "model": "GLM-4.7",
+  "duration_ms": 1500,
+  "input_tokens": 200,
+  "output_tokens": 50
 }
 ```
 
-All 14 HiveEvent variants serialized to JSON with a `type` discriminator.
+```json
+{
+  "type": "tool_call_started",
+  "timestamp_ms": 1711500001000,
+  "agent_id": "019d2475-ab8c-7ea2-ae48-32236c1ddfea",
+  "tool_name": "file_read",
+  "params": "{\"path\":\"src/main.rs\"}"
+}
+```
+
+```json
+{
+  "type": "experience_recorded",
+  "timestamp_ms": 1711500002000,
+  "experience_id": "019d2475-ab92-7a82-af17-cc293d6a5c4e",
+  "agent_id": "019d2475-ab8c-7ea2-ae48-32236c1ddfea",
+  "content_preview": "Task: Analyze codebase\n\nResult: Found 12 source files...",
+  "experience_type": "Generic { category: Some(\"task_completion\") }",
+  "importance": 0.7
+}
+```
+
+All 14 HiveEvent variants serialize to this flat JSON format via `serde_json::to_string(&event)`. No custom parsing needed — PulseVision's frontend can use `event.type`, `event.timestamp_ms`, `event.agent_id` directly.
 
 ---
 
@@ -542,7 +588,8 @@ pulsevision/
 [dependencies]
 axum = { version = "0.8", features = ["ws"] }
 tokio = { version = "1", features = ["full"] }
-pulsehive-db = { version = "0.2", features = ["builtin-embeddings"] }
+pulsehive-db = { version = "0.4", features = ["builtin-embeddings"] }
+pulsehive-core = { version = "2.0" }  # For HiveEvent deserialization
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tower-http = { version = "0.6", features = ["cors"] }
@@ -580,7 +627,12 @@ open http://localhost:3333
 ### Connecting PulseHive to PulseVision
 
 ```rust
-use pulsehive_vision::WebSocketExporter;
+use pulsehive::prelude::*;
+use pulsehive::{HiveMind, Task};
+
+// PulseVision provides this WebSocketExporter
+// (implements pulsehive_core::export::EventExporter)
+use pulsevision_client::WebSocketExporter;
 
 let hive = HiveMind::builder()
     .substrate_path("my_project.db")
@@ -588,8 +640,13 @@ let hive = HiveMind::builder()
     .event_exporter(WebSocketExporter::new("ws://localhost:3333/ws/ingest"))
     .build()?;
 
-// Now all HiveEvents stream to PulseVision in real-time
+// All HiveEvents now stream to PulseVision in real-time as JSON:
+// {"type":"agent_started","timestamp_ms":1711...,"agent_id":"019d...","name":"explorer","kind":"llm"}
+// {"type":"llm_call_completed","timestamp_ms":1711...,"input_tokens":200,"output_tokens":50,...}
+// {"type":"tool_call_started","timestamp_ms":1711...,"tool_name":"search","params":"{\"query\":\"test\"}",...}
 ```
+
+The `EventExporter` trait and `HiveMindBuilder::event_exporter()` are part of PulseHive v2.0.0 (published). PulseVision only needs to implement the `WebSocketExporter` struct.
 
 ---
 
