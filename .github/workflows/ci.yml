@@ -117,7 +117,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: EmbarkStudios/cargo-deny-action@bb137d7af7e4fb67e5f82a49c4fce4fad40782fe # v2
         with:
-          command: check advisories bans sources
+          command: check advisories bans licenses sources
 
   audit:
     name: Cargo Audit
