@@ -181,14 +181,14 @@ PulseHive **v1.0.0** is released — production-ready with Rust, Python, and Typ
 ## Related Projects
 
 - [**PulseDB**](https://crates.io/crates/pulsehive-db) — The embedded storage substrate powering PulseHive's shared consciousness
-- **PulseHive DevStudio** — AI-powered software development tool built on PulseHive (first vertical product)
+- The first vertical product built on PulseHive (details to be announced)
 
 ## Contributing
 
 PulseHive is open source under the AGPL-3.0 license. Contributions are welcome.
 
 ```bash
-git clone https://github.com/draco28/PulseHive.git
+git clone https://github.com/pulseai-labs/PulseHive.git
 cd PulseHive
 cargo build --workspace
 cargo test --workspace
@@ -198,4 +198,4 @@ See [Team Onboarding](docs/14-Team-Onboarding.md) for development setup and cont
 
 ## License
 
-PulseHive is licensed under the [GNU Affero General Public License v3.0](LICENSE).
+PulseHive is licensed under the [GNU Affero General Public License v3.0](LICENSE). A commercial license is also available for use cases that AGPL-3.0 does not suit — see [LICENSING.md](./LICENSING.md) for details.
