@@ -43,3 +43,17 @@ opencode.json
 # OS files
 .DS_Store
 Thumbs.db
+
+# Secrets / credentials (never commit — push protection + gitleaks also guard these)
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+id_rsa
+id_ed25519
+.secrets/
+.env.*
+!.env.example
+*.secret
+credentials.json
