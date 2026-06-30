@@ -1,17 +1,12 @@
 # PulseHive — Roadmap
 
-> Derived from MASTER-SPEC.md by `/plan-roadmap` on 2026-05-30.
-> Co-edited by user + scaffold-dev orchestrator over time.
-
 ## Roadmap overview
 
 PulseHive's near-term roadmap is organized around one **Phase** — *v2.x SDK Expansion*, the visionary horizon for the additive v2.x line before the v3.0 breaking work. Its first **Sprint** (the value-building window) is **v2.1.0**, which ships the provider and tooling capabilities downstream products have asked for: streaming tool execution, cooperative cancellation, and subscription-billed subprocess providers (Claude Code + Codex).
 
-Sprint 1.1 is decomposed to full **Vertical Slice** depth — four slices in strict dependency order (streaming → cancellation → stateless subprocess → stateful subprocess), each carrying 2–3 `auto:`/`user:` demo criteria. This is the build-ready surface scaffold-dev's orchestrator consumes. Slice 1 lands first because it absorbs the single `#[non_exhaustive]` contract change the others rely on; slice 2 depends on it; slices 3–4 build the new `pulsehive-subprocess` crate (stateless then stateful), gated behind a short de-risking spike on the open CLI questions. **All four slices ship as a single v2.1.0 release rather than split across two** — they are one coherent enhancement bundle downstream products requested together, and releasing them piecemeal would fragment downstream integration. Traceability arrays are empty for now (lightweight mode — no `/scaffold-docs` SRS/BACKLOG yet); they can be backfilled via `/plan-roadmap --refine-slice` once governance docs exist.
+Sprint 1.1 is decomposed to full **Vertical Slice** depth — four slices in strict dependency order (streaming → cancellation → stateless subprocess → stateful subprocess), each carrying 2–3 `auto:`/`user:` demo criteria. Slice 1 lands first because it absorbs the single `#[non_exhaustive]` contract change the others rely on; slice 2 depends on it; slices 3–4 build the new `pulsehive-subprocess` crate (stateless then stateful), gated behind a short de-risking spike on the open CLI questions. **All four slices ship as a single v2.1.0 release rather than split across two** — they are one coherent enhancement bundle downstream products requested together, and releasing them piecemeal would fragment downstream integration.
 
-Future enhancement batches (v2.2, v2.3, …) become **Sprint 1.2, 1.3, …** authored via `/plan-roadmap --add-sprint 1` as each approaches — keeping demo criteria grounded in real implementation context rather than speculation. The eventual v3.0 breaking work (e.g. the `TokenUsage` → tagged `Usage` enum) will open as a new Phase when its time comes.
-
-> **Note:** the title and this overview are manual additions; `/plan-roadmap` re-renders regenerate the slice hierarchy from state but reset these two fields — re-apply them after any re-render.
+Future enhancement batches (v2.2, v2.3, …) become **Sprint 1.2, 1.3, …** planned as each approaches — keeping demo criteria grounded in real implementation context rather than speculation. The eventual v3.0 breaking work (e.g. the `TokenUsage` → tagged `Usage` enum) will open as a new Phase when its time comes.
 
 ## Phase 1: v2.x SDK Expansion — near-term (v2.1.0 -> v2.x, before v3.0 breaking work)
 

@@ -93,7 +93,7 @@ let refiner = AgentDefinition {
 
 - [GitHub](https://github.com/pulseai-labs/PulseHive)
 - [API Docs (docs.rs)](https://docs.rs/pulsehive)
-- [SDK Specification](https://github.com/pulseai-labs/PulseHive/blob/main/SPEC.md)
+- [SDK Overview](https://github.com/pulseai-labs/PulseHive/blob/main/EXECUTIVE-SUMMARY.md)
 - [Getting Started Guide](https://github.com/pulseai-labs/PulseHive/blob/main/docs/getting-started.md)
 
 ## License
