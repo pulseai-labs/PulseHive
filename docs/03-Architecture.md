@@ -21,7 +21,7 @@ At the highest level, PulseHive sits between three categories of external actors
 ```
                         ┌─────────────────────────┐
                         │     PRODUCT CODE         │
-                        │  (DevStudio, PV Agent,   │
+                        │  (Your App, PV Agent,    │
                         │   Personal Assistant,    │
                         │   Research Engine, ...)   │
                         └───────────┬─────────────┘

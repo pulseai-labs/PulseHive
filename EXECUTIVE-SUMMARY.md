@@ -1,6 +1,6 @@
 # PulseHive — Executive Summary
 
-**PulseHive is a Rust SDK for building multi-agent AI systems whose agents share consciousness through a persistent substrate (PulseDB) instead of passing messages.** It is a framework — comparable to LangChain/LangGraph — **not** a product. Products are built *on* PulseHive (dev-automation tools, trading coaches, research engines, personal assistants); the first vertical product (DevStudio) and a downstream consumer (PulseTrader) live in separate repos.
+**PulseHive is a Rust SDK for building multi-agent AI systems whose agents share consciousness through a persistent substrate (PulseDB) instead of passing messages.** It is a framework — comparable to LangChain/LangGraph — **not** a product. Products are built *on* PulseHive (dev-automation tools, trading coaches, research engines, personal assistants); the first vertical product and a downstream consumer live in separate repos.
 
 ## What it is
 
