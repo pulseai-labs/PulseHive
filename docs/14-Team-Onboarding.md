@@ -52,7 +52,7 @@ cargo install cargo-expand   # Macro expansion viewer
 
 ```bash
 # Clone the repository
-git clone https://github.com/pulsehive/pulsehive.git
+git clone https://github.com/pulseai-labs/PulseHive.git
 cd pulsehive
 
 # Build the entire workspace

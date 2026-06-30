@@ -8,7 +8,7 @@ For extended onboarding context (architecture deep-dive, design decisions), see 
 
 ```bash
 # Clone the repository
-git clone https://github.com/pulsehive/pulsehive.git
+git clone https://github.com/pulseai-labs/PulseHive.git
 cd pulsehive
 
 # Build all crates

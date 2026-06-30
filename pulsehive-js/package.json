@@ -20,7 +20,7 @@
   "license": "AGPL-3.0-only",
   "repository": {
     "type": "git",
-    "url": "https://github.com/pulsehive/pulsehive"
+    "url": "https://github.com/pulseai-labs/PulseHive"
   },
   "engines": {
     "node": ">= 20"

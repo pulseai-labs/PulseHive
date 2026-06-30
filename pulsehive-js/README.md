@@ -1,6 +1,6 @@
 # PulseHive TypeScript/Node.js Bindings
 
-TypeScript/Node.js bindings for the [PulseHive](https://github.com/pulsehive/pulsehive) Rust SDK — shared consciousness for multi-agent AI systems.
+TypeScript/Node.js bindings for the [PulseHive](https://github.com/pulseai-labs/PulseHive) Rust SDK — shared consciousness for multi-agent AI systems.
 
 Get Rust-native performance with TypeScript ergonomics. Define agents, tools, and workflows in TypeScript while the runtime executes in Rust.
 
