@@ -59,7 +59,7 @@ napi-derive = "3"
 napi-build = "1"
 
 # Internal crate references (path + version for crates.io publishing)
-pulsehive-core = { path = "pulsehive-core", version = "2.0.1" }
-pulsehive-runtime = { path = "pulsehive-runtime", version = "2.0.1" }
-pulsehive-openai = { path = "pulsehive-openai", version = "2.0.1" }
-pulsehive-anthropic = { path = "pulsehive-anthropic", version = "2.0.1" }
+pulsehive-core = { path = "pulsehive-core", version = "2.0.2" }
+pulsehive-runtime = { path = "pulsehive-runtime", version = "2.0.2" }
+pulsehive-openai = { path = "pulsehive-openai", version = "2.0.2" }
+pulsehive-anthropic = { path = "pulsehive-anthropic", version = "2.0.2" }

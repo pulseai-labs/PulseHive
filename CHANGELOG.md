@@ -5,6 +5,18 @@ All notable changes to PulseHive will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.0.2] - 2026-07-01
+
+### Security
+- **pulsehive-py**: upgrade PyO3 `0.28` -> `0.29`, fixing **RUSTSEC-2026-0176** (out-of-bounds read in `PyList`/`PyTuple` iterators) and **RUSTSEC-2026-0177** (missing `Sync` bound on `PyCFunction::new_closure`). Also upgrades `pyo3-async-runtimes` to `0.29`.
+- Declare a Rust **1.83** MSRV (PyO3 0.29 requirement) across all crates.
+
+### Fixed
+- Correct crate metadata `repository`/`homepage` URLs to `github.com/pulseai-labs/PulseHive` (previously the stale `pulsehive/pulsehive` path).
+
+### Changed
+- Security/CI hardening: `cargo-deny` + `cargo-audit` gates (SHA-pinned actions), read-only workflow `GITHUB_TOKEN`, Dependabot config, `SECURITY.md` / `LICENSING.md` / `PUBLIC_BOUNDARY.md`, and a hardened `.gitignore`.
+
 ## [2.0.0] - 2026-03-26
 
 ### Breaking Changes — PulseVision-Ready Events
