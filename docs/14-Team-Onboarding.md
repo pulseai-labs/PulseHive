@@ -23,7 +23,7 @@ PulseHive is a Rust SDK for building multi-agent AI systems with shared consciou
 
 ### Required
 
-- **Rust stable toolchain** (1.75+). Install via [rustup](https://rustup.rs/).
+- **Rust stable toolchain** (1.83+). Install via [rustup](https://rustup.rs/).
 - **Git** for version control.
 - **Basic async Rust knowledge**: understanding of `async/await`, `tokio::spawn`, `Stream`, and why blocking in async context is bad.
 - **An LLM API key** for running examples: Anthropic (Claude) or any OpenAI-compatible provider (OpenAI, GLM, Ollama, etc.).
@@ -52,7 +52,7 @@ cargo install cargo-expand   # Macro expansion viewer
 
 ```bash
 # Clone the repository
-git clone https://github.com/pulsehive/pulsehive.git
+git clone https://github.com/pulseai-labs/PulseHive.git
 cd pulsehive
 
 # Build the entire workspace

@@ -4,6 +4,7 @@ version = "2.0.1"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+rust-version.workspace = true
 description = "Python bindings for PulseHive multi-agent SDK"
 
 [lib]
@@ -17,7 +18,7 @@ pulsehive-runtime = { workspace = true }
 pulsehive-openai = { workspace = true }
 pulsehive-anthropic = { workspace = true }
 pyo3 = { workspace = true }
-pyo3-async-runtimes = { version = "0.28", features = ["tokio-runtime"] }
+pyo3-async-runtimes = { version = "0.29", features = ["tokio-runtime"] }
 async-trait = { workspace = true }
 tokio = { workspace = true }
 futures = { workspace = true }

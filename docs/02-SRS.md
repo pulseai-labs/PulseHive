@@ -20,7 +20,7 @@ This System Requirements Specification defines the functional and non-functional
 
 PulseHive is a Rust SDK (library crate) for building multi-agent AI systems with shared consciousness through PulseDB. The SDK provides five core primitives (HiveMind, Agent, Tool, Lens, Experience), an intelligence layer (RelationshipDetector, InsightSynthesizer, ContextOptimizer), LLM provider abstractions, and observability infrastructure.
 
-PulseHive is NOT a product. It is a framework on which products (DevStudio, pharmacovigilance systems, research engines) are built.
+PulseHive is NOT a product. It is a framework on which products (pharmacovigilance systems, research engines) are built.
 
 ### 1.3 Definitions and Abbreviations
 

@@ -90,7 +90,7 @@ Once the trait boundaries stabilize (target: after Phase 2), the crate moves to 
 - **Minor** (1.1.0): New features, backward-compatible additions.
 - **Patch** (1.0.1): Bug fixes only.
 
-The 1.0 milestone requires: all five core primitives stabilized, at least two LLM providers shipping, and at least one production product (DevStudio) consuming the SDK successfully.
+The 1.0 milestone requires: all five core primitives stabilized, at least two LLM providers shipping, and at least one production product consuming the SDK successfully.
 
 ---
 

@@ -60,8 +60,8 @@ Each agent perceives the substrate through its Lens:
 
 - [pulsehive (meta-crate)](https://crates.io/crates/pulsehive)
 - [API Docs](https://docs.rs/pulsehive-runtime)
-- [GitHub](https://github.com/pulsehive/pulsehive)
-- [Benchmarks](https://github.com/pulsehive/pulsehive/blob/main/docs/benchmarks.md)
+- [GitHub](https://github.com/pulseai-labs/PulseHive)
+- [Benchmarks](https://github.com/pulseai-labs/PulseHive/blob/main/docs/benchmarks.md)
 
 ## License
 

@@ -11,14 +11,34 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
 
 jobs:
+  # Dependency policy gate — must pass before anything is published.
+  # Mirrors the cargo-deny gate in ci.yml (pinned action SHA, advisories/bans/sources).
+  cargo-deny:
+    name: Dependency Policy (cargo-deny)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@bb137d7af7e4fb67e5f82a49c4fce4fad40782fe # v2
+        with:
+          rust-version: stable
+          command: check advisories bans licenses sources
+
   publish:
     name: Publish to crates.io
     runs-on: ubuntu-latest
+    # Gated by a GitHub deployment environment (add a required reviewer on
+    # the "crates-io" environment to require manual approval before publish).
+    environment: crates-io
+    # Block publish until the dependency-policy gate passes.
+    needs: [cargo-deny]
     # Only publish on tag push (not workflow_dispatch) to prevent accidental publishes
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+
+    # Token scoped to this post-approval job only (kept out of the pre-publish cargo-deny gate).
+    env:
+      CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
 
     steps:
       - uses: actions/checkout@v4

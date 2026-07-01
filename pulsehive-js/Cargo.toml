@@ -4,6 +4,7 @@ version = "2.0.1"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+rust-version.workspace = true
 description = "TypeScript/Node.js bindings for PulseHive multi-agent SDK"
 
 [lib]

@@ -1,6 +1,6 @@
 # PulseHive Python Bindings
 
-Python bindings for the [PulseHive](https://github.com/pulsehive/pulsehive) Rust SDK — shared consciousness for multi-agent AI systems.
+Python bindings for the [PulseHive](https://github.com/pulseai-labs/PulseHive) Rust SDK — shared consciousness for multi-agent AI systems.
 
 Get Rust-native performance with Python ergonomics. Define agents, tools, and workflows in Python while the runtime executes in Rust.
 

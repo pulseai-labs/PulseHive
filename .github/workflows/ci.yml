@@ -9,6 +9,11 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+# Least-privilege default for the automatic GITHUB_TOKEN.
+# Jobs that need more (e.g. publish) opt in explicitly.
+permissions:
+  contents: read
+
 jobs:
   check:
     name: Check (${{ matrix.os }})
@@ -110,4 +115,24 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: EmbarkStudios/cargo-deny-action@v2
+      - uses: EmbarkStudios/cargo-deny-action@bb137d7af7e4fb67e5f82a49c4fce4fad40782fe # v2
+        with:
+          rust-version: stable
+          command: check advisories bans licenses sources
+
+  audit:
+    name: Cargo Audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@16b05812d776ae1dfaabc8277e421fb6d2506419 # v2.82.7
+        with:
+          tool: cargo-audit
+
+      - name: Generate lockfile
+        run: cargo generate-lockfile
+
+      - name: Run audit
+        run: cargo audit

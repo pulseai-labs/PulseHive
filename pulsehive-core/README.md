@@ -64,7 +64,7 @@ impl LlmProvider for MyProvider {
 
 - [pulsehive (meta-crate)](https://crates.io/crates/pulsehive)
 - [API Docs](https://docs.rs/pulsehive-core)
-- [GitHub](https://github.com/pulsehive/pulsehive)
+- [GitHub](https://github.com/pulseai-labs/PulseHive)
 
 ## License
 

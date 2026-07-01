@@ -51,7 +51,7 @@ let hive = HiveMind::builder()
 
 - [pulsehive (meta-crate)](https://crates.io/crates/pulsehive)
 - [API Docs](https://docs.rs/pulsehive-anthropic)
-- [GitHub](https://github.com/pulsehive/pulsehive)
+- [GitHub](https://github.com/pulseai-labs/PulseHive)
 
 ## License
 

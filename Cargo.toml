@@ -12,8 +12,9 @@ resolver = "2"
 
 [workspace.package]
 edition = "2021"
+rust-version = "1.83"   # pyo3 0.29 MSRV
 license = "AGPL-3.0-only"
-repository = "https://github.com/pulsehive/pulsehive"
+repository = "https://github.com/pulseai-labs/PulseHive"
 
 [workspace.dependencies]
 # Async runtime
@@ -50,7 +51,7 @@ tempfile = "3"
 criterion = { version = "0.5", features = ["html_reports"] }
 
 # Python bindings (PyO3)
-pyo3 = { version = "0.28", features = ["macros"] }
+pyo3 = { version = "0.29", features = ["macros"] }
 
 # Node.js bindings (napi-rs)
 napi = { version = "3", default-features = false }
