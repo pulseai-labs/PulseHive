@@ -28,6 +28,11 @@ AGENTS.md
 opencode.json
 .opencode/
 
+# AI-workspace material — belongs in the private workspace repo, never here
+MASTER-SPEC.md
+docs/specs/
+*.handoff.md
+
 # Environment and data
 .env
 .env.local
