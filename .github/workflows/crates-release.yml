@@ -50,14 +50,10 @@ jobs:
       # Publish in dependency order with wait between each.
       # "|| true" allows the step to pass if the version already exists
       # (e.g., when republishing after a manual publish).
+      # NOTE: pulsehive-runtime dev-depends on pulsehive-openai, so openai must
+      # be indexed BEFORE runtime is published, or runtime's verify build fails.
       - name: Publish pulsehive-core
         run: cargo publish -p pulsehive-core || true
-
-      - name: Wait for index propagation
-        run: sleep 30
-
-      - name: Publish pulsehive-runtime
-        run: cargo publish -p pulsehive-runtime || true
 
       - name: Wait for index propagation
         run: sleep 30
@@ -67,6 +63,12 @@ jobs:
 
       - name: Publish pulsehive-anthropic
         run: cargo publish -p pulsehive-anthropic || true
+
+      - name: Wait for index propagation
+        run: sleep 30
+
+      - name: Publish pulsehive-runtime
+        run: cargo publish -p pulsehive-runtime || true
 
       - name: Wait for index propagation
         run: sleep 30
