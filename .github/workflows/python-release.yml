@@ -43,7 +43,11 @@ jobs:
           done
           echo "Selected Xcode: $(xcode-select -p)"
 
-      - name: Build wheel
+      # Because pyo3 enables the abi3-py39 feature, maturin produces a single
+      # forward-compatible cp39-abi3 wheel per platform that runs on CPython
+      # 3.9+ (via the stable ABI) — instead of a cp312-only wheel that forced
+      # 3.9-3.11 users onto an sdist -> local Rust build. Fixes #24.
+      - name: Build abi3 wheel (cp39-abi3, CPython 3.9+)
         uses: PyO3/maturin-action@v1
         with:
           target: ${{ matrix.target }}
