@@ -48,7 +48,7 @@ jobs:
         with:
           target: ${{ matrix.target }}
           args: --release --out dist --manifest-path pulsehive-py/Cargo.toml
-          manylinux: auto
+          manylinux: 2_28
           # Install OpenSSL dev headers in manylinux container (needed by reqwest/native-tls)
           before-script-linux: |
             if command -v yum &> /dev/null; then
