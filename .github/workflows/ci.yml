@@ -42,7 +42,15 @@ jobs:
         with:
           components: rustfmt, clippy
 
+      # prefix-key bumped to purge a poisoned macOS cache: a prior successful run
+      # cached a build made under Xcode 26.5, whose clang_rt.osx search path
+      # (.../Xcode_26.5.app/.../clang/21/lib/darwin) does not exist on the
+      # macos-15 runner -> `ld: library 'clang_rt.osx' not found`, even with the
+      # correct DEVELOPER_DIR set. Bumping the key forces a fresh build under the
+      # pinned Xcode 16.x (see the DEVELOPER_DIR step below).
       - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: "v2-rust"
 
       # Xcode 26 relocated clang_rt.osx, breaking rustc's default linking
       # (`ld: library 'clang_rt.osx' not found`). Pin to a pre-26 Xcode.
