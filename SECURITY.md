@@ -25,7 +25,7 @@ Please give us a reasonable window to release a fix before any public disclosure
 
 ## Supported versions
 
-PulseHive is on the `2.x` line; the latest published `2.x` release (currently **2.0.1**) on crates.io is supported. Security fixes target the **latest published `2.x` release** — older releases are not patched, so please upgrade.
+PulseHive is on the `2.x` line; the latest published `2.x` release on crates.io is supported. Security fixes target the **latest published `2.x` release** — older releases are not patched, so please upgrade.
 
 | Version | Supported |
 |---------|-----------|
