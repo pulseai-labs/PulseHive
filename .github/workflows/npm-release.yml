@@ -17,7 +17,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: macos-latest
+          # macos-15 (not macos-latest): macos-latest now defaults to Xcode 26,
+          # whose relocated clang_rt.osx breaks rustc linking. macos-15 ships a
+          # pre-26 Xcode; the step below pins the compiler via DEVELOPER_DIR.
+          - os: macos-15
             target: aarch64-apple-darwin
             platform: macOS-arm64
           - os: ubuntu-latest
@@ -35,6 +38,10 @@ jobs:
           targets: ${{ matrix.target }}
 
       - uses: Swatinem/rust-cache@v2
+        with:
+          # Bumped to avoid restoring a macOS cache that hardcodes a stale
+          # Xcode 26.x clang_rt.osx path (see the DEVELOPER_DIR step below).
+          prefix-key: "v2-rust"
 
       - uses: actions/setup-node@v4
         with:
@@ -49,14 +56,23 @@ jobs:
         working-directory: pulsehive-js
         run: npm install
 
-      - name: Select a pre-26 Xcode (Xcode 26.5 clang_rt.osx layout breaks rustc linking)
+      # Pin the compiler to a pre-26 Xcode via DEVELOPER_DIR (which OVERRIDES
+      # xcode-select). Xcode 26 relocated clang_rt.osx and breaks rustc linking.
+      - name: Use a pre-26 Xcode (avoid Xcode 26 clang_rt.osx linker break)
         if: runner.os == 'macOS'
         run: |
-          ls -d /Applications/Xcode_*.app 2>/dev/null || true
+          sel=""
           for v in 16.4 16.3 16.2 16.1 16.0 15.4 15.2; do
-            if [ -d "/Applications/Xcode_$v.app" ]; then sudo xcode-select -s "/Applications/Xcode_$v.app"; break; fi
+            if [ -d "/Applications/Xcode_$v.app" ]; then sel="/Applications/Xcode_$v.app/Contents/Developer"; break; fi
           done
-          echo "Selected Xcode: $(xcode-select -p)"
+          if [ -z "$sel" ]; then
+            echo "::error::No pre-26 Xcode found on this runner. Installed Xcodes:"
+            ls -d /Applications/Xcode_*.app 2>/dev/null || true
+            exit 1
+          fi
+          sudo xcode-select -s "$sel"
+          echo "DEVELOPER_DIR=$sel" >> "$GITHUB_ENV"
+          echo "Using Xcode: $sel"
 
       # Wrapped in a retry loop to absorb a flaky upstream build dependency:
       # the `ort-sys` build script (pulled transitively via pulsehive-db's
