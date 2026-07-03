@@ -58,9 +58,31 @@ jobs:
           done
           echo "Selected Xcode: $(xcode-select -p)"
 
-      - name: Build native addon
+      # Wrapped in a retry loop to absorb a flaky upstream build dependency:
+      # the `ort-sys` build script (pulled transitively via pulsehive-db's
+      # builtin-embeddings -> ort / ONNX Runtime) downloads a prebuilt binary
+      # from cdn.pyke.io, which intermittently returns HTTP 403 (rate-limit /
+      # transient). That was breaking the Linux binary build. Retrying rides
+      # over the transient failure. A durable upstream fix (pin the ONNX
+      # Runtime lib or switch ort to load-dynamic in pulsehive-db) would remove
+      # the need for this. See the release-ops "Known fragility" notes.
+      - name: Build native addon (retry to absorb flaky ort-sys CDN 403)
         working-directory: pulsehive-js
-        run: npx napi build --platform --release --features napi --target ${{ matrix.target }}
+        shell: bash
+        run: |
+          set -uo pipefail
+          attempt=0
+          max=3
+          until [ "$attempt" -ge "$max" ]; do
+            if npx napi build --platform --release --features napi --target ${{ matrix.target }}; then
+              exit 0
+            fi
+            attempt=$((attempt + 1))
+            echo "napi build failed (attempt $attempt/$max) — likely a transient ort-sys cdn.pyke.io 403; retrying in 20s..."
+            sleep 20
+          done
+          echo "::error::napi build failed after $max attempts"
+          exit 1
 
       - name: Upload binary
         uses: actions/upload-artifact@v4
@@ -68,36 +90,46 @@ jobs:
           name: binary-${{ matrix.platform }}
           path: pulsehive-js/pulsehive-js.*.node
 
-  # TODO: Uncomment when npm account is configured
-  # publish:
-  #   name: Publish to npm
-  #   needs: [build-binaries]
-  #   runs-on: ubuntu-latest
-  #   # Only publish on tag push (not workflow_dispatch)
-  #   if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
-  #   steps:
-  #     - uses: actions/checkout@v4
-  #
-  #     - uses: actions/setup-node@v4
-  #       with:
-  #         node-version: "20"
-  #         registry-url: "https://registry.npmjs.org"
-  #
-  #     - name: Download all binary artifacts
-  #       uses: actions/download-artifact@v4
-  #       with:
-  #         path: pulsehive-js
-  #         pattern: binary-*
-  #         merge-multiple: true
-  #
-  #     - name: Install deps and prepare
-  #       working-directory: pulsehive-js
-  #       run: |
-  #         npm install
-  #         npx napi prepublish
-  #
-  #     - name: Publish to npm
-  #       working-directory: pulsehive-js
-  #       run: npm publish --access public
-  #       env:
-  #         NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+  publish:
+    name: Publish to npm
+    needs: [build-binaries]
+    runs-on: ubuntu-latest
+    # Only publish on tag push (not workflow_dispatch)
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    # NPM_TOKEN is provisioned as a repository secret (see release-ops handoff).
+    # Optional hardening, for parity with the crates-io / pypi jobs: move the
+    # token to an `npm` deployment environment and add `environment: npm` here
+    # so only this gated job can read it (and you can require a reviewer).
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Download all binary artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: pulsehive-js
+          pattern: binary-*
+          merge-multiple: true
+
+      - name: Install deps and prepare
+        working-directory: pulsehive-js
+        run: |
+          npm install
+          npx napi prepublish
+
+      - name: Publish to npm
+        working-directory: pulsehive-js
+        shell: bash
+        run: |
+          if [ -z "${NODE_AUTH_TOKEN:-}" ]; then
+            echo "::warning::NPM_TOKEN secret is not set — skipping npm publish."
+            echo "Add the NPM_TOKEN repository secret to enable @pulsehive/sdk publishing."
+            exit 0
+          fi
+          npm publish --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
