@@ -17,7 +17,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: macos-latest
+          - os: macos-15 # pinned off macos-latest (Xcode 26.5 clang_rt link bug)
             target: aarch64-apple-darwin
             platform: macOS-arm64
           - os: ubuntu-latest
