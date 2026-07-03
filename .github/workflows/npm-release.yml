@@ -17,7 +17,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: macos-15 # pinned off macos-latest (Xcode 26.5 clang_rt link bug)
+          - os: macos-latest
             target: aarch64-apple-darwin
             platform: macOS-arm64
           - os: ubuntu-latest
@@ -48,6 +48,15 @@ jobs:
       - name: Install npm deps
         working-directory: pulsehive-js
         run: npm install
+
+      - name: Select a pre-26 Xcode (Xcode 26.5 clang_rt.osx layout breaks rustc linking)
+        if: runner.os == 'macOS'
+        run: |
+          ls -d /Applications/Xcode_*.app 2>/dev/null || true
+          for v in 16.4 16.3 16.2 16.1 16.0 15.4 15.2; do
+            if [ -d "/Applications/Xcode_$v.app" ]; then sudo xcode-select -s "/Applications/Xcode_$v.app"; break; fi
+          done
+          echo "Selected Xcode: $(xcode-select -p)"
 
       - name: Build native addon
         working-directory: pulsehive-js

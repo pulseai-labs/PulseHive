@@ -21,7 +21,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-15, windows-latest] # macos pinned: macos-latest (Xcode 26.5) breaks clang_rt.osx linking
+        os: [ubuntu-latest, macos-latest, windows-latest]
 
     steps:
       - uses: actions/checkout@v4
@@ -31,6 +31,15 @@ jobs:
           components: rustfmt, clippy
 
       - uses: Swatinem/rust-cache@v2
+
+      - name: Select a pre-26 Xcode (Xcode 26.5 clang_rt.osx layout breaks rustc linking)
+        if: runner.os == 'macOS'
+        run: |
+          ls -d /Applications/Xcode_*.app 2>/dev/null || true
+          for v in 16.4 16.3 16.2 16.1 16.0 15.4 15.2; do
+            if [ -d "/Applications/Xcode_$v.app" ]; then sudo xcode-select -s "/Applications/Xcode_$v.app"; break; fi
+          done
+          echo "Selected Xcode: $(xcode-select -p)"
 
       - name: Format check
         run: cargo fmt --all --check
