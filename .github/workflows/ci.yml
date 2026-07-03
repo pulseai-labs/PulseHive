@@ -16,12 +16,24 @@ permissions:
 
 jobs:
   check:
-    name: Check (${{ matrix.os }})
+    name: Check (${{ matrix.label }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        # macOS runs on the pinned `macos-15` image, which reliably ships a
+        # pre-26 Xcode (working clang_rt.osx). The rolling `macos-latest` image
+        # intermittently lacks any pre-26 Xcode, so the "select a pre-26 Xcode"
+        # step below finds nothing and the build fails to link (clang_rt.osx not
+        # found under Xcode 26.5). We keep the check *name* as "Check (macos-latest)"
+        # via `label` so the required-status-check config needs no change.
+        include:
+          - os: ubuntu-latest
+            label: ubuntu-latest
+          - os: macos-15
+            label: macos-latest
+          - os: windows-latest
+            label: windows-latest
 
     steps:
       - uses: actions/checkout@v4
