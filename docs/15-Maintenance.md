@@ -245,7 +245,6 @@ PulseHive is currently maintained by a solo developer. The following practices r
 ### 8.1 Documentation as Insurance
 
 - **docs/03-Architecture.md** captures the architecture and design decisions with rationale.
-- **CLAUDE.md** provides complete context for AI-assisted development continuity.
 - **Doc comments** explain not just what code does, but why.
 - **CHANGELOG.md** provides a complete history of decisions and changes.
 - **discussion.md** preserves the design thinking behind non-obvious choices.
@@ -258,9 +257,9 @@ PulseHive is currently maintained by a solo developer. The following practices r
 - Example programs that serve as end-to-end smoke tests.
 - CI runs tests on three platforms (Linux, macOS, Windows) to catch platform-specific issues.
 
-### 8.3 AI-Assisted Development Continuity
+### 8.3 Onboarding Continuity
 
-PulseHive is developed with Claude Code. The CLAUDE.md file contains sufficient context for any Claude instance to continue development:
+A new maintainer should be able to get productive from the repository alone. The following provide sufficient context to continue development:
 
 - Project overview and architecture.
 - Crate structure and dependency relationships.
@@ -268,7 +267,7 @@ PulseHive is developed with Claude Code. The CLAUDE.md file contains sufficient 
 - PulseDB relationship and API surface.
 - Development commands and workflows.
 
-If a new maintainer (human or AI-assisted) takes over, reading CLAUDE.md + EXECUTIVE-SUMMARY.md provides a complete onboarding path.
+If a new maintainer takes over, reading EXECUTIVE-SUMMARY.md + docs/14-Team-Onboarding.md provides a complete onboarding path.
 
 ### 8.4 Code Organization
 

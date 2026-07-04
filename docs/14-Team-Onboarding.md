@@ -108,7 +108,6 @@ pulsehive/
 ├── examples/                   # Runnable examples
 ├── EXECUTIVE-SUMMARY.md        # Executive spec — vision, architecture, scope
 ├── CHANGELOG.md                # Release history
-├── CLAUDE.md                   # Claude Code context file
 └── docs/                       # Operations and design documents
 ```
 
