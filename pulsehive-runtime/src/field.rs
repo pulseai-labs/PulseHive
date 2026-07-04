@@ -115,6 +115,7 @@ pub fn cosine_distance(a: &[f32], b: &[f32]) -> f32 {
 mod tests {
     use super::*;
     use pulsedb::{AgentId, CollectiveId, ExperienceType, Timestamp};
+    use std::collections::BTreeMap;
 
     fn mock_experience(importance: f32, confidence: f32, applications: u32) -> Experience {
         Experience {
@@ -125,7 +126,7 @@ mod tests {
             embedding: vec![1.0, 0.0, 0.0],
             importance,
             confidence,
-            applications: std::collections::BTreeMap::from([(pulsedb::InstanceId::new(), applications)]),
+            applications: BTreeMap::from([(pulsedb::InstanceId::new(), applications)]),
             last_reinforced: Timestamp::now(),
             domain: vec![],
             source_agent: AgentId("test".to_string()),

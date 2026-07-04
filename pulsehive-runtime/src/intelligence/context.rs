@@ -170,6 +170,7 @@ impl ContextOptimizer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
 
     fn make_experience(importance: f32, age_hours: f32, applications: u32) -> Experience {
         let now_ms = 1_700_000_000_000_i64;
@@ -182,7 +183,7 @@ mod tests {
             experience_type: pulsedb::ExperienceType::Generic { category: None },
             importance,
             confidence: 0.8,
-            applications: std::collections::BTreeMap::from([(pulsedb::InstanceId::new(), applications)]),
+            applications: BTreeMap::from([(pulsedb::InstanceId::new(), applications)]),
             last_reinforced: Timestamp(now_ms - age_ms),
             domain: vec![],
             related_files: vec![],
