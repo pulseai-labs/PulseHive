@@ -47,31 +47,44 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      # Publish in dependency order with wait between each.
-      # "|| true" allows the step to pass if the version already exists
-      # (e.g., when republishing after a manual publish).
+      # Publish in dependency order with a wait between each so the index
+      # propagates. The `publish` helper is IDEMPOTENT — it tolerates a version
+      # that is already on crates.io (e.g. republishing after a manual publish)
+      # but FAILS LOUDLY on any other error. This replaces the old blanket
+      # `|| true`, which masked genuine publish failures (it once hid a real
+      # failed publish — see issue #26).
       # NOTE: pulsehive-runtime dev-depends on pulsehive-openai, so openai must
       # be indexed BEFORE runtime is published, or runtime's verify build fails.
-      - name: Publish pulsehive-core
-        run: cargo publish -p pulsehive-core --no-verify || true
+      - name: Publish crates (dependency order, fail-loud + idempotent)
+        run: |
+          set -uo pipefail
 
-      - name: Wait for index propagation
-        run: sleep 30
+          publish() {
+            local crate="$1"
+            echo "::group::cargo publish -p $crate"
+            local out status
+            out="$(cargo publish -p "$crate" --no-verify 2>&1)"
+            status=$?
+            printf '%s\n' "$out"
+            echo "::endgroup::"
+            if [ "$status" -eq 0 ]; then
+              echo "published: $crate"
+              return 0
+            fi
+            # Idempotent: a version already on the index is not a failure.
+            if printf '%s\n' "$out" | grep -qiE 'already (uploaded|exists)'; then
+              echo "note: $crate is already published at this version — skipping (idempotent)"
+              return 0
+            fi
+            echo "::error::publishing $crate failed (exit $status) — see log above" >&2
+            return 1
+          }
 
-      - name: Publish pulsehive-openai
-        run: cargo publish -p pulsehive-openai --no-verify || true
-
-      - name: Publish pulsehive-anthropic
-        run: cargo publish -p pulsehive-anthropic --no-verify || true
-
-      - name: Wait for index propagation
-        run: sleep 30
-
-      - name: Publish pulsehive-runtime
-        run: cargo publish -p pulsehive-runtime --no-verify || true
-
-      - name: Wait for index propagation
-        run: sleep 30
-
-      - name: Publish pulsehive (meta-crate)
-        run: cargo publish -p pulsehive --no-verify || true
+          publish pulsehive-core     || exit 1
+          sleep 30
+          publish pulsehive-openai   || exit 1
+          publish pulsehive-anthropic || exit 1
+          sleep 30
+          publish pulsehive-runtime  || exit 1
+          sleep 30
+          publish pulsehive          || exit 1
