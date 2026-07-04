@@ -38,7 +38,7 @@ Run benchmarks locally: `cargo bench -p pulsehive-runtime`
 - Bounded in practice by `attention_budget * 2` (typically 100 experiences)
 - Without attractors, reranking scales linearly and is well within targets
 
-## Performance Targets (from CLAUDE.md)
+## Performance Targets
 
 | Operation | Target (1K) | Target (100K) | Measured (1K) | Measured (10K) |
 |-----------|-------------|---------------|---------------|----------------|
