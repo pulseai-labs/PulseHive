@@ -155,7 +155,7 @@ fn compute_type_weight(exp: &Experience, lens: &Lens) -> f32 {
 fn compute_temporal_score(exp: &Experience, lens: &Lens, now: Timestamp) -> f32 {
     let age_hours = (now.0 - exp.timestamp.0) as f32 / (1000.0 * 3600.0);
     let age_hours = age_hours.max(0.0); // Guard against negative (clock skew)
-    let reinforcement = 1.0 + (exp.applications as f32 * 0.1);
+    let reinforcement = 1.0 + (exp.applications() as f32 * 0.1);
 
     match &lens.recency_curve {
         RecencyCurve::Exponential { half_life_hours } => {
@@ -305,8 +305,9 @@ mod tests {
             source_agent: AgentId("test".into()),
             source_task: None,
             timestamp: Timestamp(now_ms - age_ms),
+            last_reinforced: Timestamp(now_ms - age_ms),
             archived: false,
-            applications: 0,
+            applications: std::collections::BTreeMap::new(),
         }
     }
 
