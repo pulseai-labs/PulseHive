@@ -7,6 +7,7 @@ use pulsedb::{AgentId, CollectiveId, Experience, ExperienceId, ExperienceType, T
 use pulsehive_core::lens::Lens;
 use pulsehive_runtime::field::{cosine_distance, AttractorConfig, AttractorDynamics};
 use pulsehive_runtime::perception::rerank;
+use std::collections::BTreeMap;
 
 fn mock_experience(idx: usize) -> Experience {
     // Generate a pseudo-random embedding based on index
@@ -24,7 +25,8 @@ fn mock_experience(idx: usize) -> Experience {
         embedding,
         importance: 0.3 + (idx as f32 % 7.0) * 0.1,
         confidence: 0.5 + (idx as f32 % 5.0) * 0.1,
-        applications: (idx % 3) as u32,
+        applications: BTreeMap::from([(pulsedb::InstanceId::new(), (idx % 3) as u32)]),
+        last_reinforced: Timestamp::now(),
         domain: vec![format!("domain-{}", idx % 3)],
         source_agent: AgentId("bench-agent".into()),
         source_task: None,

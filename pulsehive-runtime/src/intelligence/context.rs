@@ -69,7 +69,7 @@ impl ContextOptimizer {
 
         let decay = 0.5_f32.powf(age_hours / self.config.decay_half_life_hours);
         let reinforcement =
-            1.0 + (experience.applications as f32 * self.config.reinforcement_boost);
+            1.0 + (experience.applications() as f32 * self.config.reinforcement_boost);
 
         experience.importance * decay * reinforcement
     }
@@ -170,6 +170,7 @@ impl ContextOptimizer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
 
     fn make_experience(importance: f32, age_hours: f32, applications: u32) -> Experience {
         let now_ms = 1_700_000_000_000_i64;
@@ -182,7 +183,8 @@ mod tests {
             experience_type: pulsedb::ExperienceType::Generic { category: None },
             importance,
             confidence: 0.8,
-            applications,
+            applications: BTreeMap::from([(pulsedb::InstanceId::new(), applications)]),
+            last_reinforced: Timestamp(now_ms - age_ms),
             domain: vec![],
             related_files: vec![],
             source_agent: pulsedb::AgentId("test".into()),

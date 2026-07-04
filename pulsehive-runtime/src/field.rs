@@ -58,7 +58,7 @@ impl AttractorDynamics {
     ///
     /// Strength formula: `importance * confidence * (1 + applications * reinforcement_boost)`
     pub fn from_experience(exp: &Experience, config: &AttractorConfig) -> Self {
-        let reinforcement = 1.0 + (exp.applications as f32 * config.reinforcement_boost);
+        let reinforcement = 1.0 + (exp.applications() as f32 * config.reinforcement_boost);
         Self {
             experience_id: exp.id,
             strength: exp.importance * exp.confidence * reinforcement,
@@ -115,6 +115,7 @@ pub fn cosine_distance(a: &[f32], b: &[f32]) -> f32 {
 mod tests {
     use super::*;
     use pulsedb::{AgentId, CollectiveId, ExperienceType, Timestamp};
+    use std::collections::BTreeMap;
 
     fn mock_experience(importance: f32, confidence: f32, applications: u32) -> Experience {
         Experience {
@@ -125,7 +126,8 @@ mod tests {
             embedding: vec![1.0, 0.0, 0.0],
             importance,
             confidence,
-            applications,
+            applications: BTreeMap::from([(pulsedb::InstanceId::new(), applications)]),
+            last_reinforced: Timestamp::now(),
             domain: vec![],
             source_agent: AgentId("test".to_string()),
             source_task: None,
