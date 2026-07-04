@@ -312,7 +312,7 @@ hive = HiveMind.builder()
 ## Next Steps
 
 - **API Documentation**: `cargo doc --no-deps --workspace --open`
-- **Architecture**: [`SPEC.md`](../SPEC.md) — full SDK specification
+- **Architecture**: [`docs/03-Architecture.md`](03-Architecture.md) — architecture & design
 - **Examples**: [`pulsehive-runtime/examples/`](../pulsehive-runtime/examples/), [`pulsehive-py/examples/`](../pulsehive-py/examples/), [`pulsehive-js/examples/`](../pulsehive-js/examples/)
 - **Contributing**: [`CONTRIBUTING.md`](../CONTRIBUTING.md)
 - **PulseDB**: [`docs/pulsedb-api-reference.md`](pulsedb-api-reference.md) — storage substrate API

@@ -106,15 +106,14 @@ pulsehive/
 │   └── src/lib.rs              # Re-exports + feature flags (anthropic, openai)
 │
 ├── examples/                   # Runnable examples
-├── SPEC.md                     # Full SDK specification (the source of truth)
+├── EXECUTIVE-SUMMARY.md        # Executive spec — vision, architecture, scope
 ├── CHANGELOG.md                # Release history
-├── CLAUDE.md                   # Claude Code context file
 └── docs/                       # Operations and design documents
 ```
 
 ### Reading Order for New Contributors
 
-1. **SPEC.md** sections 1-5: Vision, Architecture, Core Primitives, Intelligence, Field Dynamics.
+1. **EXECUTIVE-SUMMARY.md**, then **docs/03-Architecture.md**: Vision, Architecture, Core Primitives, Intelligence.
 2. **pulsehive-core/src/**: Read every file. This is the entire public API surface. It is small.
 3. **pulsehive-runtime/src/hivemind.rs**: The orchestrator. Understand the builder and deploy flow.
 4. **pulsehive-runtime/src/loop.rs**: The agentic loop. This is the heart of the system.
@@ -315,7 +314,7 @@ Currently a solo developer + Claude Code workflow. As the project grows:
 
 | Resource | What It Contains |
 |----------|-----------------|
-| `SPEC.md` | The complete SDK specification — architecture, primitives, intelligence, phases |
+| `EXECUTIVE-SUMMARY.md` + `docs/03-Architecture.md` | The SDK spec — architecture, primitives, intelligence, phases |
 | `docs/` | Operations documents (this file, deployment, observability, performance, maintenance) |
 | `docs/pulsedb-api-reference.md` | PulseDB API surface — types, traits, methods |
 | `docs/vision-mapping.md` | How PulseHive concepts map to PulseDB storage primitives |
@@ -323,7 +322,7 @@ Currently a solo developer + Claude Code workflow. As the project grows:
 | `examples/` | Runnable code examples |
 | GitHub Issues | Bug reports, feature requests, questions |
 
-**If you are stuck:** Read SPEC.md first. It is the single source of truth. If the spec does not answer your question, open a GitHub Issue.
+**If you are stuck:** Read EXECUTIVE-SUMMARY.md first, then docs/03-Architecture.md. If they do not answer your question, open a GitHub Issue.
 
 ---
 
