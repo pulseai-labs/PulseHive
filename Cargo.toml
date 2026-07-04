@@ -44,7 +44,7 @@ futures = "0.3"
 pulsehive-db = { version = "0.5", features = ["builtin-embeddings"] }
 
 # HTTP client (for LLM provider crates)
-reqwest = { version = "0.12", features = ["json", "stream"] }
+reqwest = { version = "0.13", features = ["json", "stream"] }
 
 # Testing
 tempfile = "3"
