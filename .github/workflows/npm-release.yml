@@ -17,7 +17,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: macos-latest
+          # macos-15 (not macos-latest): macos-latest now defaults to Xcode 26,
+          # whose relocated clang_rt.osx breaks rustc linking. macos-15 ships a
+          # pre-26 Xcode; the step below pins the compiler via DEVELOPER_DIR.
+          - os: macos-15
             target: aarch64-apple-darwin
             platform: macOS-arm64
           - os: ubuntu-latest
@@ -35,6 +38,10 @@ jobs:
           targets: ${{ matrix.target }}
 
       - uses: Swatinem/rust-cache@v2
+        with:
+          # Bumped to avoid restoring a macOS cache that hardcodes a stale
+          # Xcode 26.x clang_rt.osx path (see the DEVELOPER_DIR step below).
+          prefix-key: "v2-rust"
 
       - uses: actions/setup-node@v4
         with:
@@ -49,18 +56,49 @@ jobs:
         working-directory: pulsehive-js
         run: npm install
 
-      - name: Select a pre-26 Xcode (Xcode 26.5 clang_rt.osx layout breaks rustc linking)
+      # Pin the compiler to a pre-26 Xcode via DEVELOPER_DIR (which OVERRIDES
+      # xcode-select). Xcode 26 relocated clang_rt.osx and breaks rustc linking.
+      - name: Use a pre-26 Xcode (avoid Xcode 26 clang_rt.osx linker break)
         if: runner.os == 'macOS'
         run: |
-          ls -d /Applications/Xcode_*.app 2>/dev/null || true
+          sel=""
           for v in 16.4 16.3 16.2 16.1 16.0 15.4 15.2; do
-            if [ -d "/Applications/Xcode_$v.app" ]; then sudo xcode-select -s "/Applications/Xcode_$v.app"; break; fi
+            if [ -d "/Applications/Xcode_$v.app" ]; then sel="/Applications/Xcode_$v.app/Contents/Developer"; break; fi
           done
-          echo "Selected Xcode: $(xcode-select -p)"
+          if [ -z "$sel" ]; then
+            echo "::error::No pre-26 Xcode found on this runner. Installed Xcodes:"
+            ls -d /Applications/Xcode_*.app 2>/dev/null || true
+            exit 1
+          fi
+          sudo xcode-select -s "$sel"
+          echo "DEVELOPER_DIR=$sel" >> "$GITHUB_ENV"
+          echo "Using Xcode: $sel"
 
-      - name: Build native addon
+      # Wrapped in a retry loop to absorb a flaky upstream build dependency:
+      # the `ort-sys` build script (pulled transitively via pulsehive-db's
+      # builtin-embeddings -> ort / ONNX Runtime) downloads a prebuilt binary
+      # from cdn.pyke.io, which intermittently returns HTTP 403 (rate-limit /
+      # transient). That was breaking the Linux binary build. Retrying rides
+      # over the transient failure. A durable upstream fix (pin the ONNX
+      # Runtime lib or switch ort to load-dynamic in pulsehive-db) would remove
+      # the need for this. See the release-ops "Known fragility" notes.
+      - name: Build native addon (retry to absorb flaky ort-sys CDN 403)
         working-directory: pulsehive-js
-        run: npx napi build --platform --release --features napi --target ${{ matrix.target }}
+        shell: bash
+        run: |
+          set -uo pipefail
+          attempt=0
+          max=3
+          until [ "$attempt" -ge "$max" ]; do
+            if npx napi build --platform --release --features napi --target ${{ matrix.target }}; then
+              exit 0
+            fi
+            attempt=$((attempt + 1))
+            echo "napi build failed (attempt $attempt/$max) — likely a transient ort-sys cdn.pyke.io 403; retrying in 20s..."
+            sleep 20
+          done
+          echo "::error::napi build failed after $max attempts"
+          exit 1
 
       - name: Upload binary
         uses: actions/upload-artifact@v4
@@ -68,36 +106,46 @@ jobs:
           name: binary-${{ matrix.platform }}
           path: pulsehive-js/pulsehive-js.*.node
 
-  # TODO: Uncomment when npm account is configured
-  # publish:
-  #   name: Publish to npm
-  #   needs: [build-binaries]
-  #   runs-on: ubuntu-latest
-  #   # Only publish on tag push (not workflow_dispatch)
-  #   if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
-  #   steps:
-  #     - uses: actions/checkout@v4
-  #
-  #     - uses: actions/setup-node@v4
-  #       with:
-  #         node-version: "20"
-  #         registry-url: "https://registry.npmjs.org"
-  #
-  #     - name: Download all binary artifacts
-  #       uses: actions/download-artifact@v4
-  #       with:
-  #         path: pulsehive-js
-  #         pattern: binary-*
-  #         merge-multiple: true
-  #
-  #     - name: Install deps and prepare
-  #       working-directory: pulsehive-js
-  #       run: |
-  #         npm install
-  #         npx napi prepublish
-  #
-  #     - name: Publish to npm
-  #       working-directory: pulsehive-js
-  #       run: npm publish --access public
-  #       env:
-  #         NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+  publish:
+    name: Publish to npm
+    needs: [build-binaries]
+    runs-on: ubuntu-latest
+    # Only publish on tag push (not workflow_dispatch)
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    # NPM_TOKEN is provisioned as a repository secret (see release-ops handoff).
+    # Optional hardening, for parity with the crates-io / pypi jobs: move the
+    # token to an `npm` deployment environment and add `environment: npm` here
+    # so only this gated job can read it (and you can require a reviewer).
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Download all binary artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: pulsehive-js
+          pattern: binary-*
+          merge-multiple: true
+
+      - name: Install deps and prepare
+        working-directory: pulsehive-js
+        run: |
+          npm install
+          npx napi prepublish
+
+      - name: Publish to npm
+        working-directory: pulsehive-js
+        shell: bash
+        run: |
+          if [ -z "${NODE_AUTH_TOKEN:-}" ]; then
+            echo "::warning::NPM_TOKEN secret is not set — skipping npm publish."
+            echo "Add the NPM_TOKEN repository secret to enable @pulsehive/sdk publishing."
+            exit 0
+          fi
+          npm publish --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
