@@ -31,7 +31,7 @@ jobs:
             platform: Windows-x86_64
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -117,7 +117,7 @@ jobs:
     # token to an `npm` deployment environment and add `environment: npm` here
     # so only this gated job can read it (and you can require a reviewer).
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: actions/setup-node@v6
         with:
