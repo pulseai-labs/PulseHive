@@ -25,7 +25,9 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use pulsedb::{CollectiveId, SubstrateProvider};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use tokio::sync::mpsc;
 
 use crate::error::Result;
 use crate::event::EventEmitter;
@@ -57,6 +59,17 @@ pub trait Tool: Send + Sync {
     /// before executing. Default: `false`.
     fn requires_approval(&self) -> bool {
         false
+    }
+
+    /// If this tool supports streaming execution, return `Some(self)` as a
+    /// [`StreamingTool`]; otherwise `None`.
+    ///
+    /// This is an object-safe capability probe — no `Any`, no `unsafe`, no second
+    /// registry. Non-streaming tools use the `None` default unchanged; a streaming
+    /// tool overrides this single method to return `Some(self)`. The agent loop
+    /// (v2.1.0) dispatches on this to decide whether to open a progress channel.
+    fn as_streaming(&self) -> Option<&dyn StreamingTool> {
+        None
     }
 }
 
@@ -110,6 +123,90 @@ impl ToolResult {
             Self::Error(s) => format!("Error: {s}"),
         }
     }
+}
+
+/// Severity level for a streaming tool [`ToolProgress::Log`] line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LogLevel {
+    /// Fine-grained diagnostic detail.
+    Debug,
+    /// Normal informational progress.
+    Info,
+    /// A recoverable concern worth surfacing.
+    Warn,
+    /// A failure the consumer should see.
+    Error,
+}
+
+/// A progress event emitted by a streaming tool during execution.
+///
+/// Tools implementing [`StreamingTool`] push these over an [`mpsc::Sender`]. The
+/// agent loop (v2.1.0) forwards each one as a `HiveEvent::ToolProgress`. The
+/// `Started` / `Completed` bookends are emitted by the loop, not by tool bodies.
+///
+/// Serializes to tagged JSON: `{"kind": "progress", "fraction": 0.5, ...}`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ToolProgress {
+    /// Tool has begun. Emitted automatically by the loop before the tool body runs.
+    Started {
+        /// Optional caller estimate of total duration, for UI ETA rendering.
+        estimated_duration_ms: Option<u64>,
+    },
+    /// Fractional progress in `0.0..=1.0`, with an optional human-readable label.
+    Progress {
+        /// Completion fraction in `0.0..=1.0`.
+        fraction: f32,
+        /// Optional human-readable status label.
+        message: Option<String>,
+    },
+    /// A partial result available before the tool completes (e.g. the first 100
+    /// trades of a backtest, one sweep combination's score).
+    PartialResult {
+        /// Untyped JSON so partial results from all tools aggregate on one stream.
+        payload: Value,
+    },
+    /// A log line surfaced to the consumer's session timeline.
+    Log {
+        /// Severity of the log line.
+        level: LogLevel,
+        /// The log message.
+        message: String,
+    },
+    /// Tool finished. Emitted automatically by the loop after the tool body returns.
+    Completed {
+        /// Total execution duration in milliseconds.
+        duration_ms: u64,
+    },
+}
+
+/// Opt-in extension for tools that report progress during execution.
+///
+/// Tools that implement only [`Tool`] are still fully supported: the agent loop
+/// wraps them so they emit `Started` → `Completed` with no intermediate events.
+/// Implement this trait when a tool is long-running and the consumer wants live
+/// feedback (progress bars, partial results, log streams).
+///
+/// `StreamingTool: Tool` — every streaming tool is also a regular [`Tool`], so it
+/// can be stored as `Arc<dyn Tool>` and registered the same way. A streaming tool
+/// exposes itself by overriding [`Tool::as_streaming`] to return `Some(self)`.
+#[async_trait]
+pub trait StreamingTool: Tool {
+    /// Execute the tool, pushing [`ToolProgress`] events as work proceeds.
+    ///
+    /// `progress_tx` is a bounded channel owned by the agent loop. Implementations
+    /// SHOULD send `Progress` / `PartialResult` / `Log` events; they MUST NOT send
+    /// `Started` or `Completed` (the loop emits those as bookends). Returns the
+    /// final [`ToolResult`] after the stream is drained. If the receiver is dropped
+    /// (consumer gone), `progress_tx.send().await` errors — implementations SHOULD
+    /// treat that as a soft signal, keep computing, and return the result anyway.
+    async fn execute_streaming(
+        &self,
+        params: Value,
+        context: &ToolContext,
+        progress_tx: mpsc::Sender<ToolProgress>,
+    ) -> Result<ToolResult>;
 }
 
 #[cfg(test)]
@@ -174,5 +271,114 @@ mod tests {
             r#"{"a":1}"#
         );
         assert_eq!(ToolResult::error("oops").to_content(), "Error: oops");
+    }
+
+    // Mock streaming tool that ignores its context and pushes a fixed
+    // Progress(0.5) → PartialResult → Progress(1.0) sequence over the channel.
+    struct MockStreamingTool;
+
+    #[async_trait]
+    impl Tool for MockStreamingTool {
+        fn name(&self) -> &str {
+            "mock_streaming"
+        }
+        fn description(&self) -> &str {
+            "mock streaming tool for tests"
+        }
+        fn parameters(&self) -> Value {
+            serde_json::json!({"type": "object"})
+        }
+        async fn execute(&self, _params: Value, _ctx: &ToolContext) -> Result<ToolResult> {
+            Ok(ToolResult::text("final"))
+        }
+        fn as_streaming(&self) -> Option<&dyn StreamingTool> {
+            Some(self)
+        }
+    }
+
+    #[async_trait]
+    impl StreamingTool for MockStreamingTool {
+        async fn execute_streaming(
+            &self,
+            _params: Value,
+            _context: &ToolContext,
+            progress_tx: mpsc::Sender<ToolProgress>,
+        ) -> Result<ToolResult> {
+            // Dropped receiver is a soft signal: ignore send errors, keep going.
+            let _ = progress_tx
+                .send(ToolProgress::Progress {
+                    fraction: 0.5,
+                    message: None,
+                })
+                .await;
+            let _ = progress_tx
+                .send(ToolProgress::PartialResult {
+                    payload: serde_json::json!({"n": 1}),
+                })
+                .await;
+            let _ = progress_tx
+                .send(ToolProgress::Progress {
+                    fraction: 1.0,
+                    message: Some("done".into()),
+                })
+                .await;
+            Ok(ToolResult::text("final"))
+        }
+    }
+
+    /// Builds a minimal `ToolContext`. The substrate/emitter are never touched by
+    /// the mock tool; a temp `Config::default()` PulseDB avoids the ONNX path.
+    fn test_context() -> ToolContext {
+        let dir = tempfile::tempdir().unwrap();
+        let db =
+            pulsedb::PulseDB::open(dir.path().join("test.db"), pulsedb::Config::default()).unwrap();
+        // Leak the tempdir so its files outlive this context.
+        Box::leak(Box::new(dir));
+        ToolContext {
+            agent_id: "agent-test".into(),
+            collective_id: CollectiveId::new(),
+            substrate: Arc::new(pulsedb::PulseDBSubstrate::from_db(db)),
+            event_emitter: EventEmitter::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn streaming_tool_progress_channel_order() {
+        let ctx = test_context();
+        let tool = MockStreamingTool;
+
+        // Capability probe: a streaming tool exposes itself via `as_streaming`.
+        assert!(tool.as_streaming().is_some());
+
+        // Capacity > number of sends so `execute_streaming` never blocks on a
+        // receiver we only drain after it returns.
+        let (tx, mut rx) = mpsc::channel::<ToolProgress>(8);
+        let result = tool.execute_streaming(Value::Null, &ctx, tx).await.unwrap();
+
+        // Drain the channel; the sender is dropped once `execute_streaming` returns.
+        let mut events = Vec::new();
+        while let Some(p) = rx.recv().await {
+            events.push(p);
+        }
+
+        assert_eq!(events.len(), 3, "expected 3 progress events in order");
+        match &events[0] {
+            ToolProgress::Progress { fraction, message } => {
+                assert!((*fraction - 0.5).abs() < f32::EPSILON);
+                assert!(message.is_none());
+            }
+            other => panic!("event[0] expected Progress(0.5), got {other:?}"),
+        }
+        assert!(matches!(events[1], ToolProgress::PartialResult { .. }));
+        match &events[2] {
+            ToolProgress::Progress { fraction, message } => {
+                assert!((*fraction - 1.0).abs() < f32::EPSILON);
+                assert_eq!(message.as_deref(), Some("done"));
+            }
+            other => panic!("event[2] expected Progress(1.0), got {other:?}"),
+        }
+
+        // `execute_streaming` returns the final `ToolResult`.
+        assert!(matches!(result, ToolResult::Text(s) if s == "final"));
     }
 }
