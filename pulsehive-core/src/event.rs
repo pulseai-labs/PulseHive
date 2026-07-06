@@ -40,6 +40,7 @@ pub fn now_ms() -> u64 {
 /// which requires cloneable values.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum HiveEvent {
     // ── Agent lifecycle ──────────────────────────────────────────────
     /// An agent has started execution.
@@ -167,6 +168,23 @@ pub enum HiveEvent {
         collective_id: pulsedb::CollectiveId,
         /// The type of change: "Created", "Updated", "Archived", or "Deleted".
         event_type: String,
+    },
+
+    // ── Streaming tool progress ──────────────────────────────────────
+    /// A streaming tool emitted a progress event during execution.
+    ///
+    /// Carries a [`ToolProgress`](crate::tool::ToolProgress) payload
+    /// (`Started` / `Progress` / `PartialResult` / `Log` / `Completed`). The
+    /// agent loop (v2.1.0) forwards each `ToolProgress` pushed by a
+    /// [`StreamingTool`](crate::tool::StreamingTool) as one of these events.
+    ///
+    /// Serializes with the outer tag `"type":"tool_progress"`; the nested
+    /// `progress` retains its own `"kind"` tag.
+    ToolProgress {
+        timestamp_ms: u64,
+        agent_id: String,
+        tool_name: String,
+        progress: crate::tool::ToolProgress,
     },
 }
 
@@ -296,6 +314,34 @@ mod tests {
         let json = serde_json::to_string(&event).unwrap();
         assert!(json.contains("\"params\""));
         assert!(json.contains("\"tool_call_started\""));
+    }
+
+    #[test]
+    fn test_hive_event_serialize_tool_progress() {
+        let event = HiveEvent::ToolProgress {
+            timestamp_ms: 1711500000000,
+            agent_id: "agent-1".into(),
+            tool_name: "backtest".into(),
+            progress: crate::tool::ToolProgress::Progress {
+                fraction: 0.5,
+                message: Some("halfway".into()),
+            },
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        // Outer HiveEvent tag.
+        assert!(json.contains("\"type\":\"tool_progress\""));
+        // Nested ToolProgress keeps its own `kind` tag.
+        assert!(json.contains("\"kind\":\"progress\""));
+
+        // Roundtrip preserves the nested variant.
+        let deserialized: HiveEvent = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            deserialized,
+            HiveEvent::ToolProgress {
+                progress: crate::tool::ToolProgress::Progress { .. },
+                ..
+            }
+        ));
     }
 
     #[tokio::test]
@@ -458,9 +504,18 @@ mod tests {
                 collective_id: pulsedb::CollectiveId::new(),
                 event_type: "Created".into(),
             },
+            HiveEvent::ToolProgress {
+                timestamp_ms: 0,
+                agent_id: "a".into(),
+                tool_name: "search".into(),
+                progress: crate::tool::ToolProgress::Progress {
+                    fraction: 0.5,
+                    message: Some("halfway".into()),
+                },
+            },
         ];
         let _cloned: Vec<HiveEvent> = events.to_vec();
-        assert_eq!(events.len(), 14);
+        assert_eq!(events.len(), 15);
     }
 
     #[test]
