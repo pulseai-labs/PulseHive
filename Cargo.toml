@@ -41,7 +41,7 @@ futures-core = "0.3"
 futures = "0.3"
 
 # PulseDB storage substrate
-pulsehive-db = { version = "0.5", features = ["builtin-embeddings"] }
+pulsehive-db = { version = "0.6", features = ["builtin-embeddings"] }
 
 # HTTP client (for LLM provider crates)
 reqwest = { version = "0.13", features = ["json", "stream"] }
