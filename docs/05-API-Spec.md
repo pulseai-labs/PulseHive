@@ -267,6 +267,108 @@ pub trait SubstrateProvider: Send + Sync {
 
 Products do not implement this trait directly. They use `PulseDBSubstrate` (the production implementation) or a mock for testing.
 
+### 2.7 StreamingTool (Streaming Tools)
+
+*Since v2.1.0.* An opt-in extension for **streaming tools** — long-running tools
+that report live progress instead of a frozen wait. A tool that implements only
+`Tool` is still fully supported (the agent loop wraps it so it emits `Started` →
+`Completed` with no intermediate events); implement `StreamingTool` when a tool
+is long-running and the consumer wants progress bars, partial results, or a log
+stream.
+
+`StreamingTool: Tool`, so every streaming tool is also a regular `Tool` and can
+be stored as `Arc<dyn Tool>` and registered the same way. A tool exposes its
+streaming path by overriding `Tool::as_streaming()` to return `Some(self)`; the
+agent loop calls `execute_streaming()` on that path and forwards each pushed
+`ToolProgress` as a `HiveEvent::ToolProgress`.
+
+```rust
+/// A progress event pushed by a streaming tool during execution.
+///
+/// Serializes to tagged JSON: `{"kind": "progress", "fraction": 0.5, ...}`.
+pub enum ToolProgress {
+    /// Emitted automatically by the loop before the tool body runs.
+    Started { estimated_duration_ms: Option<u64> },
+    /// Fractional progress in `0.0..=1.0`, with an optional label.
+    Progress { fraction: f32, message: Option<String> },
+    /// A partial result available before the tool completes.
+    PartialResult { payload: serde_json::Value },
+    /// A log line surfaced to the consumer's session timeline.
+    Log { level: LogLevel, message: String },
+    /// Emitted automatically by the loop after the tool body returns.
+    Completed { duration_ms: u64 },
+}
+
+#[async_trait]
+pub trait StreamingTool: Tool {
+    /// Execute the tool, pushing `ToolProgress` over `progress_tx` as work
+    /// proceeds. Implementations SHOULD send `Progress` / `PartialResult` /
+    /// `Log`; they MUST NOT send `Started` / `Completed` (the loop emits those
+    /// bookends). If the receiver is dropped, `send().await` errors — treat it
+    /// as a soft signal, keep computing, and return the result anyway.
+    async fn execute_streaming(
+        &self,
+        params: serde_json::Value,
+        context: &ToolContext,
+        progress_tx: tokio::sync::mpsc::Sender<ToolProgress>,
+    ) -> Result<ToolResult, PulseHiveError>;
+}
+```
+
+**Observing progress.** The agent loop forwards each `ToolProgress` as a
+[`HiveEvent::ToolProgress`](#42-hiveevent) `{ agent_id, tool_name, progress }` on
+the `HiveMind::deploy()` stream. Because the event bus is a lossy broadcast,
+drain the stream **concurrently** with the run (not collect-after):
+
+```rust
+struct ProgressStreamTool;
+
+#[async_trait]
+impl Tool for ProgressStreamTool {
+    fn name(&self) -> &str { "progress_stream" }
+    fn description(&self) -> &str { "Reports live fractional progress" }
+    fn parameters(&self) -> serde_json::Value { json!({ "type": "object" }) }
+    async fn execute(&self, _p: serde_json::Value, _c: &ToolContext) -> Result<ToolResult> {
+        Ok(ToolResult::text("done")) // non-streaming fallback
+    }
+    fn as_streaming(&self) -> Option<&dyn StreamingTool> { Some(self) }
+}
+
+#[async_trait]
+impl StreamingTool for ProgressStreamTool {
+    async fn execute_streaming(
+        &self,
+        _params: serde_json::Value,
+        _ctx: &ToolContext,
+        progress_tx: mpsc::Sender<ToolProgress>,
+    ) -> Result<ToolResult> {
+        for step in 1..=5 {
+            tokio::time::sleep(Duration::from_millis(800)).await;
+            let _ = progress_tx.send(ToolProgress::Progress {
+                fraction: step as f32 / 5.0,
+                message: Some(format!("step {step}/5")),
+            }).await;
+        }
+        Ok(ToolResult::text("stream complete"))
+    }
+}
+
+// Consumer side — drain deploy()'s stream concurrently with the run.
+let mut stream = hive.deploy(vec![agent], vec![task]).await?;
+while let Some(event) = stream.next().await {
+    match event {
+        HiveEvent::ToolProgress { tool_name, progress, .. } => {
+            println!("[{tool_name}] {progress:?}");
+        }
+        HiveEvent::AgentCompleted { .. } => break,
+        _ => {} // HiveEvent is #[non_exhaustive] (v2.1.0)
+    }
+}
+```
+
+A complete, runnable, hermetic version (no API key) lives at
+`pulsehive-runtime/examples/streaming_tool.rs`.
+
 ---
 
 ## 3. Public Structs
@@ -554,7 +656,12 @@ pub enum AgentKind {
 
 ### 4.2 HiveEvent
 
+As of **v2.1.0**, `HiveEvent` is `#[non_exhaustive]` — new variants can be added
+in a minor release, so external code that matches on it exhaustively **must**
+include a `_ => {}` catch-all arm.
+
 ```rust
+#[non_exhaustive] // v2.1.0 — external exhaustive matches need a `_ => {}` arm
 pub enum HiveEvent {
     // Agent lifecycle
     AgentStarted { agent_id: AgentId, name: String, kind: AgentKindTag },
@@ -569,6 +676,10 @@ pub enum HiveEvent {
     ToolCallStarted { agent_id: AgentId, tool_name: String },
     ToolCallCompleted { agent_id: AgentId, tool_name: String, duration_ms: u64 },
     ToolApprovalRequested { agent_id: AgentId, tool_name: String, action: PendingAction },
+
+    // Streaming tool progress (v2.1.0) — one per `ToolProgress` pushed by a
+    // `StreamingTool`, bracketed by loop-generated Started/Completed bookends.
+    ToolProgress { agent_id: AgentId, tool_name: String, progress: ToolProgress },
 
     // Substrate operations
     ExperienceRecorded { experience_id: ExperienceId, agent_id: AgentId },
