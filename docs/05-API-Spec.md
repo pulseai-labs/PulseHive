@@ -320,6 +320,15 @@ pub trait StreamingTool: Tool {
 the `HiveMind::deploy()` stream. Because the event bus is a lossy broadcast,
 drain the stream **concurrently** with the run (not collect-after):
 
+> **Delivery is best-effort on `deploy()`.** The loop emits the envelope in order
+> (`Started` → intermediate progress → `Completed`), but `deploy()` returns a
+> `tokio::broadcast` receiver that **drops the oldest events when a subscriber
+> lags**. A slow consumer can therefore miss intermediate events **or even
+> `Started`/`Completed`** — so do **not** treat `Completed` as a guaranteed
+> terminal marker on this stream (e.g. don't hang a progress bar waiting for it).
+> The ordered envelope is only guaranteed at the emitter/[`EventExporter`] boundary;
+> on `deploy()` it is observability, not a reliable control signal.
+
 ```rust
 struct ProgressStreamTool;
 

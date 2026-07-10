@@ -201,6 +201,17 @@ pub trait StreamingTool: Tool {
     /// final [`ToolResult`] after the stream is drained. If the receiver is dropped
     /// (consumer gone), `progress_tx.send().await` errors — implementations SHOULD
     /// treat that as a soft signal, keep computing, and return the result anyway.
+    ///
+    /// **Progress is observability, not control.** `progress_tx` is the *internal*
+    /// loop→forwarder channel — NOT the consumer's `HiveMind::deploy()` stream. A
+    /// consumer dropping the `deploy()` stream does **not** cancel this tool or stop
+    /// it computing; cooperative cancellation is a separate mechanism (a future
+    /// release). The channel is bounded, so `send().await` can apply backpressure if
+    /// the loop's forwarder falls behind — treat progress as best-effort telemetry,
+    /// and prefer coalescing high-frequency updates rather than relying on every
+    /// send being delivered. Do NOT retain or clone `progress_tx` beyond this call:
+    /// the loop closes the channel by observing your returned future drop it, and a
+    /// leaked/cloned sender keeps the forwarder alive.
     async fn execute_streaming(
         &self,
         params: Value,

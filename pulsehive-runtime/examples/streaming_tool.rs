@@ -211,7 +211,10 @@ async fn main() {
     let drain = async {
         let mut total = 0usize;
         let mut progress = 0usize;
-        let mut saw_completed = false;
+        // Track the LAST ToolProgress kind so the gate can require the envelope to
+        // actually *end* with Completed (not merely to have seen a Completed
+        // somewhere). `None` until the first ToolProgress arrives.
+        let mut last_kind: Option<&'static str> = None;
 
         while let Some(event) = stream.next().await {
             match event {
@@ -223,10 +226,12 @@ async fn main() {
                     total += 1;
                     match payload {
                         ToolProgress::Started { .. } => {
+                            last_kind = Some("started");
                             println!("  [{tool_name}] ToolProgress::Started");
                         }
                         ToolProgress::Progress { fraction, message } => {
                             progress += 1;
+                            last_kind = Some("progress");
                             let label = message.unwrap_or_default();
                             println!(
                                 "  [{tool_name}] ToolProgress::Progress {:.0}% {label}",
@@ -234,10 +239,11 @@ async fn main() {
                             );
                         }
                         ToolProgress::Completed { duration_ms } => {
-                            saw_completed = true;
+                            last_kind = Some("completed");
                             println!("  [{tool_name}] ToolProgress::Completed ({duration_ms}ms)");
                         }
                         other => {
+                            last_kind = Some("other");
                             println!("  [{tool_name}] {other:?}");
                         }
                     }
@@ -249,10 +255,10 @@ async fn main() {
             }
         }
 
-        (total, progress, saw_completed)
+        (total, progress, last_kind)
     };
 
-    let (total, progress, saw_completed) =
+    let (total, progress, last_kind) =
         match tokio::time::timeout(Duration::from_secs(60), drain).await {
             Ok(counts) => counts,
             Err(_) => {
@@ -262,24 +268,31 @@ async fn main() {
         };
 
     println!(
-        "\nObserved {total} ToolProgress events ({progress} Progress), ended_with_completed={saw_completed}"
+        "\nObserved {total} ToolProgress events ({progress} Progress), last_kind={last_kind:?}"
     );
 
-    // Self-assert — this makes `cargo run --example streaming_tool` a real gate:
-    // >= 5 ToolProgress events ending with the loop-generated Completed bookend.
-    if total < 5 || !saw_completed {
+    // Self-assert — this makes `cargo run --example streaming_tool` a real gate.
+    // Assert on the *Progress* count (the user-visible live updates), not the total
+    // (which Started/Completed bookends would pad to 5), and require the envelope to
+    // END with the loop-generated Completed bookend — so a regression to fewer live
+    // updates, or a Completed that isn't terminal, fails loudly.
+    if progress < 5 || last_kind != Some("completed") {
         eprintln!(
-            "REGRESSION: expected >= 5 ToolProgress ending with Completed, \
-             got total={total} progress={progress} completed={saw_completed}"
+            "REGRESSION: expected >= 5 live Progress updates ending with Completed, \
+             got total={total} progress={progress} last_kind={last_kind:?}"
         );
         std::process::exit(1);
     }
 
-    println!("SELF-ASSERT PASSED: >= 5 ToolProgress observed, ending with Completed.");
+    println!("SELF-ASSERT PASSED: >= 5 live Progress updates observed, ending with Completed.");
 
     hive.shutdown();
 
     // Force exit: PulseDB's ONNX runtime holds background threads that prevent a
     // clean Tokio runtime shutdown (same known issue as the custom_tool example).
+    // NOTE: because this bypasses destructors, this example gates *event
+    // observation* (the streaming envelope reaching a subscriber), NOT task-lifecycle
+    // correctness — it is not evidence that the forwarder task, exporter, or agent
+    // tasks shut down cleanly. Lifecycle/leak checks belong in the runtime test suite.
     std::process::exit(0);
 }
