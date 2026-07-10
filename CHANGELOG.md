@@ -5,6 +5,17 @@ All notable changes to PulseHive will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.1.0] - Unreleased
+
+### Added
+- **Streaming tools** — a new `pulsehive_core::tool::StreamingTool: Tool` trait for long-running tools that report live progress. Tools expose it by overriding `Tool::as_streaming()` to return `Some(self)`; the agent loop then calls `StreamingTool::execute_streaming(params, context, progress_tx)` and forwards each pushed event.
+- **`pulsehive_core::tool::ToolProgress`** enum — the progress payload (`Started` / `Progress { fraction, message }` / `PartialResult` / `Log` / `Completed { duration_ms }`). The `Started` / `Completed` bookends are emitted by the agent loop; tool bodies push the intermediate variants.
+- **`HiveEvent::ToolProgress { agent_id, tool_name, progress }`** — the agent loop forwards each `ToolProgress` from a streaming tool as this event on the `HiveMind::deploy()` stream, so consumers see live progress instead of a frozen wait.
+- New runnable, hermetic example `pulsehive-runtime/examples/streaming_tool.rs` (no API key) and a "Streaming Tools" section in `docs/05-API-Spec.md`.
+
+### Changed
+- **BREAKING: `HiveEvent` is now `#[non_exhaustive]`.** New event variants (such as `ToolProgress`) can be added in a minor release without a major bump. External code that matches on `HiveEvent` exhaustively must add a `_ => {}` catch-all arm, or it will fail to compile.
+
 ## [2.0.2] - 2026-07-01
 
 ### Security
