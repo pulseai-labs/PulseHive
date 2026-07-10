@@ -62,3 +62,6 @@ id_ed25519
 !.env.example
 *.secret
 credentials.json
+
+# scaffold-dev pr_hierarchical work-item worktrees live here; never commit them
+.worktrees/
