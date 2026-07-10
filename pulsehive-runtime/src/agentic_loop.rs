@@ -7,7 +7,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use pulsedb::SubstrateProvider;
 use tokio::sync::mpsc;
@@ -346,7 +346,7 @@ async fn execute_tool_inner(
             let forwarder_emitter = event_emitter.clone();
             let forwarder_agent = agent_id.to_string();
             let forwarder_tool = tool_name.to_string();
-            let forwarder = tokio::spawn(async move {
+            let mut forwarder = tokio::spawn(async move {
                 while let Some(progress) = rx.recv().await {
                     forwarder_emitter.emit(HiveEvent::ToolProgress {
                         timestamp_ms: pulsehive_core::event::now_ms(),
@@ -365,9 +365,30 @@ async fn execute_tool_inner(
                 .instrument(tracing::debug_span!("tool_execute", tool = %tool_name))
                 .await;
 
-            // Join the forwarder to guarantee every buffered progress event is
-            // emitted before the `Completed` bookend below.
-            let _ = forwarder.await;
+            // The tool has returned; drain the forwarder so every buffered progress
+            // event is emitted before the `Completed` bookend below. Under the normal
+            // contract (the sole `progress_tx` drops when `execute_streaming` returns)
+            // the channel closes and the forwarder finishes immediately. But
+            // `mpsc::Sender` is `Clone` and tools are third-party code: a tool that
+            // clones/leaks the sender into a background task would keep the channel
+            // open forever, so an unbounded `forwarder.await` here would hang the whole
+            // deployment (no `Completed` / `ToolCallCompleted` / next turn). Bound the
+            // wait: give the forwarder a short grace to drain, then stop it — a
+            // misbehaving tool must not wedge the agent. (Fuller hardening — scoped
+            // sender, backpressure contract, adversarial tests — tracked in the
+            // streaming-tool hardening follow-up.)
+            const FORWARDER_DRAIN_GRACE: Duration = Duration::from_secs(5);
+            if tokio::time::timeout(FORWARDER_DRAIN_GRACE, &mut forwarder)
+                .await
+                .is_err()
+            {
+                tracing::warn!(
+                    tool = %tool_name,
+                    "streaming tool left a progress sender open after returning; \
+                     stopping the progress forwarder after the drain grace period"
+                );
+                forwarder.abort();
+            }
             result
         }
         None => {

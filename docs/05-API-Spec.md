@@ -326,8 +326,13 @@ drain the stream **concurrently** with the run (not collect-after):
 > lags**. A slow consumer can therefore miss intermediate events **or even
 > `Started`/`Completed`** — so do **not** treat `Completed` as a guaranteed
 > terminal marker on this stream (e.g. don't hang a progress bar waiting for it).
-> The ordered envelope is only guaranteed at the emitter/[`EventExporter`] boundary;
-> on `deploy()` it is observability, not a reliable control signal.
+> The loop emits the envelope in order, but **neither** transport preserves that order
+> for consumers: `deploy()`'s broadcast drops on lag, and a configured
+> [`EventExporter`] receives each event via an **independent fire-and-forget task**
+> (`EventEmitter::emit` spawns per event), so exports can also arrive out of order.
+> Treat progress as best-effort observability on both paths — not a reliable control
+> signal. If you need a strictly-ordered, guaranteed-terminal feed, serialize it
+> yourself downstream (key on `agent_id`/`tool_name`, order by `timestamp_ms`).
 
 ```rust
 struct ProgressStreamTool;
