@@ -10,6 +10,7 @@ use pyo3::types::PyDict;
 
 use pulsehive_core::agent::AgentOutcome;
 use pulsehive_core::event::HiveEvent;
+use pulsehive_core::tool::ToolProgress;
 
 /// Lifecycle and observability event from the PulseHive runtime.
 ///
@@ -311,6 +312,38 @@ impl From<HiveEvent> for PyHiveEvent {
                 fields.insert("event_type".into(), PyEventValue::Str(event_type));
                 ("watch_notification", None)
             }
+            HiveEvent::ToolProgress {
+                timestamp_ms,
+                agent_id,
+                tool_name,
+                progress,
+            } => {
+                fields.insert("timestamp_ms".into(), PyEventValue::Int(timestamp_ms));
+                fields.insert("agent_id".into(), PyEventValue::Str(agent_id.clone()));
+                fields.insert("tool_name".into(), PyEventValue::Str(tool_name));
+                // The nested `progress` enum has no scalar map representation, so
+                // emit a `progress_kind` discriminator plus the full payload as a
+                // JSON string (audit ⑥ default; the flatten-scalars form is deferred).
+                let progress_kind = match &progress {
+                    ToolProgress::Started { .. } => "started",
+                    ToolProgress::Progress { .. } => "progress",
+                    ToolProgress::PartialResult { .. } => "partial_result",
+                    ToolProgress::Log { .. } => "log",
+                    ToolProgress::Completed { .. } => "completed",
+                };
+                fields.insert(
+                    "progress_kind".into(),
+                    PyEventValue::Str(progress_kind.to_string()),
+                );
+                fields.insert(
+                    "progress".into(),
+                    PyEventValue::Str(serde_json::to_string(&progress).unwrap_or_default()),
+                );
+                ("tool_progress", Some(agent_id))
+            }
+            // Forward-compat: `HiveEvent` is `#[non_exhaustive]`. Future variants
+            // (VS-1.1.2+) map to an inert `unknown` event instead of failing to build.
+            _ => ("unknown", None),
         };
 
         Self {
@@ -325,4 +358,31 @@ impl From<HiveEvent> for PyHiveEvent {
 pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyHiveEvent>()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pyhiveevent_tool_progress_maps_event_type() {
+        let event = HiveEvent::ToolProgress {
+            timestamp_ms: 1,
+            agent_id: "a1".into(),
+            tool_name: "backtest".into(),
+            progress: ToolProgress::Progress {
+                fraction: 0.5,
+                message: Some("halfway".into()),
+            },
+        };
+        let py_event = PyHiveEvent::from(event);
+        assert_eq!(py_event.event_type, "tool_progress");
+        assert_eq!(py_event.agent_id.as_deref(), Some("a1"));
+        // Nested payload is serialized as a JSON string + a discriminator field.
+        assert!(py_event.fields.contains_key("progress"));
+        assert!(matches!(
+            py_event.fields.get("progress_kind"),
+            Some(PyEventValue::Str(s)) if s == "progress"
+        ));
+    }
 }

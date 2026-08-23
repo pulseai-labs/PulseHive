@@ -7,9 +7,10 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use pulsedb::SubstrateProvider;
+use tokio::sync::mpsc;
 use tracing::Instrument;
 
 use pulsehive_core::agent::{AgentOutcome, ExperienceExtractor, LlmAgentConfig};
@@ -17,7 +18,7 @@ use pulsehive_core::approval::{ApprovalHandler, ApprovalResult, PendingAction};
 use pulsehive_core::event::{EventEmitter, HiveEvent};
 use pulsehive_core::lens::Lens;
 use pulsehive_core::llm::{LlmConfig, LlmProvider, Message, ToolCall, ToolDefinition};
-use pulsehive_core::tool::{Tool, ToolContext, ToolResult};
+use pulsehive_core::tool::{Tool, ToolContext, ToolProgress, ToolResult};
 
 use crate::hivemind::Task;
 
@@ -312,6 +313,18 @@ async fn execute_tool_inner(
         params: params_str,
     });
 
+    // Loop-generated `Started` bookend — emitted for EVERY tool (streaming or
+    // not) right after `ToolCallStarted`, so every tool call produces the
+    // `Started → … → Completed` envelope.
+    event_emitter.emit(HiveEvent::ToolProgress {
+        timestamp_ms: pulsehive_core::event::now_ms(),
+        agent_id: agent_id.to_string(),
+        tool_name: tool_name.to_string(),
+        progress: ToolProgress::Started {
+            estimated_duration_ms: None,
+        },
+    });
+
     let start = Instant::now();
     let context = ToolContext {
         agent_id: agent_id.to_string(),
@@ -320,11 +333,72 @@ async fn execute_tool_inner(
         event_emitter: event_emitter.clone(),
     };
 
-    let result = match tool
-        .execute(params, &context)
-        .instrument(tracing::debug_span!("tool_execute", tool = %tool_name))
-        .await
-    {
+    // Dispatch on the streaming capability probe. Streaming tools get a bounded
+    // progress channel plus a forwarder task that pumps each `ToolProgress` into
+    // the `HiveEvent` stream; non-streaming tools take the existing path verbatim.
+    let exec_result = match tool.as_streaming() {
+        Some(streaming) => {
+            let (tx, mut rx) = mpsc::channel::<ToolProgress>(64);
+
+            // Forwarder: drain the tool's progress channel and re-emit each item
+            // as a `HiveEvent::ToolProgress`. Owns its own emitter clone + labels
+            // so it is `Send + 'static` for `tokio::spawn`.
+            let forwarder_emitter = event_emitter.clone();
+            let forwarder_agent = agent_id.to_string();
+            let forwarder_tool = tool_name.to_string();
+            let mut forwarder = tokio::spawn(async move {
+                while let Some(progress) = rx.recv().await {
+                    forwarder_emitter.emit(HiveEvent::ToolProgress {
+                        timestamp_ms: pulsehive_core::event::now_ms(),
+                        agent_id: forwarder_agent.clone(),
+                        tool_name: forwarder_tool.clone(),
+                        progress,
+                    });
+                }
+            });
+
+            // Run the streaming body. The `tx` we passed is the only sender clone;
+            // it drops when `execute_streaming` returns, closing the channel so the
+            // forwarder observes end-of-stream.
+            let result = streaming
+                .execute_streaming(params, &context, tx)
+                .instrument(tracing::debug_span!("tool_execute", tool = %tool_name))
+                .await;
+
+            // The tool has returned; drain the forwarder so every buffered progress
+            // event is emitted before the `Completed` bookend below. Under the normal
+            // contract (the sole `progress_tx` drops when `execute_streaming` returns)
+            // the channel closes and the forwarder finishes immediately. But
+            // `mpsc::Sender` is `Clone` and tools are third-party code: a tool that
+            // clones/leaks the sender into a background task would keep the channel
+            // open forever, so an unbounded `forwarder.await` here would hang the whole
+            // deployment (no `Completed` / `ToolCallCompleted` / next turn). Bound the
+            // wait: give the forwarder a short grace to drain, then stop it — a
+            // misbehaving tool must not wedge the agent. (Fuller hardening — scoped
+            // sender, backpressure contract, adversarial tests — tracked in the
+            // streaming-tool hardening follow-up.)
+            const FORWARDER_DRAIN_GRACE: Duration = Duration::from_secs(5);
+            if tokio::time::timeout(FORWARDER_DRAIN_GRACE, &mut forwarder)
+                .await
+                .is_err()
+            {
+                tracing::warn!(
+                    tool = %tool_name,
+                    "streaming tool left a progress sender open after returning; \
+                     stopping the progress forwarder after the drain grace period"
+                );
+                forwarder.abort();
+            }
+            result
+        }
+        None => {
+            tool.execute(params, &context)
+                .instrument(tracing::debug_span!("tool_execute", tool = %tool_name))
+                .await
+        }
+    };
+
+    let result = match exec_result {
         Ok(result) => result,
         Err(e) => {
             tracing::warn!(tool = %tool_name, error = %e, "Tool execution failed");
@@ -334,6 +408,17 @@ async fn execute_tool_inner(
 
     let duration_ms = start.elapsed().as_millis() as u64;
     tracing::debug!(tool = %tool_name, duration_ms, "Tool completed");
+
+    // Loop-generated `Completed` bookend — emitted right before `ToolCallCompleted`,
+    // reusing the same `start.elapsed()` measurement so it matches
+    // `ToolCallCompleted.duration_ms`.
+    event_emitter.emit(HiveEvent::ToolProgress {
+        timestamp_ms: pulsehive_core::event::now_ms(),
+        agent_id: agent_id.to_string(),
+        tool_name: tool_name.to_string(),
+        progress: ToolProgress::Completed { duration_ms },
+    });
+
     let result_preview: String = result.to_content().chars().take(200).collect();
     event_emitter.emit(HiveEvent::ToolCallCompleted {
         timestamp_ms: pulsehive_core::event::now_ms(),
@@ -957,6 +1042,167 @@ mod tests {
         assert_eq!(
             perceive_count, 1,
             "With refresh=Some(10) and 1 tool call, should have exactly 1 SubstratePerceived. Got {perceive_count}"
+        );
+    }
+
+    // ── Streaming tool-progress wiring tests (WI 1.03) ───────────────────
+
+    use pulsehive_core::tool::StreamingTool;
+
+    // Mock streaming tool: pushes a deterministic
+    // Progress(0.5) → PartialResult → Progress(1.0) sequence over its channel and
+    // never sends `Started`/`Completed` (those are loop bookends). No sleeps, so
+    // ordering assertions are deterministic.
+    struct ProgressTool;
+
+    #[async_trait]
+    impl Tool for ProgressTool {
+        fn name(&self) -> &str {
+            "progress"
+        }
+        fn description(&self) -> &str {
+            "streaming mock that emits intermediate progress"
+        }
+        fn parameters(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+        async fn execute(
+            &self,
+            _params: serde_json::Value,
+            _ctx: &ToolContext,
+        ) -> Result<ToolResult> {
+            Ok(ToolResult::text("progress-done"))
+        }
+        fn as_streaming(&self) -> Option<&dyn StreamingTool> {
+            Some(self)
+        }
+    }
+
+    #[async_trait]
+    impl StreamingTool for ProgressTool {
+        async fn execute_streaming(
+            &self,
+            _params: serde_json::Value,
+            _context: &ToolContext,
+            progress_tx: mpsc::Sender<ToolProgress>,
+        ) -> Result<ToolResult> {
+            let _ = progress_tx
+                .send(ToolProgress::Progress {
+                    fraction: 0.5,
+                    message: None,
+                })
+                .await;
+            let _ = progress_tx
+                .send(ToolProgress::PartialResult {
+                    payload: serde_json::json!({"n": 1}),
+                })
+                .await;
+            let _ = progress_tx
+                .send(ToolProgress::Progress {
+                    fraction: 1.0,
+                    message: Some("done".into()),
+                })
+                .await;
+            Ok(ToolResult::text("progress-done"))
+        }
+    }
+
+    // Classify only the tool-call envelope events (ToolCallStarted, the loop's
+    // ToolProgress bookends + forwarded intermediate progress, ToolCallCompleted)
+    // into short, order-preserving tags. Non-tool events (Llm*, Substrate*) are
+    // dropped so the envelope ordering can be asserted directly.
+    fn tool_envelope_tags(events: &[HiveEvent]) -> Vec<&'static str> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                HiveEvent::ToolCallStarted { .. } => Some("ToolCallStarted"),
+                HiveEvent::ToolCallCompleted { .. } => Some("ToolCallCompleted"),
+                HiveEvent::ToolProgress { progress, .. } => Some(match progress {
+                    ToolProgress::Started { .. } => "Started",
+                    ToolProgress::Progress { .. } => "Progress",
+                    ToolProgress::PartialResult { .. } => "PartialResult",
+                    ToolProgress::Log { .. } => "Log",
+                    ToolProgress::Completed { .. } => "Completed",
+                }),
+                _ => None,
+            })
+            .collect()
+    }
+
+    // Drive the loop with a single tool call, subscribing BEFORE the run and
+    // draining promptly after into a Vec (event count << broadcast cap 256, so no
+    // lag drop is possible for this deterministic set).
+    async fn run_loop_collect(tools: Vec<Arc<dyn Tool>>) -> Vec<HiveEvent> {
+        let provider = Arc::new(MockLlm::new(vec![
+            MockLlm::tool_call_response("call_1", tools[0].name(), serde_json::json!({})),
+            MockLlm::text_response("Done"),
+        ]));
+        let config = test_config(tools);
+        let task = test_task();
+        let substrate = test_substrate();
+        let emitter = EventEmitter::default();
+        let mut rx = emitter.subscribe();
+        let approval = pulsehive_core::approval::AutoApprove;
+
+        let _outcome = run_agentic_loop(
+            config,
+            LoopContext {
+                agent_id: "agent-streaming".into(),
+                task: &task,
+                provider,
+                substrate,
+                approval_handler: &approval,
+                event_emitter: emitter,
+                max_iterations: DEFAULT_MAX_ITERATIONS,
+                embedding_provider: None,
+            },
+        )
+        .await;
+
+        let mut events = vec![];
+        while let Ok(e) = rx.try_recv() {
+            events.push(e);
+        }
+        events
+    }
+
+    #[tokio::test]
+    async fn plain_tool_streaming_bookends() {
+        // A non-streaming tool must still yield exactly the loop-generated envelope:
+        // ToolCallStarted → ToolProgress::Started → ToolProgress::Completed → ToolCallCompleted.
+        let events = run_loop_collect(vec![Arc::new(EchoTool)]).await;
+        let tags = tool_envelope_tags(&events);
+        assert_eq!(
+            tags,
+            vec![
+                "ToolCallStarted",
+                "Started",
+                "Completed",
+                "ToolCallCompleted"
+            ],
+            "plain tool must produce the exact Started→Completed envelope. Tags: {tags:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn streaming_tool_progress_ordering() {
+        // A streaming tool's intermediate ToolProgress events must appear in send
+        // order, bracketed by the loop's Started/Completed bookends and the
+        // ToolCall* envelope.
+        let events = run_loop_collect(vec![Arc::new(ProgressTool)]).await;
+        let tags = tool_envelope_tags(&events);
+        assert_eq!(
+            tags,
+            vec![
+                "ToolCallStarted",
+                "Started",
+                "Progress",
+                "PartialResult",
+                "Progress",
+                "Completed",
+                "ToolCallCompleted"
+            ],
+            "streaming tool must emit intermediate progress in send order between bookends. Tags: {tags:?}"
         );
     }
 }

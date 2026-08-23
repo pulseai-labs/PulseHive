@@ -28,7 +28,7 @@ pub mod prelude {
     pub use crate::embedding::EmbeddingProvider;
     pub use crate::export::EventExporter;
     pub use crate::llm::LlmProvider;
-    pub use crate::tool::Tool;
+    pub use crate::tool::{StreamingTool, Tool};
 
     // ── Agent types ──────────────────────────────────────────────────
     pub use crate::agent::{
@@ -57,7 +57,7 @@ pub mod prelude {
     };
 
     // ── Tool types ───────────────────────────────────────────────────
-    pub use crate::tool::{ToolContext, ToolResult};
+    pub use crate::tool::{LogLevel, ToolContext, ToolProgress, ToolResult};
 
     // ── PulseDB re-exports ───────────────────────────────────────────
     pub use pulsedb::{

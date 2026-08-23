@@ -7,6 +7,7 @@ use std::collections::HashMap;
 
 use pulsehive_core::agent::AgentOutcome;
 use pulsehive_core::event::HiveEvent;
+use pulsehive_core::tool::ToolProgress;
 
 #[cfg(feature = "napi")]
 use napi_derive::napi;
@@ -292,6 +293,38 @@ impl From<HiveEvent> for JsHiveEvent {
                 fields.insert("eventType".into(), EventValue::Str(event_type));
                 ("watch_notification", None)
             }
+            HiveEvent::ToolProgress {
+                timestamp_ms,
+                agent_id,
+                tool_name,
+                progress,
+            } => {
+                fields.insert("timestampMs".into(), EventValue::Num(timestamp_ms));
+                fields.insert("agentId".into(), EventValue::Str(agent_id.clone()));
+                fields.insert("toolName".into(), EventValue::Str(tool_name));
+                // The nested `progress` enum has no scalar map representation, so
+                // emit a `progressKind` discriminator plus the full payload as a
+                // JSON string (audit ⑥ default; the flatten-scalars form is deferred).
+                let progress_kind = match &progress {
+                    ToolProgress::Started { .. } => "started",
+                    ToolProgress::Progress { .. } => "progress",
+                    ToolProgress::PartialResult { .. } => "partial_result",
+                    ToolProgress::Log { .. } => "log",
+                    ToolProgress::Completed { .. } => "completed",
+                };
+                fields.insert(
+                    "progressKind".into(),
+                    EventValue::Str(progress_kind.to_string()),
+                );
+                fields.insert(
+                    "progress".into(),
+                    EventValue::Str(serde_json::to_string(&progress).unwrap_or_default()),
+                );
+                ("tool_progress", Some(agent_id))
+            }
+            // Forward-compat: `HiveEvent` is `#[non_exhaustive]`. Future variants
+            // (VS-1.1.2+) map to an inert `unknown` event instead of failing to build.
+            _ => ("unknown", None),
         };
 
         Self {
@@ -299,5 +332,32 @@ impl From<HiveEvent> for JsHiveEvent {
             agent_id,
             fields,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn jshiveevent_tool_progress_maps_event_type() {
+        let event = HiveEvent::ToolProgress {
+            timestamp_ms: 1,
+            agent_id: "a1".into(),
+            tool_name: "backtest".into(),
+            progress: ToolProgress::Progress {
+                fraction: 0.5,
+                message: Some("halfway".into()),
+            },
+        };
+        let js_event = JsHiveEvent::from(event);
+        assert_eq!(js_event.event_type, "tool_progress");
+        assert_eq!(js_event.agent_id.as_deref(), Some("a1"));
+        // Nested payload is serialized as a JSON string + a discriminator field.
+        assert!(js_event.fields.contains_key("progress"));
+        assert!(matches!(
+            js_event.fields.get("progressKind"),
+            Some(EventValue::Str(s)) if s == "progress"
+        ));
     }
 }
