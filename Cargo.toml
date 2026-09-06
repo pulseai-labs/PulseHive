@@ -20,6 +20,9 @@ repository = "https://github.com/pulseai-labs/PulseHive"
 # Async runtime
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync"] }
 
+# Cancellation tokens (`tokio_util::sync::CancellationToken`, no feature needed)
+tokio-util = { version = "0.7", default-features = false }
+
 # Serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

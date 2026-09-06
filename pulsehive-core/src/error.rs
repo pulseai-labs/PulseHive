@@ -6,6 +6,27 @@
 use thiserror::Error;
 
 /// Top-level error type for all PulseHive operations.
+///
+/// The enum is non-exhaustive, so later variants are additive. An exhaustive
+/// `match` outside this crate needs a `_ =>` arm — without one it no longer
+/// compiles:
+///
+/// ```compile_fail,E0004
+/// fn describe(err: pulsehive_core::error::PulseHiveError) -> &'static str {
+///     use pulsehive_core::error::PulseHiveError as E;
+///     match err {
+///         E::Substrate(_) => "substrate",
+///         E::Llm(_) => "llm",
+///         E::LlmTransport(_) => "llm transport",
+///         E::Tool(_) => "tool",
+///         E::Agent(_) => "agent",
+///         E::Config(_) => "config",
+///         E::Validation(_) => "validation",
+///         E::Embedding(_) => "embedding",
+///     }
+/// }
+/// ```
+#[non_exhaustive]
 #[derive(Debug, Error)]
 pub enum PulseHiveError {
     /// Error from the PulseDB storage substrate.
@@ -17,6 +38,12 @@ pub enum PulseHiveError {
     /// Error from an LLM provider (API failure, rate limit, parse error).
     #[error("LLM error: {0}")]
     Llm(String),
+
+    /// Structured transport failure from an LLM provider.
+    ///
+    /// Automatically converted from [`crate::llm::LlmError`] via the `?` operator.
+    #[error("LLM transport error: {0}")]
+    LlmTransport(#[from] crate::llm::LlmError),
 
     /// Error during tool execution.
     #[error("Tool error: {0}")]
@@ -43,6 +70,11 @@ impl PulseHiveError {
     /// Creates an LLM error.
     pub fn llm(msg: impl Into<String>) -> Self {
         Self::Llm(msg.into())
+    }
+
+    /// Creates a structured LLM transport error.
+    pub fn llm_transport(err: crate::llm::LlmError) -> Self {
+        Self::LlmTransport(err)
     }
 
     /// Creates a tool error.

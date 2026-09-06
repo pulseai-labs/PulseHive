@@ -66,11 +66,7 @@ impl LlmProvider for MockLlm {
             format!("[Response #{n}] Analysis complete.")
         };
 
-        Ok(LlmResponse {
-            content: Some(response),
-            tool_calls: vec![],
-            usage: TokenUsage::default(),
-        })
+        Ok(LlmResponse::text(response))
     }
 
     async fn chat_stream(

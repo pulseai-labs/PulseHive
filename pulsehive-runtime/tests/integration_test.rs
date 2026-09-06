@@ -33,23 +33,19 @@ impl MockLlm {
     }
 
     fn text(content: &str) -> LlmResponse {
-        LlmResponse {
-            content: Some(content.into()),
-            tool_calls: vec![],
-            usage: TokenUsage::default(),
-        }
+        LlmResponse::text(content)
     }
 
     fn tool_call(id: &str, name: &str, args: Value) -> LlmResponse {
-        LlmResponse {
-            content: None,
-            tool_calls: vec![ToolCall {
+        LlmResponse::new(
+            None,
+            vec![ToolCall {
                 id: id.into(),
                 name: name.into(),
                 arguments: args,
             }],
-            usage: TokenUsage::default(),
-        }
+            TokenUsage::default(),
+        )
     }
 }
 

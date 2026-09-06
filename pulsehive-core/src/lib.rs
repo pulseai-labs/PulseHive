@@ -53,7 +53,8 @@ pub mod prelude {
 
     // ── LLM types ────────────────────────────────────────────────────
     pub use crate::llm::{
-        LlmChunk, LlmConfig, LlmResponse, Message, TokenUsage, ToolCall, ToolDefinition,
+        LlmChunk, LlmConfig, LlmError, LlmErrorKind, LlmResponse, Message, ReasoningEffort,
+        TokenUsage, ToolCall, ToolChoice, ToolDefinition,
     };
 
     // ── Tool types ───────────────────────────────────────────────────

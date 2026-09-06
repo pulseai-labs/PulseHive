@@ -228,11 +228,7 @@ pub fn convert_response(response: MessagesResponse) -> LlmResponse {
         })
         .unwrap_or_default();
 
-    LlmResponse {
-        content,
-        tool_calls,
-        usage,
-    }
+    LlmResponse::new(content, tool_calls, usage)
 }
 
 #[cfg(test)]

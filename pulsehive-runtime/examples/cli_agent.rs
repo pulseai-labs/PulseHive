@@ -49,11 +49,7 @@ impl LlmProvider for MockLlm {
         _t: Vec<ToolDefinition>,
         _c: &LlmConfig,
     ) -> pulsehive_core::error::Result<LlmResponse> {
-        Ok(LlmResponse {
-            content: Some("Hello from PulseHive!".into()),
-            tool_calls: vec![],
-            usage: TokenUsage::default(),
-        })
+        Ok(LlmResponse::text("Hello from PulseHive!"))
     }
     async fn chat_stream(
         &self,

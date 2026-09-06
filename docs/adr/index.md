@@ -11,6 +11,7 @@ ADRs follow numbered naming convention: `NNN-decision-title.md`
 | N | Date | Decision | Status |
 |---|------|----------|--------|
 | 001 | 2026-08-23 | Ossify Adoption | Accepted |
+| 011 | 2026-09-06 | Provider Transport Contract | Proposed |
 
 ---
 
