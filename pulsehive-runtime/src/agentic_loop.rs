@@ -583,23 +583,19 @@ mod tests {
         }
 
         fn text_response(content: &str) -> LlmResponse {
-            LlmResponse {
-                content: Some(content.into()),
-                tool_calls: vec![],
-                usage: TokenUsage::default(),
-            }
+            LlmResponse::text(content)
         }
 
         fn tool_call_response(id: &str, name: &str, args: serde_json::Value) -> LlmResponse {
-            LlmResponse {
-                content: None,
-                tool_calls: vec![ToolCall {
+            LlmResponse::new(
+                None,
+                vec![ToolCall {
                     id: id.into(),
                     name: name.into(),
                     arguments: args,
                 }],
-                usage: TokenUsage::default(),
-            }
+                TokenUsage::default(),
+            )
         }
     }
 

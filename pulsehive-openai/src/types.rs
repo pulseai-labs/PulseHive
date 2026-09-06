@@ -175,11 +175,7 @@ impl ChatCompletionResponse {
             output_tokens: u.completion_tokens,
         });
 
-        LlmResponse {
-            content,
-            tool_calls,
-            usage,
-        }
+        LlmResponse::new(content, tool_calls, usage)
     }
 }
 

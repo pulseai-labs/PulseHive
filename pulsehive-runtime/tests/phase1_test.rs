@@ -90,21 +90,17 @@ async fn test_phase1_full_pipeline() {
     // FR-001: Build HiveMind
     let provider = ScriptedLlm::new(vec![
         // Call 1: Agent calls search tool
-        LlmResponse {
-            content: None,
-            tool_calls: vec![ToolCall {
+        LlmResponse::new(
+            None,
+            vec![ToolCall {
                 id: "call_1".into(),
                 name: "search".into(),
                 arguments: serde_json::json!({"query": "rust patterns"}),
             }],
-            usage: TokenUsage::default(),
-        },
+            TokenUsage::default(),
+        ),
         // Call 2: Agent responds with final answer
-        LlmResponse {
-            content: Some("Found great Rust patterns in the codebase.".into()),
-            tool_calls: vec![],
-            usage: TokenUsage::default(),
-        },
+        LlmResponse::text("Found great Rust patterns in the codebase."),
     ]);
 
     let hive = HiveMind::builder()

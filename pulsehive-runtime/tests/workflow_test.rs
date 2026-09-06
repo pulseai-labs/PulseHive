@@ -31,11 +31,7 @@ impl MockLlm {
     }
 
     fn text(content: &str) -> LlmResponse {
-        LlmResponse {
-            content: Some(content.into()),
-            tool_calls: vec![],
-            usage: TokenUsage::default(),
-        }
+        LlmResponse::text(content)
     }
 }
 

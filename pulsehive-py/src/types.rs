@@ -27,12 +27,9 @@ impl PyLlmConfig {
     #[pyo3(signature = (provider, model, temperature=0.7, max_tokens=4096))]
     fn new(provider: String, model: String, temperature: f32, max_tokens: u32) -> Self {
         Self {
-            inner: LlmConfig {
-                provider,
-                model,
-                temperature,
-                max_tokens,
-            },
+            inner: LlmConfig::new(provider, model)
+                .with_temperature(temperature)
+                .with_max_tokens(max_tokens),
         }
     }
 
