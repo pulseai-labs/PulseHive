@@ -9,7 +9,10 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use pulsehive_core::llm::{LlmResponse, Message, TokenUsage, ToolCall, ToolDefinition};
+use pulsehive_core::error::{PulseHiveError, Result};
+use pulsehive_core::llm::{
+    LlmError, LlmErrorKind, LlmResponse, Message, TokenUsage, ToolCall, ToolChoice, ToolDefinition,
+};
 
 // ── Request Types ────────────────────────────────────────────────────
 
@@ -25,6 +28,50 @@ pub struct MessagesRequest {
     pub tools: Vec<AnthropicTool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stream: Option<bool>,
+    /// Anthropic's `tool_choice` wire object, present only when the caller
+    /// set [`ToolChoice`] on the call config.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_choice: Option<AnthropicToolChoice>,
+}
+
+/// Anthropic's `tool_choice` wire object, built from core's [`ToolChoice`].
+///
+/// The mapping is this crate's to own (ADR-006): `auto` lets the model
+/// decide, `any` forces some tool, `tool` names a specific tool, and `none`
+/// forbids tools.
+#[derive(Debug, Serialize)]
+#[serde(tag = "type")]
+pub enum AnthropicToolChoice {
+    /// The model decides whether to call a tool: `{"type":"auto"}`.
+    #[serde(rename = "auto")]
+    Auto,
+    /// The model must call some tool: `{"type":"any"}`.
+    #[serde(rename = "any")]
+    Required,
+    /// The model must call this specific tool: `{"type":"tool","name":…}`.
+    #[serde(rename = "tool")]
+    Tool {
+        /// The tool the model must call.
+        name: String,
+    },
+    /// The model must not call a tool: `{"type":"none"}`.
+    #[serde(rename = "none")]
+    None,
+}
+
+impl From<&ToolChoice> for AnthropicToolChoice {
+    fn from(choice: &ToolChoice) -> Self {
+        match choice {
+            ToolChoice::Auto => Self::Auto,
+            ToolChoice::None => Self::None,
+            ToolChoice::Required => Self::Required,
+            ToolChoice::Function { name } => Self::Tool { name: name.clone() },
+            // `ToolChoice` is non-exhaustive; a future variant has no
+            // Anthropic mapping yet, so fall back to letting the model
+            // decide rather than guessing a stricter shape.
+            _ => Self::Auto,
+        }
+    }
 }
 
 /// A message in Anthropic format.
@@ -191,8 +238,17 @@ pub fn convert_messages(messages: &[Message]) -> (Option<String>, Vec<AnthropicM
     (system, anthropic_msgs)
 }
 
-/// Convert Anthropic response to PulseHive LlmResponse.
-pub fn convert_response(response: MessagesResponse) -> LlmResponse {
+/// Convert an Anthropic response to a PulseHive [`LlmResponse`].
+///
+/// `stop_reason` is copied verbatim into `finish_reason` — `end_turn`,
+/// `max_tokens`, `stop_sequence`, `tool_use`, whatever the API sent; no
+/// normalization (ADR-007, E3). `reasoning` is always `None`: this provider
+/// never requests `thinking` blocks, so none can come back.
+///
+/// A `tool_use` block whose `input` is not a JSON object is a typed
+/// [`LlmErrorKind::MalformedToolCall`] failure rather than a silently
+/// rewritten tool call.
+pub fn convert_response(response: MessagesResponse) -> Result<LlmResponse> {
     let mut text_parts: Vec<String> = Vec::new();
     let mut tool_calls: Vec<ToolCall> = Vec::new();
 
@@ -202,6 +258,18 @@ pub fn convert_response(response: MessagesResponse) -> LlmResponse {
                 text_parts.push(text);
             }
             ContentBlock::ToolUse { id, name, input } => {
+                if !input.is_object() {
+                    let mut error = LlmError::new(
+                        LlmErrorKind::MalformedToolCall,
+                        "tool_use input is not a JSON object",
+                    )
+                    .with_status(200)
+                    .with_body(input.to_string());
+                    if let Some(stop_reason) = response.stop_reason.clone() {
+                        error = error.with_finish_reason(stop_reason);
+                    }
+                    return Err(PulseHiveError::llm_transport(error));
+                }
                 tool_calls.push(ToolCall {
                     id,
                     name,
@@ -228,7 +296,11 @@ pub fn convert_response(response: MessagesResponse) -> LlmResponse {
         })
         .unwrap_or_default();
 
-    LlmResponse::new(content, tool_calls, usage)
+    let mut result = LlmResponse::new(content, tool_calls, usage);
+    if let Some(stop_reason) = response.stop_reason {
+        result = result.with_finish_reason(stop_reason);
+    }
+    Ok(result)
 }
 
 #[cfg(test)]
@@ -273,7 +345,7 @@ mod tests {
                 output_tokens: 5,
             }),
         };
-        let result = convert_response(response);
+        let result = convert_response(response).expect("text-only response converts");
         assert_eq!(result.content, Some("Hello!".into()));
         assert!(result.tool_calls.is_empty());
         assert_eq!(result.usage.output_tokens, 5);
@@ -291,7 +363,7 @@ mod tests {
             stop_reason: Some("tool_use".into()),
             usage: None,
         };
-        let result = convert_response(response);
+        let result = convert_response(response).expect("tool_use response converts");
         assert!(result.content.is_none());
         assert_eq!(result.tool_calls.len(), 1);
         assert_eq!(result.tool_calls[0].name, "search");

@@ -934,6 +934,50 @@ impl AnthropicProvider {
 // Implements LlmProvider
 ```
 
+**Transport hardening (2.1.0).** Every transport failure from `chat` is a
+`PulseHiveError::LlmTransport` carrying an `LlmError`:
+
+| Situation | `kind` | Retried? | Carries |
+|---|---|---|---|
+| Request deadline exceeded (send or body read) | `Timeout` | never — fails after one attempt | `attempts: 1` |
+| Other transport failure (connection refused, reset, …) | `Connect` | yes, within the attempt budget | — |
+| HTTP 429 | `RateLimited` | yes; integer-seconds `Retry-After` wins over backoff | `status: 429`, raw `body`, `retry_after` |
+| HTTP 500 / 502 / 503 / 529 | `ServerError` | yes (529 also honours `Retry-After`) | `status`, raw `body` |
+| Other 4xx | `ClientError` | never | `status`, raw `body`, the Anthropic error envelope's `error.message` when it parses |
+| Other 5xx | `ServerError` | never | `status`, raw `body` |
+| Success status, unparseable body | `Parse` | never | `status: 200`, raw `body` |
+| `tool_use` block whose `input` is not a JSON object | `MalformedToolCall` | never | `status: 200`, the input's JSON text as `body`, the response's `stop_reason` |
+| Cancelled `LlmConfig::cancel` token (before or during a call) | `Cancelled` | never | `attempts` = sends made so far |
+
+Per-call overrides and cancellation: `LlmConfig::timeout_secs` and
+`LlmConfig::max_retries` override `AnthropicConfig`'s `timeout_secs` /
+`max_retries` for that one call (`max_attempts = max_retries + 1`), and a
+cancelled `LlmConfig::cancel` token aborts the in-flight request.
+
+Wire mapping, request side — `LlmConfig::tool_choice` maps to Anthropic's
+exact shapes and is omitted entirely when unset:
+
+| `ToolChoice` | Anthropic wire object |
+|---|---|
+| `Auto` | `{"type":"auto"}` |
+| `Required` | `{"type":"any"}` |
+| `Function { name }` | `{"type":"tool","name":"<name>"}` |
+| `None` | `{"type":"none"}` |
+
+`LlmConfig::reasoning_effort` is **accepted and ignored** by this provider:
+it is never sent on the wire — neither a `reasoning_effort` nor a `thinking`
+parameter — and the call succeeds unchanged. Mapping it to Anthropic extended
+thinking is a recorded feature-map entry, not provider parity.
+
+Wire mapping, response side — `stop_reason` is copied **verbatim** into
+`LlmResponse::finish_reason` (`end_turn`, `max_tokens`, `stop_sequence`,
+`tool_use`, …; no normalization), and `reasoning` is always `None` because
+this provider never requests `thinking` blocks. `chat_stream` is not
+supported by this provider today (every call returns a not-supported error).
+
+`AnthropicProvider::config()` returns a shared reference to the provider's
+`AnthropicConfig`.
+
 ### 6.2 pulsehive-openai
 
 ```rust
