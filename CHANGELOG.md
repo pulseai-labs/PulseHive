@@ -7,8 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [2.1.0] - Unreleased
 
+### Fixed
+- **pulsehive-openai**: a timed-out request now fails once with a typed `LlmErrorKind::Timeout` and is never re-sent (#46) — previously a timeout was retried like a connection error, re-billing the consumer for generation already spent.
+- **pulsehive-openai**: a tool call whose `arguments` do not parse as a JSON object (e.g. truncated by `finish_reason: "length"`) now surfaces as a typed `LlmErrorKind::MalformedToolCall` carrying the raw arguments and the finish reason, instead of a dispatchable call with empty `{}` arguments.
+
 ### Added
 - **Streaming tools** — a new `pulsehive_core::tool::StreamingTool: Tool` trait for long-running tools that report live progress. Tools expose it by overriding `Tool::as_streaming()` to return `Some(self)`; the agent loop then calls `StreamingTool::execute_streaming(params, context, progress_tx)` and forwards each pushed event.
+- **pulsehive-openai**: every transport failure from `OpenAICompatibleProvider` is now a typed `PulseHiveError::LlmTransport(LlmError)` with kind (`Timeout`, `Connect`, `RateLimited`, `ServerError`, `ClientError`, `Parse`, `MalformedToolCall`, `Cancelled`), status, attempts, verbatim body and `retry_after`; `PulseHiveError::Llm(String)` remains only for request-build serialization failures.
+- **pulsehive-openai**: per-call `LlmConfig::timeout_secs` and `LlmConfig::max_retries` override the provider's configured values for that one call on a single provider instance, and `LlmConfig::cancel` aborts an in-flight request (or a backoff sleep) mid-flight, returning `LlmErrorKind::Cancelled`.
+- **pulsehive-openai**: `reasoning_effort` and `tool_choice` are sent on the wire only when set (`tool_choice` maps to `"auto"` / `"none"` / `"required"` / `{"type":"function","function":{"name":…}}`); with both unset the request body is byte-identical to 2.0.2.
+- **pulsehive-openai**: `finish_reason` and `reasoning` (including the `reasoning_content` alias) come off the wire onto `LlmResponse`; `chat_stream` still carries neither (documented limitation).
+- **pulsehive-openai**: `OpenAICompatibleProvider::config()` exposes the provider's `OpenAIConfig`.
 - **`pulsehive_core::tool::ToolProgress`** enum — the progress payload (`Started` / `Progress { fraction, message }` / `PartialResult` / `Log` / `Completed { duration_ms }`). The `Started` / `Completed` bookends are emitted by the agent loop; tool bodies push the intermediate variants.
 - **`HiveEvent::ToolProgress { agent_id, tool_name, progress }`** — the agent loop forwards each `ToolProgress` from a streaming tool as this event on the `HiveMind::deploy()` stream, so consumers see live progress instead of a frozen wait. Delivery on `deploy()` is **best-effort** (a lossy broadcast that drops events for lagging subscribers); the ordered `Started → … → Completed` envelope is emitted in order by the loop but preserved by **neither** transport for consumers (the `deploy()` broadcast drops on lag; a configured `EventExporter` receives each event via an independent fire-and-forget task), so consumers should not treat `Completed` as a guaranteed terminal marker.
 - New runnable, hermetic example `pulsehive-runtime/examples/streaming_tool.rs` (no API key) and a "Streaming Tools" section in `docs/05-API-Spec.md`.

@@ -10,10 +10,14 @@ use futures_core::Stream;
 use serde_json::Value;
 
 use pulsehive_core::error::{PulseHiveError, Result};
-use pulsehive_core::llm::{LlmChunk, LlmConfig, LlmProvider, LlmResponse, Message, ToolDefinition};
+use pulsehive_core::llm::{
+    LlmChunk, LlmConfig, LlmError, LlmErrorKind, LlmProvider, LlmResponse, Message, ToolDefinition,
+};
 
 use crate::config::OpenAIConfig;
-use crate::types::{ChatCompletionRequest, ChatCompletionResponse, OpenAITool, StreamChunk};
+use crate::types::{
+    ChatCompletionRequest, ChatCompletionResponse, OpenAITool, OpenAIToolChoice, StreamChunk,
+};
 
 /// LLM provider for any OpenAI-compatible API.
 ///
@@ -104,18 +108,65 @@ impl OpenAICompatibleProvider {
             temperature: config.temperature,
             max_tokens: config.max_tokens,
             stream,
+            // New wire fields go out only when the caller set them, so an
+            // unset config sends a body byte-identical to 2.0.2 (#47 R1, R6).
+            reasoning_effort: config.reasoning_effort,
+            tool_choice: config.tool_choice.as_ref().map(OpenAIToolChoice::from),
         })
     }
 
-    /// Send a request with automatic retry for transient errors.
+    /// The provider's configuration (E7): defaults for timeout, retry budget
+    /// and endpoint, as constructed.
+    pub fn config(&self) -> &OpenAIConfig {
+        &self.config
+    }
+
+    /// Send a request under the provider's transport policy.
     ///
-    /// Retries on: 429 (rate limit), 500, 502, 503, 529 (server overloaded).
-    /// Fails immediately on: 400, 401, 403, 404 (client errors).
-    /// Uses exponential backoff: 1s → 2s → 4s, respects Retry-After header on 429.
-    async fn send_request(&self, request: &ChatCompletionRequest) -> Result<reqwest::Response> {
+    /// Every failure is a typed [`LlmError`] inside
+    /// [`PulseHiveError::LlmTransport`] — never a bare string — and the two
+    /// failure branches are distinguishable by kind (#46's second complaint):
+    ///
+    /// * **Status failures** — the provider answered a non-success status.
+    ///   `429`, `500`, `502`, `503` and `529` are retried up to the attempt
+    ///   budget, a `429` waiting for `Retry-After` when present (else
+    ///   exponential backoff: 1s → 2s → 4s, capped at 8s). Every other 4xx is
+    ///   [`LlmErrorKind::ClientError`] and every other 5xx
+    ///   [`LlmErrorKind::ServerError`], both failing immediately with the raw
+    ///   body attached verbatim.
+    /// * **Transport failures** — the request never completed. A deadline
+    ///   expiry ([`LlmErrorKind::Timeout`]) is **never retried**: the request
+    ///   timed out and re-sending it would bill the consumer for work already
+    ///   spent (#46). A connection-level error ([`LlmErrorKind::Connect`]) is
+    ///   retried with the same backoff. A cancelled
+    ///   [`LlmConfig::cancel`] token ([`LlmErrorKind::Cancelled`]) aborts the
+    ///   in-flight request, the body read and every backoff sleep, and is
+    ///   never retried.
+    ///
+    /// Per-call `LlmConfig` overrides: `max_retries` replaces this provider's
+    /// configured budget for this one call (`Some(0)` means exactly one
+    /// attempt), and `timeout_secs` replaces the client-level deadline for
+    /// this request only.
+    ///
+    /// `attempts` on every error counts the requests actually sent, the failed
+    /// one included; it is `0` only for a cancellation observed before the
+    /// first send. On success the count travels with the response, so errors
+    /// built downstream (parse, malformed tool call) carry it too.
+    async fn send_request(
+        &self,
+        request: &ChatCompletionRequest,
+        call: &LlmConfig,
+    ) -> Result<(reqwest::Response, u32)> {
         let url = self.config.chat_completions_url();
-        let max_attempts = self.config.max_retries + 1;
-        let mut last_err = PulseHiveError::llm("No attempts made");
+        let max_attempts = call.max_retries.unwrap_or(self.config.max_retries) + 1;
+        let cancel = call.cancel.as_ref();
+
+        // A token cancelled before the call never sends anything.
+        if let Some(token) = cancel {
+            if token.is_cancelled() {
+                return Err(cancelled_error(0));
+            }
+        }
 
         for attempt in 1..=max_attempts {
             tracing::debug!(
@@ -126,59 +177,175 @@ impl OpenAICompatibleProvider {
                 "Sending chat request"
             );
 
-            let response = self.client.post(&url).json(request).send().await;
+            let mut builder = self.client.post(&url).json(request);
+            if let Some(secs) = call.timeout_secs {
+                // Per-request deadline: replaces the client-level timeout for
+                // this call only (4.2).
+                builder = builder.timeout(Duration::from_secs(secs));
+            }
 
-            match response {
-                Ok(resp) if resp.status().is_success() => {
-                    return Ok(resp);
-                }
-                Ok(resp) => {
-                    let status = resp.status();
-                    let retry_after = parse_retry_after(&resp);
-                    let body = resp
-                        .text()
-                        .await
-                        .unwrap_or_else(|_| "<failed to read body>".into());
+            let send = builder.send();
+            let response = match cancel {
+                Some(token) => tokio::select! {
+                    // Dropping the send future is what aborts the connection.
+                    biased;
+                    _ = token.cancelled() => return Err(cancelled_error(attempt)),
+                    response = send => response,
+                },
+                None => send.await,
+            };
 
-                    let err_msg = format!("OpenAI API error (HTTP {status}): {body}");
-
-                    if is_retryable_status(status) && attempt < max_attempts {
-                        let delay = retry_after.unwrap_or_else(|| retry_delay(attempt));
-                        tracing::warn!(
-                            attempt = attempt,
-                            status = %status,
-                            delay_ms = delay.as_millis(),
-                            "Retrying after transient error"
-                        );
-                        tokio::time::sleep(delay).await;
-                        last_err = PulseHiveError::llm(err_msg);
-                        continue;
-                    }
-
-                    return Err(PulseHiveError::llm(err_msg));
+            let response = match response {
+                Ok(resp) => resp,
+                // A timed-out request fails once and is never re-sent (E5).
+                Err(e) if e.is_timeout() => {
+                    tracing::warn!(
+                        attempt = attempt,
+                        "request timed out after {attempt} attempt(s); not retrying"
+                    );
+                    return Err(PulseHiveError::llm_transport(
+                        LlmError::new(LlmErrorKind::Timeout, e.to_string()).with_attempts(attempt),
+                    ));
                 }
                 Err(e) => {
-                    let err_msg = format!("HTTP request failed: {e}");
-
                     if attempt < max_attempts {
                         let delay = retry_delay(attempt);
                         tracing::warn!(
                             attempt = attempt,
-                            delay_ms = delay.as_millis(),
-                            "Retrying after connection error: {e}"
+                            kind = "connect",
+                            delay_ms = delay.as_millis() as u64,
+                            error = %e,
+                            "Retrying after connection error"
                         );
-                        tokio::time::sleep(delay).await;
-                        last_err = PulseHiveError::llm(err_msg);
+                        if let Some(token) = cancel {
+                            tokio::select! {
+                                biased;
+                                _ = token.cancelled() => return Err(cancelled_error(attempt)),
+                                _ = tokio::time::sleep(delay) => {}
+                            }
+                        } else {
+                            tokio::time::sleep(delay).await;
+                        }
                         continue;
                     }
-
-                    return Err(PulseHiveError::llm(err_msg));
+                    return Err(PulseHiveError::llm_transport(
+                        LlmError::new(LlmErrorKind::Connect, e.to_string()).with_attempts(attempt),
+                    ));
                 }
+            };
+
+            if response.status().is_success() {
+                return Ok((response, attempt));
             }
+
+            let status = response.status();
+            let retry_after = parse_retry_after(&response);
+            let text = response.text();
+            let text = match cancel {
+                Some(token) => tokio::select! {
+                    biased;
+                    _ = token.cancelled() => return Err(cancelled_error(attempt)),
+                    text = text => text,
+                },
+                None => text.await,
+            };
+            // Only a successfully read body proceeds to status classification:
+            // a body-read failure is a transport failure, not a status failure
+            // with a placeholder body.
+            let body = match text {
+                Ok(body) => body,
+                Err(e) if e.is_timeout() => {
+                    tracing::warn!(
+                        attempt = attempt,
+                        "request timed out after {attempt} attempt(s); not retrying"
+                    );
+                    return Err(PulseHiveError::llm_transport(
+                        LlmError::new(LlmErrorKind::Timeout, e.to_string()).with_attempts(attempt),
+                    ));
+                }
+                Err(e) => {
+                    if attempt < max_attempts {
+                        let delay = retry_delay(attempt);
+                        tracing::warn!(
+                            attempt = attempt,
+                            kind = "connect",
+                            delay_ms = delay.as_millis() as u64,
+                            error = %e,
+                            "Retrying after body-read connection error"
+                        );
+                        if let Some(token) = cancel {
+                            tokio::select! {
+                                biased;
+                                _ = token.cancelled() => return Err(cancelled_error(attempt)),
+                                _ = tokio::time::sleep(delay) => {}
+                            }
+                        } else {
+                            tokio::time::sleep(delay).await;
+                        }
+                        continue;
+                    }
+                    return Err(PulseHiveError::llm_transport(
+                        LlmError::new(LlmErrorKind::Connect, e.to_string()).with_attempts(attempt),
+                    ));
+                }
+            };
+
+            let kind = if status.as_u16() == 429 {
+                LlmErrorKind::RateLimited
+            } else if is_retryable_status(status) {
+                LlmErrorKind::ServerError
+            } else if status.is_client_error() {
+                LlmErrorKind::ClientError
+            } else {
+                LlmErrorKind::ServerError
+            };
+
+            let mut err = LlmError::new(kind, format!("HTTP {status}"))
+                .with_status(status.as_u16())
+                .with_attempts(attempt)
+                .with_body(body);
+            if let Some(delay) = retry_after {
+                err = err.with_retry_after(delay);
+            }
+
+            if is_retryable_status(status) && attempt < max_attempts {
+                let delay = retry_after.unwrap_or_else(|| retry_delay(attempt));
+                tracing::warn!(
+                    attempt = attempt,
+                    status = %status,
+                    delay_ms = delay.as_millis() as u64,
+                    "Retrying after transient error"
+                );
+                if let Some(token) = cancel {
+                    tokio::select! {
+                        biased;
+                        _ = token.cancelled() => return Err(cancelled_error(attempt)),
+                        _ = tokio::time::sleep(delay) => {}
+                    }
+                } else {
+                    tokio::time::sleep(delay).await;
+                }
+                continue;
+            }
+
+            return Err(PulseHiveError::llm_transport(err));
         }
 
-        Err(last_err)
+        // Unreachable in practice: the final iteration always returns. Kept as
+        // a typed error rather than a panic (MASTER-SPEC §9.4).
+        Err(PulseHiveError::llm_transport(
+            LlmError::new(LlmErrorKind::ServerError, "retry budget exhausted")
+                .with_attempts(max_attempts),
+        ))
     }
+}
+
+/// The typed error for a caller cancellation.
+fn cancelled_error(attempts: u32) -> PulseHiveError {
+    PulseHiveError::llm_transport(
+        LlmError::new(LlmErrorKind::Cancelled, "call cancelled by the caller")
+            .with_attempts(attempts),
+    )
 }
 
 #[async_trait]
@@ -190,25 +357,54 @@ impl LlmProvider for OpenAICompatibleProvider {
         config: &LlmConfig,
     ) -> Result<LlmResponse> {
         let request = self.build_request(&messages, &tools, config, false)?;
-        let response = self.send_request(&request).await?;
+        let (response, attempts) = self.send_request(&request, config).await?;
 
-        let body = response
-            .text()
-            .await
-            .map_err(|e| PulseHiveError::llm(format!("Failed to read response body: {e}")))?;
+        let status = response.status();
+        let read = response.text();
+        let read = match config.cancel.as_ref() {
+            Some(token) => tokio::select! {
+                biased;
+                _ = token.cancelled() => return Err(cancelled_error(attempts)),
+                body = read => body,
+            },
+            None => read.await,
+        };
+        let body = match read {
+            Ok(body) => body,
+            // A timeout while reading the body is a Timeout, not a Parse (4.1).
+            Err(e) if e.is_timeout() => {
+                return Err(PulseHiveError::llm_transport(
+                    LlmError::new(LlmErrorKind::Timeout, e.to_string()).with_attempts(attempts),
+                ))
+            }
+            Err(e) => {
+                return Err(PulseHiveError::llm_transport(
+                    LlmError::new(LlmErrorKind::Parse, e.to_string())
+                        .with_status(status.as_u16())
+                        .with_attempts(attempts),
+                ))
+            }
+        };
 
+        // The body is attached verbatim — the consumer decides what to redact.
         let completion: ChatCompletionResponse = serde_json::from_str(&body).map_err(|e| {
-            let excerpt = if body.len() > 200 {
-                format!("{}...", &body[..200])
-            } else {
-                body.clone()
-            };
-            PulseHiveError::llm(format!("Failed to parse response: {e}\nBody: {excerpt}"))
+            PulseHiveError::llm_transport(
+                LlmError::new(LlmErrorKind::Parse, e.to_string())
+                    .with_status(status.as_u16())
+                    .with_attempts(attempts)
+                    .with_body(body.clone()),
+            )
         })?;
 
-        Ok(completion.into_llm_response())
+        completion.into_llm_response(attempts)
     }
 
+    /// Streams a chat completion as SSE chunks.
+    ///
+    /// Limitation (E11, #47 R4): the streaming path carries neither
+    /// `reasoning` nor `finish_reason` — only [`Self::chat`] surfaces them.
+    /// Transport failures before the stream starts surface as the same typed
+    /// [`PulseHiveError::LlmTransport`] errors as `chat`.
     async fn chat_stream(
         &self,
         messages: Vec<Message>,
@@ -216,7 +412,7 @@ impl LlmProvider for OpenAICompatibleProvider {
         config: &LlmConfig,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<LlmChunk>> + Send>>> {
         let request = self.build_request(&messages, &tools, config, true)?;
-        let response = self.send_request(&request).await?;
+        let (response, _attempts) = self.send_request(&request, config).await?;
 
         let stream = response
             .bytes_stream()

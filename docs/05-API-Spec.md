@@ -539,18 +539,33 @@ Model selection and inference parameters:
 
 ```rust
 pub struct LlmConfig {
+    pub provider: String,
     pub model: String,
     pub temperature: f32,
     pub max_tokens: u32,
+    pub timeout_secs: Option<u64>,           // Per-call timeout override
+    pub max_retries: Option<u32>,            // Per-call retry-budget override
+    pub reasoning_effort: Option<ReasoningEffort>,
+    pub tool_choice: Option<ToolChoice>,
+    pub cancel: Option<CancellationToken>,   // Runtime state, never serialized
 }
 
 impl LlmConfig {
     /// Create a config with provider name and model identifier.
     pub fn new(provider: &str, model: &str) -> Self;
+    pub fn with_temperature(self, temperature: f32) -> Self;
+    pub fn with_max_tokens(self, max_tokens: u32) -> Self;
+    pub fn with_timeout_secs(self, timeout_secs: u64) -> Self;
+    pub fn with_max_retries(self, max_retries: u32) -> Self;
+    pub fn with_reasoning_effort(self, reasoning_effort: ReasoningEffort) -> Self;
+    pub fn with_tool_choice(self, tool_choice: ToolChoice) -> Self;
+    pub fn with_cancel(self, cancel: CancellationToken) -> Self;
 }
 ```
 
 The `provider` field matches the name passed to `HiveMindBuilder::llm_provider()`.
+
+`timeout_secs` and `max_retries` override the provider's configured values for that single call (`Some(0)` retries means exactly one attempt). `cancel` carries a `tokio_util::sync::CancellationToken`; cancelling it aborts the in-flight request and the call returns a `LlmErrorKind::Cancelled` transport error. `reasoning_effort` (`Minimal`/`Low`/`Medium`/`High`) and `tool_choice` (`Auto`/`None`/`Required`/`Function { name }`) reach the wire only when set.
 
 ### 3.7 Task
 
@@ -724,8 +739,11 @@ pub enum PulseHiveError {
     /// Storage layer errors (from PulseDB).
     Substrate(pulsedb::PulseDBError),
 
-    /// LLM provider errors (network, auth, rate limits).
-    Llm { provider: String, message: String },
+    /// LLM request-build and serialization failures.
+    Llm(String),
+
+    /// Structured transport failure from an LLM provider.
+    LlmTransport(LlmError),
 
     /// Tool execution errors.
     Tool(String),
@@ -737,12 +755,39 @@ pub enum PulseHiveError {
     Config(String),
 
     /// Agent execution errors.
-    Agent { agent_id: AgentId, message: String },
+    Agent(String),
 
-    /// Approval was denied.
-    ApprovalDenied { tool_name: String, reason: String },
+    /// Embedding provider errors.
+    Embedding(String),
 }
 ```
+
+`LlmTransport` carries a structured [`LlmError`] instead of a message string, so callers branch on a kind rather than matching text:
+
+```rust
+pub struct LlmError {
+    pub kind: LlmErrorKind,
+    pub message: String,
+    pub status: Option<u16>,          // HTTP status, when the failure carried one
+    pub attempts: u32,                // Requests actually sent (0 only for a pre-send cancellation)
+    pub body: Option<String>,         // Response body, verbatim; the consumer redacts
+    pub finish_reason: Option<String>,// Set for MalformedToolCall
+    pub retry_after: Option<Duration>,
+}
+```
+
+| `LlmErrorKind` | Meaning |
+|---|---|
+| `Timeout` | The call exceeded its deadline |
+| `Connect` | The connection could not be established |
+| `RateLimited` | The provider rate-limited the call |
+| `ServerError` | The provider returned a 5xx |
+| `ClientError` | The provider returned a 4xx that is not a rate limit |
+| `Parse` | The response body could not be parsed |
+| `MalformedToolCall` | The model emitted a tool call that could not be read as one |
+| `Cancelled` | The caller cancelled the in-flight call |
+
+Whether a kind is worth retrying is provider policy, not part of this contract.
 
 ### 4.5 AgentOutcome
 
@@ -936,6 +981,30 @@ let ollama = OpenAICompatibleProvider::new(OpenAIConfig {
     organization: None,
 });
 ```
+
+**Transport contract (2.1.0).** Every transport failure from `chat` is a typed `PulseHiveError::LlmTransport(LlmError)`; `PulseHiveError::Llm(String)` remains only for request-build serialization failures. Classification:
+
+| Situation | `LlmErrorKind` | Retried? | Carries |
+|---|---|---|---|
+| Request exceeded its deadline (send or body read) | `Timeout` | **never** — one attempt (#46) | `attempts: 1` |
+| Connection-level error (connect refused, reset) | `Connect` | yes, exponential backoff (1s→2s→4s, cap 8s) | — |
+| HTTP 429 | `RateLimited` | yes; waits `Retry-After` when present, else backoff | `status`, verbatim `body`, `retry_after` |
+| HTTP 500 / 502 / 503 / 529 | `ServerError` | yes, same backoff | `status`, verbatim `body` |
+| Any other 4xx | `ClientError` | never | `status`, verbatim `body` |
+| Any other 5xx | `ServerError` | never | `status`, verbatim `body` |
+| 2xx whose body fails to read or parse | `Parse` | never | `status`, verbatim `body` |
+| Tool-call `arguments` not a JSON object | `MalformedToolCall` | never | raw arguments as `body`, `finish_reason` |
+| `LlmConfig::cancel` token fires | `Cancelled` | never | `attempts` (0 if before the first send) |
+
+`attempts` counts the requests actually sent, the failed one included.
+
+**Per-call overrides.** `LlmConfig::timeout_secs` replaces the client-level deadline for that request only, and `LlmConfig::max_retries` replaces the provider's configured budget for that call (`Some(0)` = exactly one attempt) — both on a single provider instance. A cancelled `LlmConfig::cancel` token aborts the in-flight request, the body read and every backoff sleep.
+
+**Wire fields.** `reasoning_effort` and `tool_choice` are sent only when set; `tool_choice` maps to `"auto"` / `"none"` / `"required"` / `{"type":"function","function":{"name":…}}`. With both unset the request body is byte-identical to 2.0.2. On the response, `finish_reason` and `reasoning` (also read from the `reasoning_content` alias several compatible providers use) are surfaced on `LlmResponse`. A tool call whose `arguments` string does not parse as a JSON object is a `MalformedToolCall` error, never a call with `{}` arguments; a legitimate `"{}"` still yields `{}`.
+
+**Streaming limitation.** `chat_stream` carries neither `reasoning` nor `finish_reason` — only `chat` surfaces them.
+
+**Config accessor.** `OpenAICompatibleProvider::config() -> &OpenAIConfig` exposes the provider's configured defaults.
 
 ---
 
