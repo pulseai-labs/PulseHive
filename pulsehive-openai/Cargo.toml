@@ -26,4 +26,5 @@ tracing = { workspace = true }
 [dev-dependencies]
 dotenvy = "0.15"
 tokio = { workspace = true, features = ["test-util"] }
+tokio-util = { workspace = true }
 futures = { workspace = true }
