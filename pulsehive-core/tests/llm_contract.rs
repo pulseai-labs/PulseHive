@@ -37,7 +37,7 @@ fn llm_config_2_0_2_json_deserializes_with_new_fields_none() {
     assert_eq!(config.max_retries, None);
     assert_eq!(config.reasoning_effort, None);
     assert_eq!(config.tool_choice, None);
-    assert_eq!(config.cancel, None);
+    assert!(config.cancel.is_none());
 }
 
 /// New fields are additive on the wire: a key appears only once it is set.
@@ -78,7 +78,7 @@ fn llm_config_cancel_token_never_serializes_and_clones_share_cancellation() {
     assert!(!json.contains("cancel"), "{json}");
 
     let round_tripped: LlmConfig = serde_json::from_str(&json).unwrap();
-    assert_eq!(round_tripped.cancel, None);
+    assert!(round_tripped.cancel.is_none());
 
     let clone = config.clone();
     clone.cancel.as_ref().unwrap().cancel();
