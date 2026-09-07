@@ -35,7 +35,8 @@ PulseHive has fundamental architectural constraints that apply across all module
 
 **Provider Abstraction:**
 - LLM access through `LlmProvider` trait only
-- No hardcoded provider implementations
+- No hardcoded provider selection or transport behavior in core
+- Provider crates may implement `LlmProvider` (e.g. `pulsehive-openai`)
 - Pluggable provider model
 
 **Rationale:** These constraints keep PulseHive small, composable, and maintainable. The five-primitive boundary prevents framework bloat. Object-safe traits enable dynamic composition. AGPL ensures open-source contributions remain open.
