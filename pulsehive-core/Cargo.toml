@@ -19,6 +19,7 @@ serde_json = { workspace = true }
 async-trait = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
+tokio-util = { workspace = true }
 uuid = { workspace = true }
 futures-core = { workspace = true }
 tracing = { workspace = true }

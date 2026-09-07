@@ -32,12 +32,9 @@ impl JsLlmConfig {
         max_tokens: Option<u32>,
     ) -> Self {
         Self {
-            inner: LlmConfig {
-                provider,
-                model,
-                temperature: temperature.unwrap_or(0.7) as f32,
-                max_tokens: max_tokens.unwrap_or(4096),
-            },
+            inner: LlmConfig::new(provider, model)
+                .with_temperature(temperature.unwrap_or(0.7) as f32)
+                .with_max_tokens(max_tokens.unwrap_or(4096)),
         }
     }
 

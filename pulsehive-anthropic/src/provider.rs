@@ -1,6 +1,10 @@
 //! Anthropic Claude LLM provider implementation.
 
+use std::future::Future;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -11,12 +15,37 @@ use pulsehive_core::error::{PulseHiveError, Result};
 use pulsehive_core::llm::*;
 
 use crate::config::AnthropicConfig;
-use crate::types::{self, AnthropicTool, MessagesRequest, MessagesResponse};
+use crate::types::{self, AnthropicTool, AnthropicToolChoice, MessagesRequest, MessagesResponse};
 
 /// Anthropic Claude provider implementing the PulseHive LlmProvider trait.
 ///
 /// Supports Claude Opus, Sonnet, and Haiku models via the Messages API
-/// with tool use and streaming.
+/// with tool use.
+///
+/// # Transport behaviour
+///
+/// Transport failures surface as
+/// [`PulseHiveError::LlmTransport`](pulsehive_core::error::PulseHiveError::LlmTransport)
+/// carrying an [`LlmError`](pulsehive_core::llm::LlmError). A timeout fails
+/// once (`Timeout`) and is never re-sent; connection failures and
+/// 429/500/502/503/529 retry within the attempt budget, honouring an
+/// integer-seconds `Retry-After` header on 429/529 (capped at the backoff
+/// ceiling); any other 4xx/5xx fails
+/// immediately; a success status with an unreadable or unparseable body is
+/// `Parse`, while a body that cannot be read on an error status is a
+/// Connect-class failure that retries.
+/// `stop_reason` is reported verbatim as `finish_reason`, and `reasoning` is
+/// always `None`. [`LlmConfig::timeout_secs`] and [`LlmConfig::max_retries`]
+/// override this provider's configured values for a single call, and a
+/// cancelled [`LlmConfig::cancel`] token aborts the in-flight request.
+///
+/// `LlmConfig::reasoning_effort` is **accepted and ignored**: it is never
+/// sent on the wire — neither a `reasoning_effort` nor a `thinking`
+/// parameter. Mapping it to Anthropic extended thinking is a recorded
+/// feature-map entry, not provider parity.
+///
+/// Streaming (`chat_stream`) is not supported by this provider today; every
+/// call returns a not-supported error.
 pub struct AnthropicProvider {
     config: AnthropicConfig,
     client: Client,
@@ -38,6 +67,14 @@ impl AnthropicProvider {
         Self { config, client }
     }
 
+    /// The provider's configuration: a non-secret view of the defaults for
+    /// endpoint, model, timeout and retry budget as constructed. There is no
+    /// path from the view to the API key, and neither the view nor
+    /// [`AnthropicConfig`] renders the key in its `Debug` output.
+    pub fn config(&self) -> crate::config::AnthropicConfigView {
+        self.config.view()
+    }
+
     /// Build the request body for the Messages API.
     fn build_request(
         &self,
@@ -53,6 +90,20 @@ impl AnthropicProvider {
         } else {
             config.model.clone()
         };
+        // tool_choice without tools is rejected by the Messages API, so it is
+        // omitted whenever the request carries no tools, caller intent or not.
+        let tool_choice = if tools.is_empty() {
+            None
+        } else {
+            config.tool_choice.as_ref().map(AnthropicToolChoice::from)
+        };
+        if config.reasoning_effort.is_some() {
+            tracing::debug!(
+                "reasoning_effort is set on LlmConfig but is ignored by the Anthropic \
+                 provider: it is not sent on the wire (extended thinking is a recorded \
+                 feature-map entry, not a parity item)"
+            );
+        }
 
         MessagesRequest {
             model,
@@ -61,7 +112,324 @@ impl AnthropicProvider {
             messages: anthropic_messages,
             tools: anthropic_tools,
             stream: if stream { Some(true) } else { None },
+            tool_choice,
         }
+    }
+
+    /// Send one Messages API request, applying the per-call overrides and
+    /// this crate's retry policy.
+    ///
+    /// `config.max_retries` wins over `self.config.max_retries`;
+    /// `config.timeout_secs` overrides the client timeout for this request;
+    /// a cancelled `config.cancel` token aborts the in-flight exchange.
+    /// Every `Err` on the transport path is a typed `LlmTransport` error;
+    /// `PulseHiveError::llm(..)` remains reserved for request-build
+    /// failures — reachable here only when the request itself cannot be
+    /// built (malformed `base_url`, an `api_key` that cannot be a header
+    /// value), which fails immediately without sending anything.
+    async fn send_request(
+        &self,
+        request_body: &MessagesRequest,
+        config: &LlmConfig,
+    ) -> Result<LlmResponse> {
+        // Saturating: `LlmConfig` is an unvalidated Deserialize, so a
+        // `max_retries` of `u32::MAX` must still yield at least one attempt
+        // instead of overflowing (debug) or wrapping to zero (release).
+        let max_attempts = config
+            .max_retries
+            .unwrap_or(self.config.max_retries)
+            .saturating_add(1);
+        let mut attempts: u32 = 0;
+
+        loop {
+            // Cancellation is checked before every attempt, so a token
+            // cancelled before the first send returns with attempts == 0.
+            if config
+                .cancel
+                .as_ref()
+                .is_some_and(|token| token.is_cancelled())
+            {
+                return Err(Self::cancelled_error(attempts));
+            }
+
+            attempts += 1;
+
+            let mut request = self
+                .client
+                .post(self.config.messages_url())
+                .header("x-api-key", &self.config.api_key)
+                .header("anthropic-version", &self.config.anthropic_version)
+                .header("content-type", "application/json")
+                .json(&request_body);
+            if let Some(timeout_secs) = config.timeout_secs {
+                request = request.timeout(Duration::from_secs(timeout_secs));
+            }
+
+            // Phase 1 — send, latched as started and raced against
+            // cancellation. A timeout here fails once and is never re-sent;
+            // any other transport failure (connection refused, reset, ...)
+            // retries within the attempt budget. A cancellation that wins
+            // before the send future was ever polled never sent anything
+            // and reports the previous attempt count (0 on the first
+            // attempt): attempts counts requests actually sent.
+            let started = Arc::new(AtomicBool::new(false));
+            let send = MarkStarted {
+                future: Box::pin(request.send()),
+                started: Arc::clone(&started),
+            };
+            let response = match config.cancel.as_ref() {
+                Some(token) => tokio::select! {
+                    biased;
+                    _ = token.cancelled() => {
+                        let sent = if started.load(Ordering::Relaxed) {
+                            attempts
+                        } else {
+                            attempts - 1
+                        };
+                        return Err(Self::cancelled_error(sent));
+                    }
+                    response = send => response,
+                },
+                None => send.await,
+            };
+            let response = match response {
+                Ok(response) => response,
+                Err(e) if e.is_timeout() => return Err(Self::timeout_error(&e, attempts)),
+                // A builder error (malformed base_url, an api_key that
+                // cannot be a header value) never reaches the network: a
+                // request-build failure, surfaced immediately — not retried
+                // through the budget and not classified as Connect.
+                Err(e) if e.is_builder() => {
+                    return Err(PulseHiveError::llm(format!("failed to build request: {e}")));
+                }
+                Err(e) => {
+                    if attempts >= max_attempts {
+                        return Err(Self::connect_error(&e, attempts));
+                    }
+                    self.sleep_cancelled(backoff_delay(attempts), config, attempts)
+                        .await?;
+                    continue;
+                }
+            };
+            let status = response.status();
+            let retry_after = parse_retry_after(response.headers());
+
+            // Phase 2 — read the body, still raced against cancellation.
+            // The mapping depends on the phase and the status: a timeout
+            // fails once whatever the status; a non-timeout read failure is
+            // a Parse error on a success status (nothing parseable arrived)
+            // and a Connect-class failure that retries within the budget on
+            // any other status.
+            let body_raw = match self.race_cancel(response.text(), config, attempts).await? {
+                Ok(body) => body,
+                Err(e) if e.is_timeout() => return Err(Self::timeout_error(&e, attempts)),
+                Err(_) if status.is_success() => {
+                    // No partial body is recoverable from a dropped read, so
+                    // the error carries the status and no body.
+                    return Err(PulseHiveError::llm_transport(
+                        LlmError::new(LlmErrorKind::Parse, "response body could not be read")
+                            .with_status(status.as_u16())
+                            .with_attempts(attempts),
+                    ));
+                }
+                Err(e) => {
+                    if attempts >= max_attempts {
+                        return Err(Self::connect_error(&e, attempts));
+                    }
+                    self.sleep_cancelled(backoff_delay(attempts), config, attempts)
+                        .await?;
+                    continue;
+                }
+            };
+
+            let status_code = status.as_u16();
+            if matches!(status_code, 429 | 500 | 502 | 503 | 529) {
+                let kind = if status_code == 429 {
+                    LlmErrorKind::RateLimited
+                } else {
+                    LlmErrorKind::ServerError
+                };
+                if attempts >= max_attempts {
+                    let mut error = LlmError::new(kind, format!("Anthropic API error {status}"))
+                        .with_status(status_code)
+                        .with_attempts(attempts)
+                        .with_body(&body_raw);
+                    if matches!(status_code, 429 | 529) {
+                        if let Some(delay) = retry_after {
+                            error = error.with_retry_after(delay);
+                        }
+                    }
+                    return Err(PulseHiveError::llm_transport(error));
+                }
+                // An integer-seconds Retry-After wins over backoff on
+                // 429/529, capped at the same ceiling as the backoff so a
+                // hostile header cannot stall the call for hours; everything
+                // else uses this crate's backoff shape.
+                let delay = honored_retry_delay(retry_after, status_code, attempts);
+                self.sleep_cancelled(delay, config, attempts).await?;
+                continue;
+            }
+
+            if status.is_success() {
+                let parsed: MessagesResponse = serde_json::from_str(&body_raw).map_err(|e| {
+                    PulseHiveError::llm_transport(
+                        LlmError::new(
+                            LlmErrorKind::Parse,
+                            format!("failed to parse response: {e}"),
+                        )
+                        .with_status(status_code)
+                        .with_attempts(attempts)
+                        .with_body(&body_raw),
+                    )
+                })?;
+                return match types::convert_response(parsed) {
+                    Ok(response) => Ok(response),
+                    Err(PulseHiveError::LlmTransport(mut error)) => {
+                        error.attempts = attempts;
+                        Err(PulseHiveError::LlmTransport(error))
+                    }
+                    Err(other) => Err(other),
+                };
+            }
+
+            // Non-retryable failure status: other 5xx stays ServerError,
+            // anything else is a ClientError carrying the Anthropic error
+            // envelope's message when the body parses as one. A body that
+            // does not parse as an envelope keeps the displayed message
+            // generic (status only): the verbatim body can carry prompt or
+            // credential content, and Display feeds logs and persisted
+            // error outcomes — the raw text lives only in the structured
+            // `body` field.
+            let kind = if (500..600).contains(&status_code) {
+                LlmErrorKind::ServerError
+            } else {
+                LlmErrorKind::ClientError
+            };
+            let message = if kind == LlmErrorKind::ClientError {
+                serde_json::from_str::<types::AnthropicError>(&body_raw)
+                    .map(|envelope| envelope.error.message)
+                    .unwrap_or_else(|_| format!("Anthropic API error {status}"))
+            } else {
+                format!("Anthropic API error {status}")
+            };
+            return Err(PulseHiveError::llm_transport(
+                LlmError::new(kind, message)
+                    .with_status(status_code)
+                    .with_attempts(attempts)
+                    .with_body(&body_raw),
+            ));
+        }
+    }
+
+    /// Race a future against the call's cancellation token, if any. Dropping
+    /// the future on cancellation aborts the in-flight request. The race is
+    /// `biased` with cancellation polled first, matching the OpenAI
+    /// provider's copies: a completed result is never nondeterministically
+    /// discarded as `Cancelled`.
+    async fn race_cancel<F: Future>(
+        &self,
+        future: F,
+        config: &LlmConfig,
+        attempts: u32,
+    ) -> Result<F::Output> {
+        let cancel = config.cancel.as_ref().map(|token| token.cancelled());
+        match cancel {
+            Some(cancelled) => tokio::select! {
+                biased;
+                _ = cancelled => Err(Self::cancelled_error(attempts)),
+                output = future => Ok(output),
+            },
+            None => Ok(future.await),
+        }
+    }
+
+    /// A backoff sleep raced against cancellation.
+    async fn sleep_cancelled(
+        &self,
+        delay: Duration,
+        config: &LlmConfig,
+        attempts: u32,
+    ) -> Result<()> {
+        self.race_cancel(tokio::time::sleep(delay), config, attempts)
+            .await
+            .map(|_| ())
+    }
+
+    /// The typed cancellation error, carrying the sends made so far.
+    fn cancelled_error(attempts: u32) -> PulseHiveError {
+        PulseHiveError::llm_transport(
+            LlmError::new(
+                LlmErrorKind::Cancelled,
+                "call cancelled by the caller's token",
+            )
+            .with_attempts(attempts),
+        )
+    }
+
+    /// The typed, never-retried timeout error. The warn log always names the
+    /// timeout, never "connection error" — used by both the send phase and
+    /// the body-read phase.
+    fn timeout_error(error: &reqwest::Error, attempts: u32) -> PulseHiveError {
+        tracing::warn!("anthropic request timed out after {attempts} attempt(s); not retrying");
+        PulseHiveError::llm_transport(
+            LlmError::new(LlmErrorKind::Timeout, format!("request timed out: {error}"))
+                .with_attempts(attempts),
+        )
+    }
+
+    /// The typed Connect error returned once the attempt budget is spent —
+    /// used by the send phase and by a failed body read on a non-success
+    /// status.
+    fn connect_error(error: &reqwest::Error, attempts: u32) -> PulseHiveError {
+        PulseHiveError::llm_transport(
+            LlmError::new(LlmErrorKind::Connect, format!("transport failure: {error}"))
+                .with_attempts(attempts),
+        )
+    }
+}
+
+/// This crate's own backoff shape, unchanged from 2.0.x: exponential
+/// `1 << n` seconds capped at 16s, where `n` counts failed attempts so far.
+fn backoff_delay(failed_attempts: u32) -> Duration {
+    Duration::from_secs(1u64 << failed_attempts.min(4))
+}
+
+/// The backoff ceiling: an honored `Retry-After` never sleeps longer than
+/// this, so a hostile or misconfigured header cannot stall the call for hours.
+const BACKOFF_CEILING: Duration = Duration::from_secs(16);
+
+/// The delay honored before the next retry: a 429/529 `Retry-After` capped at
+/// the backoff ceiling, else this crate's backoff shape.
+fn honored_retry_delay(retry_after: Option<Duration>, status_code: u16, attempts: u32) -> Duration {
+    match retry_after {
+        Some(delay) if matches!(status_code, 429 | 529) => delay.min(BACKOFF_CEILING),
+        _ => backoff_delay(attempts),
+    }
+}
+
+/// Parse an integer-seconds `Retry-After` header, when present and integral.
+fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
+    let raw = headers.get("retry-after")?.to_str().ok()?;
+    let secs: u64 = raw.trim().parse().ok()?;
+    Some(Duration::from_secs(secs))
+}
+
+/// A future that latches whether it has been polled, so a cancellation
+/// racing it can distinguish "never started" from "in flight": `attempts`
+/// counts requests actually sent, and a cancellation observed before the
+/// send future's first poll never sent anything.
+struct MarkStarted<F> {
+    future: Pin<Box<F>>,
+    started: Arc<AtomicBool>,
+}
+
+impl<F: Future> Future for MarkStarted<F> {
+    type Output = F::Output;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<F::Output> {
+        let this = self.get_mut();
+        this.started.store(true, Ordering::Relaxed);
+        this.future.as_mut().poll(cx)
     }
 }
 
@@ -74,55 +442,7 @@ impl LlmProvider for AnthropicProvider {
         config: &LlmConfig,
     ) -> Result<LlmResponse> {
         let request_body = self.build_request(&messages, &tools, config, false);
-
-        let mut last_error = None;
-        for attempt in 0..=self.config.max_retries {
-            if attempt > 0 {
-                let delay = Duration::from_secs(1 << attempt.min(4));
-                tokio::time::sleep(delay).await;
-            }
-
-            let response = self
-                .client
-                .post(self.config.messages_url())
-                .header("x-api-key", &self.config.api_key)
-                .header("anthropic-version", &self.config.anthropic_version)
-                .header("content-type", "application/json")
-                .json(&request_body)
-                .send()
-                .await
-                .map_err(|e| PulseHiveError::llm(format!("HTTP request failed: {e}")))?;
-
-            let status = response.status();
-
-            // Retry on rate limit (429) or overloaded (529)
-            if status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.as_u16() == 529 {
-                last_error = Some(PulseHiveError::llm(format!(
-                    "Anthropic API rate limited ({}), attempt {}/{}",
-                    status,
-                    attempt + 1,
-                    self.config.max_retries + 1
-                )));
-                continue;
-            }
-
-            if !status.is_success() {
-                let body = response.text().await.unwrap_or_default();
-                return Err(PulseHiveError::llm(format!(
-                    "Anthropic API error {}: {}",
-                    status, body
-                )));
-            }
-
-            let body = response
-                .json::<MessagesResponse>()
-                .await
-                .map_err(|e| PulseHiveError::llm(format!("Failed to parse response: {e}")))?;
-
-            return Ok(types::convert_response(body));
-        }
-
-        Err(last_error.unwrap_or_else(|| PulseHiveError::llm("Max retries exceeded")))
+        self.send_request(&request_body, config).await
     }
 
     async fn chat_stream(
@@ -191,14 +511,89 @@ mod tests {
     }
 
     #[test]
+    fn test_build_request_omits_tool_choice_without_tools() {
+        let provider = AnthropicProvider::new("sk-test");
+        let config = LlmConfig::new("anthropic", "claude-sonnet-4-6")
+            .with_tool_choice(pulsehive_core::llm::ToolChoice::Required);
+
+        // No tools: the Messages API would reject the request, so the key is
+        // omitted even though the caller set a choice.
+        let request = provider.build_request(&[Message::user("hi")], &[], &config, false);
+        assert!(request.tool_choice.is_none());
+
+        // One tool: the choice goes out.
+        let tools = vec![ToolDefinition {
+            name: "search".into(),
+            description: "Search the web".into(),
+            parameters: serde_json::json!({"type": "object"}),
+        }];
+        let request = provider.build_request(&[Message::user("hi")], &tools, &config, false);
+        assert!(matches!(
+            request.tool_choice,
+            Some(crate::types::AnthropicToolChoice::Required)
+        ));
+    }
+
+    #[test]
+    fn test_honored_retry_delay_capped_at_backoff_ceiling() {
+        // A hostile Retry-After never sleeps past the backoff ceiling...
+        assert_eq!(
+            honored_retry_delay(Some(Duration::from_secs(100_000)), 429, 1),
+            BACKOFF_CEILING
+        );
+        assert_eq!(
+            honored_retry_delay(Some(Duration::from_secs(100_000)), 529, 1),
+            BACKOFF_CEILING
+        );
+        // 500/502/503 use the backoff shape even when the header is present...
+        assert_eq!(
+            honored_retry_delay(Some(Duration::from_secs(0)), 503, 1),
+            backoff_delay(1)
+        );
+        // ...and a short honored value passes through verbatim.
+        assert_eq!(
+            honored_retry_delay(Some(Duration::from_secs(2)), 429, 1),
+            Duration::from_secs(2)
+        );
+        assert_eq!(honored_retry_delay(None, 429, 1), backoff_delay(1));
+    }
+
+    #[test]
     fn test_provider_is_send_sync() {
         fn _assert_send_sync<T: Send + Sync>() {}
         _assert_send_sync::<AnthropicProvider>();
     }
 
     #[tokio::test]
+    async fn test_mark_started_latches_on_first_poll() {
+        let started = Arc::new(AtomicBool::new(false));
+        let mut future = std::pin::pin!(MarkStarted {
+            future: Box::pin(std::future::pending::<()>()),
+            started: Arc::clone(&started),
+        });
+        assert!(
+            !started.load(Ordering::Relaxed),
+            "not started before the first poll"
+        );
+
+        // One poll of the wrapper polls the inner future; a pending result
+        // still counts as started.
+        let first =
+            std::future::poll_fn(|cx| std::task::Poll::Ready(future.as_mut().poll(cx))).await;
+        assert!(first.is_pending());
+        assert!(
+            started.load(Ordering::Relaxed),
+            "started once the future has been polled"
+        );
+    }
+
+    #[tokio::test]
     async fn test_chat_with_invalid_url_returns_error() {
-        let config = AnthropicConfig::new("sk-test").with_base_url("http://localhost:1/invalid");
+        let mut config =
+            AnthropicConfig::new("sk-test").with_base_url("http://localhost:1/invalid");
+        // Connection failures now retry within the attempt budget; keep this
+        // unit test fast by spending none.
+        config.max_retries = 0;
         let provider = AnthropicProvider::with_config(config);
 
         let result = provider
@@ -209,6 +604,14 @@ mod tests {
             )
             .await;
 
-        assert!(result.is_err());
+        // Transport failures are typed LlmTransport errors (r1.s1.w3): a
+        // refused connection classifies as Connect after one attempt.
+        match result {
+            Err(PulseHiveError::LlmTransport(err)) => {
+                assert_eq!(err.kind, LlmErrorKind::Connect);
+                assert_eq!(err.attempts, 1);
+            }
+            other => panic!("expected typed LlmTransport error, got: {other:?}"),
+        }
     }
 }

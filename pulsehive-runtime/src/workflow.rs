@@ -317,11 +317,7 @@ mod tests {
         }
 
         fn text_response(content: &str) -> LlmResponse {
-            LlmResponse {
-                content: Some(content.into()),
-                tool_calls: vec![],
-                usage: TokenUsage::default(),
-            }
+            LlmResponse::text(content)
         }
     }
 

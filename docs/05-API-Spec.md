@@ -539,18 +539,33 @@ Model selection and inference parameters:
 
 ```rust
 pub struct LlmConfig {
+    pub provider: String,
     pub model: String,
     pub temperature: f32,
     pub max_tokens: u32,
+    pub timeout_secs: Option<u64>,           // Per-call timeout override
+    pub max_retries: Option<u32>,            // Per-call retry-budget override
+    pub reasoning_effort: Option<ReasoningEffort>,
+    pub tool_choice: Option<ToolChoice>,
+    pub cancel: Option<CancellationToken>,   // Runtime state, never serialized
 }
 
 impl LlmConfig {
     /// Create a config with provider name and model identifier.
     pub fn new(provider: &str, model: &str) -> Self;
+    pub fn with_temperature(self, temperature: f32) -> Self;
+    pub fn with_max_tokens(self, max_tokens: u32) -> Self;
+    pub fn with_timeout_secs(self, timeout_secs: u64) -> Self;
+    pub fn with_max_retries(self, max_retries: u32) -> Self;
+    pub fn with_reasoning_effort(self, reasoning_effort: ReasoningEffort) -> Self;
+    pub fn with_tool_choice(self, tool_choice: ToolChoice) -> Self;
+    pub fn with_cancel(self, cancel: CancellationToken) -> Self;
 }
 ```
 
 The `provider` field matches the name passed to `HiveMindBuilder::llm_provider()`.
+
+`timeout_secs` and `max_retries` override the provider's configured values for that single call (`Some(0)` retries means exactly one attempt). `cancel` carries a `tokio_util::sync::CancellationToken`; cancelling it aborts the in-flight request and the call returns a `LlmErrorKind::Cancelled` transport error. `reasoning_effort` (`Minimal`/`Low`/`Medium`/`High`) and `tool_choice` (`Auto`/`None`/`Required`/`Function { name }`) reach the wire only when set.
 
 ### 3.7 Task
 
@@ -724,8 +739,11 @@ pub enum PulseHiveError {
     /// Storage layer errors (from PulseDB).
     Substrate(pulsedb::PulseDBError),
 
-    /// LLM provider errors (network, auth, rate limits).
-    Llm { provider: String, message: String },
+    /// LLM request-build and serialization failures.
+    Llm(String),
+
+    /// Structured transport failure from an LLM provider.
+    LlmTransport(LlmError),
 
     /// Tool execution errors.
     Tool(String),
@@ -737,12 +755,39 @@ pub enum PulseHiveError {
     Config(String),
 
     /// Agent execution errors.
-    Agent { agent_id: AgentId, message: String },
+    Agent(String),
 
-    /// Approval was denied.
-    ApprovalDenied { tool_name: String, reason: String },
+    /// Embedding provider errors.
+    Embedding(String),
 }
 ```
+
+`LlmTransport` carries a structured [`LlmError`] instead of a message string, so callers branch on a kind rather than matching text:
+
+```rust
+pub struct LlmError {
+    pub kind: LlmErrorKind,
+    pub message: String,
+    pub status: Option<u16>,          // HTTP status, when the failure carried one
+    pub attempts: u32,                // Requests actually sent (0 only for a pre-send cancellation)
+    pub body: Option<String>,         // Response body, verbatim; the consumer redacts
+    pub finish_reason: Option<String>,// Set for MalformedToolCall
+    pub retry_after: Option<Duration>,
+}
+```
+
+| `LlmErrorKind` | Meaning |
+|---|---|
+| `Timeout` | The call exceeded its deadline |
+| `Connect` | The connection could not be established |
+| `RateLimited` | The provider rate-limited the call |
+| `ServerError` | The provider returned a 5xx |
+| `ClientError` | The provider returned a 4xx that is not a rate limit |
+| `Parse` | The response body could not be parsed |
+| `MalformedToolCall` | The model emitted a tool call that could not be read as one |
+| `Cancelled` | The caller cancelled the in-flight call |
+
+Whether a kind is worth retrying is provider policy, not part of this contract.
 
 ### 4.5 AgentOutcome
 
@@ -889,6 +934,59 @@ impl AnthropicProvider {
 // Implements LlmProvider
 ```
 
+**Transport hardening (2.1.0).** Every transport failure from `chat` is a
+`PulseHiveError::LlmTransport` carrying an `LlmError`; a request that cannot
+be built at all (malformed `base_url`, an `api_key` that cannot be a header
+value) is the request-build exception — `PulseHiveError::Llm(String)`, failing
+immediately without retrying or sending anything:
+
+| Situation | `kind` | Retried? | Carries |
+|---|---|---|---|
+| Request deadline exceeded (send or body read) | `Timeout` | never — fails after one attempt | `attempts: 1` |
+| Request could not be built (malformed `base_url`, unheaderable `api_key`) | — (`PulseHiveError::Llm(String)`) | never — fails before anything is sent | — |
+| Other transport failure (connection refused, reset, …) | `Connect` | yes, within the attempt budget | — |
+| HTTP 429 | `RateLimited` | yes; integer-seconds `Retry-After` wins over backoff, capped at the 16s backoff ceiling | `status: 429`, raw `body`, `retry_after` (the raw header value) |
+| HTTP 500 / 502 / 503 | `ServerError` | yes, same backoff — `Retry-After` is not honoured | `status`, raw `body` |
+| HTTP 529 | `ServerError` | yes; `Retry-After` honoured like 429 | `status`, raw `body`, `retry_after` |
+| Any other non-5xx status (4xx, or a terminal 3xx) | `ClientError` | never | `status`, raw `body` (structured only — the envelope's `error.message` renders in the displayed message when it parses; an unparseable body does not) |
+| Other 5xx | `ServerError` | never | `status`, raw `body` |
+| Success status, unparseable body | `Parse` | never | `status: 200`, raw `body` |
+| `tool_use` block whose `input` is not a JSON object | `MalformedToolCall` | never | `status: 200`, the input's JSON text as `body`, the response's `stop_reason` |
+| Cancelled `LlmConfig::cancel` token (before or during a call) | `Cancelled` | never | `attempts` = sends made so far |
+
+Per-call overrides and cancellation: `LlmConfig::timeout_secs` and
+`LlmConfig::max_retries` override `AnthropicConfig`'s `timeout_secs` /
+`max_retries` for that one call (`max_attempts = max_retries + 1`), and a
+cancelled `LlmConfig::cancel` token aborts the in-flight request.
+
+Wire mapping, request side — `LlmConfig::tool_choice` maps to Anthropic's
+exact shapes and is omitted entirely when unset or when the request carries
+no tools (the Messages API rejects `tool_choice` without `tools`):
+
+| `ToolChoice` | Anthropic wire object |
+|---|---|
+| `Auto` | `{"type":"auto"}` |
+| `Required` | `{"type":"any"}` |
+| `Function { name }` | `{"type":"tool","name":"<name>"}` |
+| `None` | `{"type":"none"}` |
+
+`LlmConfig::reasoning_effort` is **accepted and ignored** by this provider:
+it is never sent on the wire — neither a `reasoning_effort` nor a `thinking`
+parameter — and the call succeeds unchanged. Mapping it to Anthropic extended
+thinking is a recorded feature-map entry, not provider parity.
+
+Wire mapping, response side — `stop_reason` is copied **verbatim** into
+`LlmResponse::finish_reason` (`end_turn`, `max_tokens`, `stop_sequence`,
+`tool_use`, …; no normalization), and `reasoning` is always `None` because
+this provider never requests `thinking` blocks. `chat_stream` is not
+supported by this provider today (every call returns a not-supported error).
+
+`AnthropicProvider::config()` returns an `AnthropicConfigView`: the transport
+settings (endpoint, model, timeout, retry budget) with no path to the API
+key. Neither the view nor `AnthropicConfig` renders the key in `Debug`, and
+`base_url` renders with any URL userinfo (`user:pass@`) stripped — the
+provider keeps dialing the original URL.
+
 ### 6.2 pulsehive-openai
 
 ```rust
@@ -898,7 +996,8 @@ pub struct OpenAIConfig {
     pub api_key: String,
     pub base_url: String,       // Default: "https://api.openai.com/v1"
     pub model: String,
-    pub organization: Option<String>,
+    pub timeout_secs: u64,      // Default: 60
+    pub max_retries: u32,       // Default: 3
 }
 
 impl OpenAICompatibleProvider {
@@ -917,7 +1016,8 @@ let openai = OpenAICompatibleProvider::new(OpenAIConfig {
     api_key: env::var("OPENAI_API_KEY")?,
     base_url: "https://api.openai.com/v1".into(),
     model: "gpt-4o".into(),
-    organization: None,
+    timeout_secs: 60,
+    max_retries: 3,
 });
 
 // GLM-5
@@ -925,7 +1025,8 @@ let glm = OpenAICompatibleProvider::new(OpenAIConfig {
     api_key: env::var("GLM_API_KEY")?,
     base_url: "https://open.bigmodel.cn/api/paas/v4".into(),
     model: "glm-5".into(),
-    organization: None,
+    timeout_secs: 60,
+    max_retries: 3,
 });
 
 // Ollama (local)
@@ -933,9 +1034,36 @@ let ollama = OpenAICompatibleProvider::new(OpenAIConfig {
     api_key: "not-needed".into(),
     base_url: "http://localhost:11434/v1".into(),
     model: "llama3.1".into(),
-    organization: None,
+    timeout_secs: 120,
+    max_retries: 3,
 });
 ```
+
+**Transport contract (2.1.0).** Every transport failure from `chat` and `chat_stream` is a typed `PulseHiveError::LlmTransport(LlmError)`; `PulseHiveError::Llm(String)` remains for request-build failures — serialization, or a request that cannot be built at all (malformed `base_url`), which fails immediately without retrying or sending anything. Classification:
+
+| Situation | `LlmErrorKind` | Retried? | Carries |
+|---|---|---|---|
+| Request exceeded its deadline (send or body read) | `Timeout` | **never** — one attempt (#46) | `attempts: 1` |
+| Connection-level error (connect refused, reset) | `Connect` | yes, exponential backoff (1s→2s→4s, cap 8s) | — |
+| Request could not be built (malformed `base_url`) | — (`PulseHiveError::Llm(String)`) | never — fails before anything is sent | — |
+| HTTP 429 / 529 | `RateLimited` / `ServerError` | yes; waits `Retry-After` when present (capped at the 8s backoff ceiling), else backoff | `status`, verbatim `body`, `retry_after` (the raw header value) |
+| HTTP 500 / 502 / 503 | `ServerError` | yes, same backoff — `Retry-After` is not honored | `status`, verbatim `body` |
+| Any other 4xx, or a terminal 3xx (a 304 / redirect without usable `Location`) | `ClientError` | never | `status`, verbatim `body` |
+| Any other 5xx | `ServerError` | never | `status`, verbatim `body` |
+| 2xx whose body fails to read or parse | `Parse` | never | `status`, verbatim `body` |
+| Mid-stream SSE body-read failure (`chat_stream`) | `Timeout` / `Parse` | never — the stream ends after one typed error | `status: 200`, `attempts` |
+| Tool-call `arguments` not a JSON object (an empty/whitespace string is a zero-argument `{}` call — unless `finish_reason` is `"length"`, where it was truncated and is malformed) | `MalformedToolCall` | never | raw arguments as `body`, `finish_reason` |
+| `LlmConfig::cancel` token fires | `Cancelled` | never | `attempts` (0 if before the first send) |
+
+`attempts` counts the requests actually sent, the failed one included.
+
+**Per-call overrides.** `LlmConfig::timeout_secs` replaces the client-level deadline for that request only, and `LlmConfig::max_retries` replaces the provider's configured budget for that call (`Some(0)` = exactly one attempt) — both on a single provider instance. A cancelled `LlmConfig::cancel` token aborts the in-flight request, the body read (including reads of a `chat_stream` body already in progress) and every backoff sleep.
+
+**Wire fields.** `reasoning_effort` is sent only when set; `tool_choice` is sent only when set **and** the request carries tools (the APIs reject `tool_choice` without `tools`), mapping to `"auto"` / `"none"` / `"required"` / `{"type":"function","function":{"name":…}}`. With both absent the request body is byte-identical to 2.0.2. On the response, `finish_reason` and `reasoning` (also read from the `reasoning_content` alias several compatible providers use) are surfaced on `LlmResponse`; a non-string `reasoning`/`reasoning_content` value is ignored as `None` rather than failing the response. A tool call whose `arguments` string does not parse as a JSON object is a `MalformedToolCall` error, never a call with `{}` arguments; a legitimate `"{}"` — and the `""` zero-argument spelling used by Ollama, LM Studio and vLLM — still yields `{}`, except under `finish_reason: "length"` where an empty string means the arguments were cut off before any JSON was emitted.
+
+**Streaming limitation.** `chat_stream` carries neither `reasoning` nor `finish_reason` — only `chat` surfaces them. The stream ends at the `Done` chunk: polling past it yields end-of-stream, so a cancellation after `Done` produces no error.
+
+**Config accessor.** `OpenAICompatibleProvider::config()` returns an `OpenAIConfigView`: the transport settings (endpoint, model, timeout, retry budget) with no path to the API key. Neither the view nor `OpenAIConfig` renders the key in `Debug`, and `base_url` renders with any URL userinfo (`user:pass@`) stripped — the provider keeps dialing the original URL.
 
 ---
 
@@ -1085,9 +1213,24 @@ match hive.deploy(agents, tasks).await {
         // Database error -- file permissions, corruption
         eprintln!("Storage error: {}", db_err);
     }
-    Err(PulseHiveError::Llm { provider, message }) => {
-        // LLM API error -- network, auth, rate limit
-        eprintln!("LLM error ({}): {}", provider, message);
+    Err(PulseHiveError::LlmTransport(err)) => {
+        // LLM transport error -- network, auth, rate limit; branch on the
+        // kind instead of matching on message text
+        match err.kind {
+            pulsehive_core::llm::LlmErrorKind::RateLimited => {
+                eprintln!("Rate limited; retry after {:?}", err.retry_after);
+            }
+            pulsehive_core::llm::LlmErrorKind::Timeout
+            | pulsehive_core::llm::LlmErrorKind::Connect => {
+                eprintln!("Transport failure: {}", err);
+            }
+            _ => eprintln!("LLM error: {}", err),
+        }
+    }
+    Err(PulseHiveError::Llm(msg)) => {
+        // Request-build or serialization failure -- a bug in the caller's
+        // message construction, not a transport issue
+        eprintln!("LLM request error: {}", msg);
     }
     Err(e) => {
         eprintln!("Unexpected error: {}", e);

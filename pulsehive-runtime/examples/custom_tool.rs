@@ -189,24 +189,20 @@ impl LlmProvider for ToolCallingLlm {
     ) -> pulsehive_core::error::Result<LlmResponse> {
         // First call: use the calculator tool (if available)
         if !self.called.swap(true, std::sync::atomic::Ordering::Relaxed) && !tools.is_empty() {
-            Ok(LlmResponse {
-                content: None,
-                tool_calls: vec![ToolCall {
+            Ok(LlmResponse::new(
+                None,
+                vec![ToolCall {
                     id: "call_1".into(),
                     name: "calculator".into(),
                     arguments: serde_json::json!({"operation": "multiply", "a": 6, "b": 7}),
                 }],
-                usage: TokenUsage::default(),
-            })
+                TokenUsage::default(),
+            ))
         } else {
             // Second call: respond with the final answer
-            Ok(LlmResponse {
-                content: Some(
-                    "The answer is 42! I used the calculator tool to compute 6 × 7.".into(),
-                ),
-                tool_calls: vec![],
-                usage: TokenUsage::default(),
-            })
+            Ok(LlmResponse::text(
+                "The answer is 42! I used the calculator tool to compute 6 × 7.",
+            ))
         }
     }
 

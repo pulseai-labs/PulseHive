@@ -1,7 +1,11 @@
 //! OpenAI-compatible LLM provider implementation.
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -10,10 +14,14 @@ use futures_core::Stream;
 use serde_json::Value;
 
 use pulsehive_core::error::{PulseHiveError, Result};
-use pulsehive_core::llm::{LlmChunk, LlmConfig, LlmProvider, LlmResponse, Message, ToolDefinition};
+use pulsehive_core::llm::{
+    LlmChunk, LlmConfig, LlmError, LlmErrorKind, LlmProvider, LlmResponse, Message, ToolDefinition,
+};
 
-use crate::config::OpenAIConfig;
-use crate::types::{ChatCompletionRequest, ChatCompletionResponse, OpenAITool, StreamChunk};
+use crate::config::{OpenAIConfig, OpenAIConfigView};
+use crate::types::{
+    ChatCompletionRequest, ChatCompletionResponse, OpenAITool, OpenAIToolChoice, StreamChunk,
+};
 
 /// LLM provider for any OpenAI-compatible API.
 ///
@@ -104,18 +112,85 @@ impl OpenAICompatibleProvider {
             temperature: config.temperature,
             max_tokens: config.max_tokens,
             stream,
+            // New wire fields go out only when the caller set them, so an
+            // unset config sends a body byte-identical to 2.0.2 (#47 R1, R6).
+            reasoning_effort: config.reasoning_effort,
+            // tool_choice without tools is a 400 on every OpenAI-compatible
+            // endpoint, so it is omitted whenever the request carries no
+            // tools, caller intent or not.
+            tool_choice: if tools.is_empty() {
+                None
+            } else {
+                config.tool_choice.as_ref().map(OpenAIToolChoice::from)
+            },
         })
     }
 
-    /// Send a request with automatic retry for transient errors.
+    /// The provider's configuration (E7): a non-secret view of the defaults
+    /// for endpoint, model, timeout and retry budget as constructed. There is
+    /// no path from the view to the API key, and neither the view nor
+    /// [`OpenAIConfig`] renders the key in its `Debug` output.
+    pub fn config(&self) -> OpenAIConfigView {
+        self.config.view()
+    }
+
+    /// Send a request under the provider's transport policy.
     ///
-    /// Retries on: 429 (rate limit), 500, 502, 503, 529 (server overloaded).
-    /// Fails immediately on: 400, 401, 403, 404 (client errors).
-    /// Uses exponential backoff: 1s → 2s → 4s, respects Retry-After header on 429.
-    async fn send_request(&self, request: &ChatCompletionRequest) -> Result<reqwest::Response> {
+    /// Every failure is a typed [`LlmError`] inside
+    /// [`PulseHiveError::LlmTransport`] — never a bare string, except a
+    /// builder error (malformed `base_url`), which never reaches the
+    /// network, fails immediately without retrying, and surfaces as the
+    /// request-build failure it is via [`PulseHiveError::llm`]. The two
+    /// failure branches are distinguishable by kind (#46's second complaint):
+    ///
+    /// * **Status failures** — the provider answered a non-success status.
+    ///   `429`, `500`, `502`, `503` and `529` are retried up to the attempt
+    ///   budget. `429` and `529` — the overload statuses — wait for an
+    ///   integer-seconds `Retry-After` when present, capped at the same 8s
+    ///   ceiling as the exponential backoff (1s → 2s → 4s → 8s) that `500` /
+    ///   `502` / `503` and a header-less `429`/`529` always use. Every other
+    ///   4xx is [`LlmErrorKind::ClientError`] and every other 5xx
+    ///   [`LlmErrorKind::ServerError`], both failing immediately with the raw
+    ///   body attached verbatim.
+    /// * **Transport failures** — the request never completed. A deadline
+    ///   expiry ([`LlmErrorKind::Timeout`]) is **never retried**: the request
+    ///   timed out and re-sending it would bill the consumer for work already
+    ///   spent (#46). A connection-level error ([`LlmErrorKind::Connect`]) is
+    ///   retried with the same backoff. A cancelled
+    ///   [`LlmConfig::cancel`] token ([`LlmErrorKind::Cancelled`]) aborts the
+    ///   in-flight request, the body read and every backoff sleep, and is
+    ///   never retried.
+    ///
+    /// Per-call `LlmConfig` overrides: `max_retries` replaces this provider's
+    /// configured budget for this one call (`Some(0)` means exactly one
+    /// attempt), and `timeout_secs` replaces the client-level deadline for
+    /// this request only.
+    ///
+    /// `attempts` on every error counts the requests actually sent, the failed
+    /// one included; it is `0` only for a cancellation observed before the
+    /// first send. On success the count travels with the response, so errors
+    /// built downstream (parse, malformed tool call) carry it too.
+    async fn send_request(
+        &self,
+        request: &ChatCompletionRequest,
+        call: &LlmConfig,
+    ) -> Result<(reqwest::Response, u32)> {
         let url = self.config.chat_completions_url();
-        let max_attempts = self.config.max_retries + 1;
-        let mut last_err = PulseHiveError::llm("No attempts made");
+        // Saturating: `LlmConfig` is an unvalidated Deserialize, so a
+        // `max_retries` of `u32::MAX` must still yield at least one attempt
+        // instead of overflowing (debug) or wrapping to zero (release).
+        let max_attempts = call
+            .max_retries
+            .unwrap_or(self.config.max_retries)
+            .saturating_add(1);
+        let cancel = call.cancel.as_ref();
+
+        // A token cancelled before the call never sends anything.
+        if let Some(token) = cancel {
+            if token.is_cancelled() {
+                return Err(cancelled_error(0));
+            }
+        }
 
         for attempt in 1..=max_attempts {
             tracing::debug!(
@@ -126,58 +201,227 @@ impl OpenAICompatibleProvider {
                 "Sending chat request"
             );
 
-            let response = self.client.post(&url).json(request).send().await;
+            let mut builder = self.client.post(&url).json(request);
+            if let Some(secs) = call.timeout_secs {
+                // Per-request deadline: replaces the client-level timeout for
+                // this call only (4.2).
+                builder = builder.timeout(Duration::from_secs(secs));
+            }
 
-            match response {
-                Ok(resp) if resp.status().is_success() => {
-                    return Ok(resp);
-                }
-                Ok(resp) => {
-                    let status = resp.status();
-                    let retry_after = parse_retry_after(&resp);
-                    let body = resp
-                        .text()
-                        .await
-                        .unwrap_or_else(|_| "<failed to read body>".into());
-
-                    let err_msg = format!("OpenAI API error (HTTP {status}): {body}");
-
-                    if is_retryable_status(status) && attempt < max_attempts {
-                        let delay = retry_after.unwrap_or_else(|| retry_delay(attempt));
-                        tracing::warn!(
-                            attempt = attempt,
-                            status = %status,
-                            delay_ms = delay.as_millis(),
-                            "Retrying after transient error"
-                        );
-                        tokio::time::sleep(delay).await;
-                        last_err = PulseHiveError::llm(err_msg);
-                        continue;
+            // The send future is latched as started so a cancellation that
+            // wins before it was ever polled reports the previous attempt
+            // count: attempts counts requests actually sent.
+            let started = Arc::new(AtomicBool::new(false));
+            let send = MarkStarted {
+                future: Box::pin(builder.send()),
+                started: Arc::clone(&started),
+            };
+            let response = match cancel {
+                Some(token) => tokio::select! {
+                    // Dropping the send future is what aborts the connection.
+                    biased;
+                    _ = token.cancelled() => {
+                        let sent = if started.load(Ordering::Relaxed) {
+                            attempt
+                        } else {
+                            attempt - 1
+                        };
+                        return Err(cancelled_error(sent));
                     }
+                    response = send => response,
+                },
+                None => send.await,
+            };
 
-                    return Err(PulseHiveError::llm(err_msg));
+            let response = match response {
+                Ok(resp) => resp,
+                // A timed-out request fails once and is never re-sent (E5).
+                Err(e) if e.is_timeout() => {
+                    tracing::warn!(
+                        attempt = attempt,
+                        "request timed out after {attempt} attempt(s); not retrying"
+                    );
+                    return Err(PulseHiveError::llm_transport(
+                        LlmError::new(LlmErrorKind::Timeout, e.to_string()).with_attempts(attempt),
+                    ));
+                }
+                // A builder error (malformed base_url) never reaches the
+                // network: a request-build failure, surfaced immediately —
+                // not retried through the budget and not classified as
+                // Connect.
+                Err(e) if e.is_builder() => {
+                    return Err(PulseHiveError::llm(format!("failed to build request: {e}")));
                 }
                 Err(e) => {
-                    let err_msg = format!("HTTP request failed: {e}");
-
                     if attempt < max_attempts {
                         let delay = retry_delay(attempt);
                         tracing::warn!(
                             attempt = attempt,
-                            delay_ms = delay.as_millis(),
-                            "Retrying after connection error: {e}"
+                            kind = "connect",
+                            delay_ms = delay.as_millis() as u64,
+                            error = %e,
+                            "Retrying after connection error"
                         );
-                        tokio::time::sleep(delay).await;
-                        last_err = PulseHiveError::llm(err_msg);
+                        if let Some(token) = cancel {
+                            tokio::select! {
+                                biased;
+                                _ = token.cancelled() => return Err(cancelled_error(attempt)),
+                                _ = tokio::time::sleep(delay) => {}
+                            }
+                        } else {
+                            tokio::time::sleep(delay).await;
+                        }
                         continue;
                     }
-
-                    return Err(PulseHiveError::llm(err_msg));
+                    return Err(PulseHiveError::llm_transport(
+                        LlmError::new(LlmErrorKind::Connect, e.to_string()).with_attempts(attempt),
+                    ));
                 }
+            };
+
+            if response.status().is_success() {
+                return Ok((response, attempt));
             }
+
+            let status = response.status();
+            // Retry-After is honored only on the overload statuses (429/529):
+            // 500/502/503 use the same exponential backoff as any other
+            // retryable failure, and the header is not reported as retry
+            // guidance where it is not honored.
+            let retry_after = parse_retry_after(&response).filter(|_| honors_retry_after(status));
+            let text = response.text();
+            let text = match cancel {
+                Some(token) => tokio::select! {
+                    biased;
+                    _ = token.cancelled() => return Err(cancelled_error(attempt)),
+                    text = text => text,
+                },
+                None => text.await,
+            };
+            // Only a successfully read body proceeds to status classification:
+            // a body-read failure is a transport failure, not a status failure
+            // with a placeholder body.
+            let body = match text {
+                Ok(body) => body,
+                Err(e) if e.is_timeout() => {
+                    tracing::warn!(
+                        attempt = attempt,
+                        "request timed out after {attempt} attempt(s); not retrying"
+                    );
+                    return Err(PulseHiveError::llm_transport(
+                        LlmError::new(LlmErrorKind::Timeout, e.to_string()).with_attempts(attempt),
+                    ));
+                }
+                Err(e) => {
+                    if attempt < max_attempts {
+                        let delay = retry_delay(attempt);
+                        tracing::warn!(
+                            attempt = attempt,
+                            kind = "connect",
+                            delay_ms = delay.as_millis() as u64,
+                            error = %e,
+                            "Retrying after body-read connection error"
+                        );
+                        if let Some(token) = cancel {
+                            tokio::select! {
+                                biased;
+                                _ = token.cancelled() => return Err(cancelled_error(attempt)),
+                                _ = tokio::time::sleep(delay) => {}
+                            }
+                        } else {
+                            tokio::time::sleep(delay).await;
+                        }
+                        continue;
+                    }
+                    return Err(PulseHiveError::llm_transport(
+                        LlmError::new(LlmErrorKind::Connect, e.to_string()).with_attempts(attempt),
+                    ));
+                }
+            };
+
+            let kind = if status.as_u16() == 429 {
+                LlmErrorKind::RateLimited
+            } else if is_retryable_status(status) {
+                LlmErrorKind::ServerError
+            } else if status.is_client_error() {
+                LlmErrorKind::ClientError
+            } else if status.is_server_error() {
+                LlmErrorKind::ServerError
+            } else {
+                // The non-4xx/non-5xx remainder — a terminal 3xx such as a
+                // 304 or a redirect without a usable Location — is a
+                // client-side response problem: ServerError is publicly
+                // defined as a provider 5xx, and callers would apply
+                // server-outage fallback logic to it.
+                LlmErrorKind::ClientError
+            };
+
+            let mut err = LlmError::new(kind, format!("HTTP {status}"))
+                .with_status(status.as_u16())
+                .with_attempts(attempt)
+                .with_body(body);
+            if let Some(delay) = retry_after {
+                // The error carries the server's verbatim guidance; only the
+                // honored sleep below is capped.
+                err = err.with_retry_after(delay);
+            }
+
+            if is_retryable_status(status) && attempt < max_attempts {
+                let delay = honored_retry_delay(retry_after, attempt);
+                tracing::warn!(
+                    attempt = attempt,
+                    status = %status,
+                    delay_ms = delay.as_millis() as u64,
+                    "Retrying after transient error"
+                );
+                if let Some(token) = cancel {
+                    tokio::select! {
+                        biased;
+                        _ = token.cancelled() => return Err(cancelled_error(attempt)),
+                        _ = tokio::time::sleep(delay) => {}
+                    }
+                } else {
+                    tokio::time::sleep(delay).await;
+                }
+                continue;
+            }
+
+            return Err(PulseHiveError::llm_transport(err));
         }
 
-        Err(last_err)
+        // Unreachable in practice: the final iteration always returns. Kept as
+        // a typed error rather than a panic (MASTER-SPEC §9.4).
+        Err(PulseHiveError::llm_transport(
+            LlmError::new(LlmErrorKind::ServerError, "retry budget exhausted")
+                .with_attempts(max_attempts),
+        ))
+    }
+}
+
+/// The typed error for a caller cancellation.
+fn cancelled_error(attempts: u32) -> PulseHiveError {
+    PulseHiveError::llm_transport(
+        LlmError::new(LlmErrorKind::Cancelled, "call cancelled by the caller")
+            .with_attempts(attempts),
+    )
+}
+
+/// A future that latches whether it has been polled, so a cancellation
+/// racing it can distinguish "never started" from "in flight": `attempts`
+/// counts requests actually sent, and a cancellation observed before the
+/// send future's first poll never sent anything.
+struct MarkStarted<F> {
+    future: Pin<Box<F>>,
+    started: Arc<AtomicBool>,
+}
+
+impl<F: Future> Future for MarkStarted<F> {
+    type Output = F::Output;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<F::Output> {
+        let this = self.get_mut();
+        this.started.store(true, Ordering::Relaxed);
+        this.future.as_mut().poll(cx)
     }
 }
 
@@ -190,25 +434,58 @@ impl LlmProvider for OpenAICompatibleProvider {
         config: &LlmConfig,
     ) -> Result<LlmResponse> {
         let request = self.build_request(&messages, &tools, config, false)?;
-        let response = self.send_request(&request).await?;
+        let (response, attempts) = self.send_request(&request, config).await?;
 
-        let body = response
-            .text()
-            .await
-            .map_err(|e| PulseHiveError::llm(format!("Failed to read response body: {e}")))?;
+        let status = response.status();
+        let read = response.text();
+        let read = match config.cancel.as_ref() {
+            Some(token) => tokio::select! {
+                biased;
+                _ = token.cancelled() => return Err(cancelled_error(attempts)),
+                body = read => body,
+            },
+            None => read.await,
+        };
+        let body = match read {
+            Ok(body) => body,
+            // A timeout while reading the body is a Timeout, not a Parse (4.1).
+            Err(e) if e.is_timeout() => {
+                return Err(PulseHiveError::llm_transport(
+                    LlmError::new(LlmErrorKind::Timeout, e.to_string()).with_attempts(attempts),
+                ))
+            }
+            Err(e) => {
+                return Err(PulseHiveError::llm_transport(
+                    LlmError::new(LlmErrorKind::Parse, e.to_string())
+                        .with_status(status.as_u16())
+                        .with_attempts(attempts),
+                ))
+            }
+        };
 
+        // The body is attached verbatim — the consumer decides what to redact.
         let completion: ChatCompletionResponse = serde_json::from_str(&body).map_err(|e| {
-            let excerpt = if body.len() > 200 {
-                format!("{}...", &body[..200])
-            } else {
-                body.clone()
-            };
-            PulseHiveError::llm(format!("Failed to parse response: {e}\nBody: {excerpt}"))
+            PulseHiveError::llm_transport(
+                LlmError::new(LlmErrorKind::Parse, e.to_string())
+                    .with_status(status.as_u16())
+                    .with_attempts(attempts)
+                    .with_body(body.clone()),
+            )
         })?;
 
-        Ok(completion.into_llm_response())
+        completion.into_llm_response(attempts)
     }
 
+    /// Streams a chat completion as SSE chunks.
+    ///
+    /// Limitation (E11, #47 R4): the streaming path carries neither
+    /// `reasoning` nor `finish_reason` — only [`Self::chat`] surfaces them.
+    /// Transport failures before the stream starts surface as the same typed
+    /// [`PulseHiveError::LlmTransport`] errors as `chat`, and so does every
+    /// mid-stream body-read failure (classified like `chat()`'s body read).
+    /// A cancelled [`LlmConfig::cancel`] token aborts the in-flight request,
+    /// every backoff sleep and every read of the streamed body: a server that
+    /// answers `200` and then stalls cannot hold the stream past the token.
     async fn chat_stream(
         &self,
         messages: Vec<Message>,
@@ -216,28 +493,85 @@ impl LlmProvider for OpenAICompatibleProvider {
         config: &LlmConfig,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<LlmChunk>> + Send>>> {
         let request = self.build_request(&messages, &tools, config, true)?;
-        let response = self.send_request(&request).await?;
+        let (response, attempts) = self.send_request(&request, config).await?;
+        let status = response.status();
+        let cancel = config.cancel.clone();
 
-        let stream = response
+        let reads = response
             .bytes_stream()
-            .scan(SseParseState::new(), |state, bytes_result| {
-                let chunks = match bytes_result {
+            .map(move |read| read.map_err(|e| stream_body_error(&e, status, attempts)));
+
+        // A terminating adapter over the raced body reads. The parser state
+        // lives inside the unfold, so termination is decided BEFORE any body
+        // read is polled: once the parser has emitted Done, the next poll
+        // ends the stream outright and a stalled body (or a later
+        // cancellation) can neither delay termination nor fabricate an
+        // error. A read failure yields exactly one typed error — the
+        // underlying body is sticky after an error and would re-report it
+        // on every poll — and a body that ends without a [DONE] marker
+        // still ends the stream cleanly.
+        let stream = futures::stream::unfold(
+            (reads, cancel, SseParseState::new()),
+            move |(mut reads, cancel, mut parser)| async move {
+                if parser.finished {
+                    return None;
+                }
+                let next = match cancel.as_ref() {
+                    Some(token) => tokio::select! {
+                        biased;
+                        _ = token.cancelled() => {
+                            // Terminate exactly like a read failure: one
+                            // error emitted, every subsequent poll None.
+                            parser.finished = true;
+                            Some(Err(cancelled_error(attempts)))
+                        }
+                        read = reads.next() => read,
+                    },
+                    None => reads.next().await,
+                };
+                let read = match next {
+                    Some(read) => read,
+                    None => return None,
+                };
+                let chunks = match read {
                     Ok(bytes) => {
-                        state.buffer.extend_from_slice(&bytes);
-                        state.emit_chunks()
+                        parser.buffer.extend_from_slice(&bytes);
+                        parser.emit_chunks()
                     }
                     Err(e) => {
-                        vec![Err(PulseHiveError::llm(format!("Stream error: {e}")))]
+                        parser.finished = true;
+                        vec![Err(e)]
                     }
                 };
-                // Return Some to keep scanning, None would stop
-                futures::future::ready(Some(chunks))
-            })
-            .flat_map(futures::stream::iter)
-            .boxed();
+                Some((chunks, (reads, cancel, parser)))
+            },
+        )
+        .flat_map(futures::stream::iter)
+        .boxed();
 
         Ok(stream)
     }
+}
+
+/// A mid-stream body-read failure on a success response, classified like
+/// `chat()`'s body read: a timeout is `Timeout`; any other read failure on
+/// the streamed body is `Parse` — a success status was already delivered, so
+/// nothing parseable arrived.
+fn stream_body_error(
+    error: &reqwest::Error,
+    status: reqwest::StatusCode,
+    attempts: u32,
+) -> PulseHiveError {
+    let kind = if error.is_timeout() {
+        LlmErrorKind::Timeout
+    } else {
+        LlmErrorKind::Parse
+    };
+    PulseHiveError::llm_transport(
+        LlmError::new(kind, error.to_string())
+            .with_status(status.as_u16())
+            .with_attempts(attempts),
+    )
 }
 
 // ── SSE Parse State Machine ──────────────────────────────────────────
@@ -343,6 +677,25 @@ fn is_retryable_status(status: reqwest::StatusCode) -> bool {
     matches!(status.as_u16(), 429 | 500 | 502 | 503 | 529)
 }
 
+/// Returns true for the overload statuses whose `Retry-After` header is
+/// honored as retry guidance (and reported on the error).
+fn honors_retry_after(status: reqwest::StatusCode) -> bool {
+    matches!(status.as_u16(), 429 | 529)
+}
+
+/// The exponential backoff ceiling: an honored `Retry-After` never sleeps
+/// longer than this, so a hostile or misconfigured header cannot stall the
+/// call for hours.
+const RETRY_DELAY_CEILING: Duration = Duration::from_secs(8);
+
+/// The delay honored before the next retry: a 429/529 `Retry-After` (already
+/// filtered to those statuses) capped at the backoff ceiling, else backoff.
+fn honored_retry_delay(retry_after: Option<Duration>, attempt: u32) -> Duration {
+    retry_after
+        .map(|delay| delay.min(RETRY_DELAY_CEILING))
+        .unwrap_or_else(|| retry_delay(attempt))
+}
+
 /// Computes exponential backoff delay: 1s * 2^(attempt-1), capped at 8s.
 fn retry_delay(attempt: u32) -> Duration {
     let secs = (1u64 << (attempt - 1).min(3)).min(8);
@@ -370,6 +723,29 @@ mod tests {
     fn test_provider_construction() {
         let config = OpenAIConfig::new("sk-test", "gpt-4");
         let _provider = OpenAICompatibleProvider::new(config);
+    }
+
+    #[tokio::test]
+    async fn test_mark_started_latches_on_first_poll() {
+        let started = Arc::new(AtomicBool::new(false));
+        let mut future = std::pin::pin!(MarkStarted {
+            future: Box::pin(std::future::pending::<()>()),
+            started: Arc::clone(&started),
+        });
+        assert!(
+            !started.load(Ordering::Relaxed),
+            "not started before the first poll"
+        );
+
+        // One poll of the wrapper polls the inner future; a pending result
+        // still counts as started.
+        let first =
+            std::future::poll_fn(|cx| std::task::Poll::Ready(future.as_mut().poll(cx))).await;
+        assert!(first.is_pending());
+        assert!(
+            started.load(Ordering::Relaxed),
+            "started once the future has been polled"
+        );
     }
 
     #[test]
@@ -648,6 +1024,35 @@ mod tests {
         assert_eq!(retry_delay(3), Duration::from_secs(4)); // 2^2
         assert_eq!(retry_delay(4), Duration::from_secs(8)); // 2^3, capped
         assert_eq!(retry_delay(5), Duration::from_secs(8)); // still capped
+    }
+
+    #[test]
+    fn test_honored_retry_delay_capped_at_backoff_ceiling() {
+        // A hostile Retry-After never sleeps past the backoff ceiling...
+        assert_eq!(
+            honored_retry_delay(Some(Duration::from_secs(100_000)), 1),
+            RETRY_DELAY_CEILING
+        );
+        // ...but a short one is honored verbatim, and no header means backoff.
+        assert_eq!(
+            honored_retry_delay(Some(Duration::from_secs(2)), 1),
+            Duration::from_secs(2)
+        );
+        assert_eq!(honored_retry_delay(None, 1), retry_delay(1));
+    }
+
+    #[test]
+    fn test_retry_after_honored_only_on_overload_statuses() {
+        let four_twenty_nine = reqwest::StatusCode::from_u16(429).expect("429 is a valid status");
+        let five_hundred = reqwest::StatusCode::from_u16(500).expect("500 is a valid status");
+        assert!(honors_retry_after(four_twenty_nine));
+        assert!(honors_retry_after(
+            reqwest::StatusCode::from_u16(529).expect("529 is a valid status")
+        ));
+        assert!(!honors_retry_after(five_hundred));
+        assert!(!honors_retry_after(
+            reqwest::StatusCode::from_u16(401).expect("401 is a valid status")
+        ));
     }
 
     // ── HTTP-level tests ─────────────────────────────────────────────

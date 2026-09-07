@@ -11,12 +11,15 @@
 //! {"role": "tool", "tool_call_id": "call_1", "content": "result"}
 //! ```
 
+use std::fmt;
 use std::pin::Pin;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use futures_core::Stream;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use tokio_util::sync::CancellationToken;
 
 use crate::error::Result;
 use crate::tool::Tool;
@@ -25,6 +28,25 @@ use crate::tool::Tool;
 ///
 /// The `provider` field routes to a named [`LlmProvider`] instance registered
 /// with the HiveMind builder (e.g., `"openai"`, `"anthropic"`).
+///
+/// The type is non-exhaustive, so later fields are additive. Construct it with
+/// [`LlmConfig::new`] and the `with_*` builders — a struct literal outside this
+/// crate no longer compiles:
+///
+/// ```compile_fail,E0639
+/// let config = pulsehive_core::llm::LlmConfig {
+///     provider: "openai".into(),
+///     model: "gpt-4o".into(),
+///     temperature: 0.7,
+///     max_tokens: 4096,
+///     timeout_secs: None,
+///     max_retries: None,
+///     reasoning_effort: None,
+///     tool_choice: None,
+///     cancel: None,
+/// };
+/// ```
+#[non_exhaustive]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LlmConfig {
     /// Provider name — matches the key used in `HiveMind::builder().llm_provider(name, ...)`.
@@ -35,6 +57,22 @@ pub struct LlmConfig {
     pub temperature: f32,
     /// Maximum tokens to generate.
     pub max_tokens: u32,
+    /// Per-call override of the provider's configured request timeout, in seconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_secs: Option<u64>,
+    /// Per-call override of the provider's configured retry budget.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_retries: Option<u32>,
+    /// Reasoning budget hint for models that expose one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<ReasoningEffort>,
+    /// Constraint on whether and which tool the model may call.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_choice: Option<ToolChoice>,
+    /// Cancellation carrier for the in-flight call. Runtime state, never wire
+    /// state — it is skipped by serde in both directions.
+    #[serde(skip)]
+    pub cancel: Option<CancellationToken>,
 }
 
 impl LlmConfig {
@@ -45,8 +83,92 @@ impl LlmConfig {
             model: model.into(),
             temperature: 0.7,
             max_tokens: 4096,
+            timeout_secs: None,
+            max_retries: None,
+            reasoning_effort: None,
+            tool_choice: None,
+            cancel: None,
         }
     }
+
+    /// Sets the sampling temperature.
+    pub fn with_temperature(mut self, temperature: f32) -> Self {
+        self.temperature = temperature;
+        self
+    }
+
+    /// Sets the maximum number of tokens to generate.
+    pub fn with_max_tokens(mut self, max_tokens: u32) -> Self {
+        self.max_tokens = max_tokens;
+        self
+    }
+
+    /// Overrides the provider's configured request timeout for this call.
+    pub fn with_timeout_secs(mut self, timeout_secs: u64) -> Self {
+        self.timeout_secs = Some(timeout_secs);
+        self
+    }
+
+    /// Overrides the provider's configured retry budget for this call.
+    pub fn with_max_retries(mut self, max_retries: u32) -> Self {
+        self.max_retries = Some(max_retries);
+        self
+    }
+
+    /// Sets the reasoning budget hint.
+    pub fn with_reasoning_effort(mut self, reasoning_effort: ReasoningEffort) -> Self {
+        self.reasoning_effort = Some(reasoning_effort);
+        self
+    }
+
+    /// Sets the tool-choice constraint.
+    pub fn with_tool_choice(mut self, tool_choice: ToolChoice) -> Self {
+        self.tool_choice = Some(tool_choice);
+        self
+    }
+
+    /// Attaches a cancellation token to this call.
+    pub fn with_cancel(mut self, cancel: CancellationToken) -> Self {
+        self.cancel = Some(cancel);
+        self
+    }
+}
+
+/// Reasoning budget hint for models that expose one.
+///
+/// Providers map this to their own wire representation; the mapping is not part
+/// of this contract.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ReasoningEffort {
+    /// Least reasoning the model will do.
+    Minimal,
+    /// Low reasoning budget.
+    Low,
+    /// Balanced reasoning budget.
+    Medium,
+    /// Highest reasoning budget.
+    High,
+}
+
+/// Constraint on whether and which tool the model may call.
+///
+/// The exact provider wire object (OpenAI's
+/// `{"type":"function","function":{"name":…}}`, for one) is the provider crate's
+/// mapping, not this enum's serde form.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ToolChoice {
+    /// The model decides whether to call a tool.
+    Auto,
+    /// The model must not call a tool.
+    None,
+    /// The model must call some tool.
+    Required,
+    /// The model must call this specific tool.
+    Function { name: String },
 }
 
 /// A message in a multi-turn conversation.
@@ -166,6 +288,21 @@ pub struct TokenUsage {
 }
 
 /// Complete response from a non-streaming LLM call.
+///
+/// The type is non-exhaustive, so later fields are additive. Construct it with
+/// [`LlmResponse::new`] or [`LlmResponse::text`] and the `with_*` builders — a
+/// struct literal outside this crate no longer compiles:
+///
+/// ```compile_fail,E0639
+/// let response = pulsehive_core::llm::LlmResponse {
+///     content: Some("hi".into()),
+///     tool_calls: vec![],
+///     usage: pulsehive_core::llm::TokenUsage::default(),
+///     finish_reason: None,
+///     reasoning: None,
+/// };
+/// ```
+#[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct LlmResponse {
     /// Text content of the response (`None` if only tool calls).
@@ -174,7 +311,206 @@ pub struct LlmResponse {
     pub tool_calls: Vec<ToolCall>,
     /// Token usage statistics.
     pub usage: TokenUsage,
+    /// Why the model stopped, verbatim as the provider reported it.
+    pub finish_reason: Option<String>,
+    /// Reasoning trace, when the provider returned one.
+    pub reasoning: Option<String>,
 }
+
+impl LlmResponse {
+    /// Creates a response from the three fields every provider fills.
+    pub fn new(content: Option<String>, tool_calls: Vec<ToolCall>, usage: TokenUsage) -> Self {
+        Self {
+            content,
+            tool_calls,
+            usage,
+            finish_reason: None,
+            reasoning: None,
+        }
+    }
+
+    /// Creates a text-only response with no tool calls and no usage reported.
+    pub fn text(content: impl Into<String>) -> Self {
+        Self::new(Some(content.into()), vec![], TokenUsage::default())
+    }
+
+    /// Sets the tool calls.
+    pub fn with_tool_calls(mut self, tool_calls: Vec<ToolCall>) -> Self {
+        self.tool_calls = tool_calls;
+        self
+    }
+
+    /// Sets the token usage.
+    pub fn with_usage(mut self, usage: TokenUsage) -> Self {
+        self.usage = usage;
+        self
+    }
+
+    /// Sets the provider's verbatim finish reason.
+    pub fn with_finish_reason(mut self, finish_reason: impl Into<String>) -> Self {
+        self.finish_reason = Some(finish_reason.into());
+        self
+    }
+
+    /// Sets the reasoning trace.
+    pub fn with_reasoning(mut self, reasoning: impl Into<String>) -> Self {
+        self.reasoning = Some(reasoning.into());
+        self
+    }
+}
+
+/// What went wrong on the transport between PulseHive and an LLM provider.
+///
+/// Whether a kind is worth retrying is provider policy, not part of this
+/// contract.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LlmErrorKind {
+    /// The call exceeded its deadline.
+    Timeout,
+    /// The connection could not be established.
+    Connect,
+    /// The provider rate-limited the call.
+    RateLimited,
+    /// The provider returned a 5xx.
+    ServerError,
+    /// The provider returned a 4xx that is not a rate limit.
+    ClientError,
+    /// The response body could not be parsed.
+    Parse,
+    /// The model emitted a tool call that could not be read as one.
+    MalformedToolCall,
+    /// The caller cancelled the in-flight call.
+    Cancelled,
+}
+
+impl LlmErrorKind {
+    /// The snake_case name, identical to this kind's serde representation.
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Timeout => "timeout",
+            Self::Connect => "connect",
+            Self::RateLimited => "rate_limited",
+            Self::ServerError => "server_error",
+            Self::ClientError => "client_error",
+            Self::Parse => "parse",
+            Self::MalformedToolCall => "malformed_tool_call",
+            Self::Cancelled => "cancelled",
+        }
+    }
+}
+
+/// A structured transport failure from an LLM provider.
+///
+/// This replaces stringly-typed transport errors: the caller can branch on
+/// [`LlmErrorKind`] instead of matching on message text.
+///
+/// The type is non-exhaustive, so later fields are additive. Construct it with
+/// [`LlmError::new`] and the `with_*` builders — a struct literal outside this
+/// crate no longer compiles:
+///
+/// ```compile_fail,E0639
+/// let err = pulsehive_core::llm::LlmError {
+///     kind: pulsehive_core::llm::LlmErrorKind::Timeout,
+///     message: "deadline".into(),
+///     status: None,
+///     attempts: 1,
+///     body: None,
+///     finish_reason: None,
+///     retry_after: None,
+/// };
+/// ```
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LlmError {
+    /// What class of failure this is.
+    pub kind: LlmErrorKind,
+    /// Human-readable description.
+    pub message: String,
+    /// HTTP status, when the failure carried one.
+    pub status: Option<u16>,
+    /// How many requests were actually sent before giving up, the failed one
+    /// included. `0` means the call was cancelled before any request was
+    /// sent.
+    pub attempts: u32,
+    /// Response body, verbatim. For explicit inspection only — the consumer
+    /// decides what to redact, and it is never rendered by `Display`, so
+    /// logging an error cannot leak provider bodies.
+    pub body: Option<String>,
+    /// The finish reason that accompanied the failure — set for
+    /// [`LlmErrorKind::MalformedToolCall`].
+    pub finish_reason: Option<String>,
+    /// How long the provider asked the caller to wait before retrying.
+    pub retry_after: Option<Duration>,
+}
+
+impl LlmError {
+    /// Creates an error for a single attempt with no transport detail attached.
+    pub fn new(kind: LlmErrorKind, message: impl Into<String>) -> Self {
+        Self {
+            kind,
+            message: message.into(),
+            status: None,
+            attempts: 1,
+            body: None,
+            finish_reason: None,
+            retry_after: None,
+        }
+    }
+
+    /// Sets the HTTP status.
+    pub fn with_status(mut self, status: u16) -> Self {
+        self.status = Some(status);
+        self
+    }
+
+    /// Sets how many attempts were made.
+    pub fn with_attempts(mut self, attempts: u32) -> Self {
+        self.attempts = attempts;
+        self
+    }
+
+    /// Sets the verbatim response body.
+    pub fn with_body(mut self, body: impl Into<String>) -> Self {
+        self.body = Some(body.into());
+        self
+    }
+
+    /// Sets the accompanying finish reason.
+    pub fn with_finish_reason(mut self, finish_reason: impl Into<String>) -> Self {
+        self.finish_reason = Some(finish_reason.into());
+        self
+    }
+
+    /// Sets the provider's requested retry delay.
+    pub fn with_retry_after(mut self, retry_after: Duration) -> Self {
+        self.retry_after = Some(retry_after);
+        self
+    }
+}
+
+impl fmt::Display for LlmError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{} after {} attempt(s): {}",
+            self.kind.as_str(),
+            self.attempts,
+            self.message
+        )?;
+        if let Some(status) = self.status {
+            write!(f, " (HTTP {status})")?;
+        }
+        // The verbatim body is deliberately NOT rendered here: provider
+        // bodies can echo prompt content, tenant or credential data, and
+        // Display feeds every `%e` / `to_string()` consumer (the agent loop
+        // logs and persists that string). Inspect `body` explicitly instead.
+        Ok(())
+    }
+}
+
+impl std::error::Error for LlmError {}
 
 /// A chunk from a streaming LLM response.
 #[derive(Debug, Clone)]
