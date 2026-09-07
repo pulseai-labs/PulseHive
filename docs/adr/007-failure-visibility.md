@@ -13,12 +13,12 @@ PulseHive operates in complex distributed systems (LLM providers, substrate) whe
 
 **Failure Visibility:**
 - **Result types:** Public APIs return `Result<T, E>` for fallible operations
-- **No silent failures:** Library never suppresses errors without explicit consumer acknowledgement
+- **No silent failures, with documented best-effort exceptions:** Most failures surface through `Result`, but known paths are best-effort today: `HiveMind::deploy` only logs a failed Watch subscription, and `record_experience` logs and continues after an embedding failure and silently ignores `get_experience` errors (`pulsehive-runtime/src/hivemind.rs`); error propagation for these paths is tracked in #57
 - **Documented error conditions:** All error variants documented in API docs
 - **Provider failures:** LLM provider errors propagate to consumer
-- **Substrate failures:** PulseDB errors (connection, query) surface through Result types
+- **Substrate failures:** PulseDB errors (connection, query) surface through Result types, excepting the best-effort paths above
 
-**What Must Never Fail Silently:**
+**What Must Never Fail Silently (intent; the best-effort exceptions above are the known gaps):**
 - API key authentication failures
 - Substrate connection failures
 - LLM provider outages
@@ -32,12 +32,12 @@ PulseHive operates in complex distributed systems (LLM providers, substrate) whe
 **Positive:**
 - Consumers can implement targeted error handling
 - Failures are debuggable and observable
-- No hidden error suppression
+- Best-effort exception paths are documented rather than hidden (propagation tracked in #57)
 
 **Neutral:**
 - Error handling boilerplate required in consumer code
 - Some operations become fallible that could be infallible in theory
 
 **Negative:**
-- Cannot suppress transient errors without consumer awareness
+- Deploy-time Watch subscription and record_experience embedding/get_experience failures are currently log-only or silent (propagation tracked in #57)
 - Error propagation requires careful consumer design
