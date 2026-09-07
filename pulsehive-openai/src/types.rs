@@ -142,8 +142,27 @@ pub(crate) struct ChatMessage {
     pub tool_calls: Option<Vec<OpenAIToolCall>>,
     /// Reasoning trace, under OpenAI's `reasoning` key or the
     /// `reasoning_content` spelling several compatible providers use.
-    #[serde(default, alias = "reasoning_content")]
+    #[serde(
+        default,
+        alias = "reasoning_content",
+        deserialize_with = "deserialize_reasoning"
+    )]
     pub reasoning: Option<String>,
+}
+
+/// Deserializes a reasoning field permissively: a string populates it, any
+/// other shape — the structured reasoning objects/arrays some
+/// OpenAI-compatible endpoints return — is ignored as `None` so the
+/// response still parses (before this field existed, serde ignored the
+/// key entirely; failing the whole response is a compat regression).
+fn deserialize_reasoning<'de, D>(deserializer: D) -> std::result::Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    match Option::<Value>::deserialize(deserializer)? {
+        Some(Value::String(text)) => Ok(Some(text)),
+        _ => Ok(None),
+    }
 }
 
 /// Tool call as returned by OpenAI
@@ -270,9 +289,13 @@ impl ChatCompletionResponse {
 ///
 /// An empty or whitespace-only string is a zero-argument call —
 /// OpenAI-compatible backends (Ollama, LM Studio, vLLM) emit `""` for those —
-/// and parses as `{}`. Anything else non-object — a parse error, a non-object
-/// value — is a typed [`LlmErrorKind::MalformedToolCall`] carrying the raw
-/// arguments as the body and the choice's finish reason when present.
+/// and parses as `{}`, unless the completion was truncated
+/// (`finish_reason: "length"`): an empty string then means the arguments
+/// were cut off before any JSON was emitted, which is a typed
+/// [`LlmErrorKind::MalformedToolCall`], not a dispatchable call. Anything
+/// else non-object — a parse error, a non-object value — is the same typed
+/// failure carrying the raw arguments as the body and the choice's finish
+/// reason when present.
 fn parse_tool_arguments(raw: &str, finish_reason: &Option<String>, attempts: u32) -> Result<Value> {
     let invalid = |message: String| {
         let mut err = LlmError::new(LlmErrorKind::MalformedToolCall, message)
@@ -286,6 +309,11 @@ fn parse_tool_arguments(raw: &str, finish_reason: &Option<String>, attempts: u32
     };
 
     if raw.trim().is_empty() {
+        if finish_reason.as_deref() == Some("length") {
+            return Err(invalid(
+                "arguments are empty and the completion was truncated".into(),
+            ));
+        }
         return Ok(serde_json::json!({}));
     }
 
@@ -419,6 +447,28 @@ mod tests {
                 .expect("empty arguments are a zero-argument call");
             assert_eq!(value, serde_json::json!({}), "raw: {raw:?}");
         }
+
+        // An empty finish_reason (or a non-truncation one) keeps the
+        // compatibility behavior too.
+        for reason in [None, Some("stop".to_string())] {
+            let value = parse_tool_arguments("", &reason, 1)
+                .expect("empty arguments on a completed call are zero-argument");
+            assert_eq!(value, serde_json::json!({}), "reason: {reason:?}");
+        }
+    }
+
+    #[test]
+    fn test_empty_tool_arguments_with_truncation_finish_reason_are_rejected() {
+        // A completion cut off by finish_reason "length" can emit an empty
+        // arguments string: the arguments were truncated before any JSON was
+        // emitted, which is a malformed call, not a dispatchable one.
+        let err = match parse_tool_arguments("", &Some("length".into()), 2) {
+            Err(PulseHiveError::LlmTransport(err)) => err,
+            other => panic!("expected MalformedToolCall, got: {other:?}"),
+        };
+        assert_eq!(err.kind, LlmErrorKind::MalformedToolCall);
+        assert_eq!(err.attempts, 2);
+        assert_eq!(err.finish_reason.as_deref(), Some("length"));
     }
 
     #[test]
@@ -498,6 +548,40 @@ mod tests {
             let llm = response.into_llm_response(1).unwrap();
             assert_eq!(llm.reasoning.as_deref(), Some("thinking"), "key: {key}");
             assert_eq!(llm.finish_reason.as_deref(), Some("length"), "key: {key}");
+        }
+    }
+
+    #[test]
+    fn test_structured_reasoning_is_ignored_not_fatal() {
+        // Some OpenAI-compatible endpoints return a structured object or
+        // array for reasoning/reasoning_content; before the field existed
+        // serde ignored them, so failing the whole response would be a
+        // compat regression. Any non-string shape deserializes as None.
+        for key in ["reasoning", "reasoning_content"] {
+            for shape in [
+                r#"{"summary":["thought"],"effort":1}"#,
+                r#"["step 1","step 2"]"#,
+                r#"42"#,
+                r#"null"#,
+            ] {
+                let json = format!(
+                    r#"{{
+                        "id": "chatcmpl-abc",
+                        "choices": [{{
+                            "message": {{"content": "ok", "{key}": {shape}, "tool_calls": null}},
+                            "finish_reason": "stop"
+                        }}],
+                        "usage": {{"prompt_tokens": 1, "completion_tokens": 1}}
+                    }}"#
+                );
+                let response: ChatCompletionResponse =
+                    serde_json::from_str(&json).unwrap_or_else(|e| {
+                        panic!("response must parse, key {key} shape {shape}: {e}")
+                    });
+                let llm = response.into_llm_response(1).unwrap();
+                assert_eq!(llm.reasoning, None, "key: {key}, shape: {shape}");
+                assert_eq!(llm.content.as_deref(), Some("ok"));
+            }
         }
     }
 
