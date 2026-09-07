@@ -935,11 +935,15 @@ impl AnthropicProvider {
 ```
 
 **Transport hardening (2.1.0).** Every transport failure from `chat` is a
-`PulseHiveError::LlmTransport` carrying an `LlmError`:
+`PulseHiveError::LlmTransport` carrying an `LlmError`; a request that cannot
+be built at all (malformed `base_url`, an `api_key` that cannot be a header
+value) is the request-build exception — `PulseHiveError::Llm(String)`, failing
+immediately without retrying or sending anything:
 
 | Situation | `kind` | Retried? | Carries |
 |---|---|---|---|
 | Request deadline exceeded (send or body read) | `Timeout` | never — fails after one attempt | `attempts: 1` |
+| Request could not be built (malformed `base_url`, unheaderable `api_key`) | — (`PulseHiveError::Llm(String)`) | never — fails before anything is sent | — |
 | Other transport failure (connection refused, reset, …) | `Connect` | yes, within the attempt budget | — |
 | HTTP 429 | `RateLimited` | yes; integer-seconds `Retry-After` wins over backoff, capped at the 16s backoff ceiling | `status: 429`, raw `body`, `retry_after` (the raw header value) |
 | HTTP 500 / 502 / 503 | `ServerError` | yes, same backoff — `Retry-After` is not honoured | `status`, raw `body` |
@@ -979,8 +983,9 @@ supported by this provider today (every call returns a not-supported error).
 
 `AnthropicProvider::config()` returns an `AnthropicConfigView`: the transport
 settings (endpoint, model, timeout, retry budget) with no path to the API
-key, which never renders in `Debug` either on the view or on
-`AnthropicConfig`.
+key. Neither the view nor `AnthropicConfig` renders the key in `Debug`, and
+`base_url` renders with any URL userinfo (`user:pass@`) stripped — the
+provider keeps dialing the original URL.
 
 ### 6.2 pulsehive-openai
 
@@ -1030,12 +1035,13 @@ let ollama = OpenAICompatibleProvider::new(OpenAIConfig {
 });
 ```
 
-**Transport contract (2.1.0).** Every transport failure from `chat` and `chat_stream` is a typed `PulseHiveError::LlmTransport(LlmError)`; `PulseHiveError::Llm(String)` remains only for request-build serialization failures. Classification:
+**Transport contract (2.1.0).** Every transport failure from `chat` and `chat_stream` is a typed `PulseHiveError::LlmTransport(LlmError)`; `PulseHiveError::Llm(String)` remains for request-build failures — serialization, or a request that cannot be built at all (malformed `base_url`), which fails immediately without retrying or sending anything. Classification:
 
 | Situation | `LlmErrorKind` | Retried? | Carries |
 |---|---|---|---|
 | Request exceeded its deadline (send or body read) | `Timeout` | **never** — one attempt (#46) | `attempts: 1` |
 | Connection-level error (connect refused, reset) | `Connect` | yes, exponential backoff (1s→2s→4s, cap 8s) | — |
+| Request could not be built (malformed `base_url`) | — (`PulseHiveError::Llm(String)`) | never — fails before anything is sent | — |
 | HTTP 429 / 529 | `RateLimited` / `ServerError` | yes; waits `Retry-After` when present (capped at the 8s backoff ceiling), else backoff | `status`, verbatim `body`, `retry_after` (the raw header value) |
 | HTTP 500 / 502 / 503 | `ServerError` | yes, same backoff — `Retry-After` is not honored | `status`, verbatim `body` |
 | Any other 4xx | `ClientError` | never | `status`, verbatim `body` |
@@ -1051,9 +1057,9 @@ let ollama = OpenAICompatibleProvider::new(OpenAIConfig {
 
 **Wire fields.** `reasoning_effort` is sent only when set; `tool_choice` is sent only when set **and** the request carries tools (the APIs reject `tool_choice` without `tools`), mapping to `"auto"` / `"none"` / `"required"` / `{"type":"function","function":{"name":…}}`. With both absent the request body is byte-identical to 2.0.2. On the response, `finish_reason` and `reasoning` (also read from the `reasoning_content` alias several compatible providers use) are surfaced on `LlmResponse`. A tool call whose `arguments` string does not parse as a JSON object is a `MalformedToolCall` error, never a call with `{}` arguments; a legitimate `"{}"` — and the `""` zero-argument spelling used by Ollama, LM Studio and vLLM — still yields `{}`.
 
-**Streaming limitation.** `chat_stream` carries neither `reasoning` nor `finish_reason` — only `chat` surfaces them.
+**Streaming limitation.** `chat_stream` carries neither `reasoning` nor `finish_reason` — only `chat` surfaces them. The stream ends at the `Done` chunk: polling past it yields end-of-stream, so a cancellation after `Done` produces no error.
 
-**Config accessor.** `OpenAICompatibleProvider::config()` returns an `OpenAIConfigView`: the transport settings (endpoint, model, timeout, retry budget) with no path to the API key, which never renders in `Debug` either on the view or on `OpenAIConfig`.
+**Config accessor.** `OpenAICompatibleProvider::config()` returns an `OpenAIConfigView`: the transport settings (endpoint, model, timeout, retry budget) with no path to the API key. Neither the view nor `OpenAIConfig` renders the key in `Debug`, and `base_url` renders with any URL userinfo (`user:pass@`) stripped — the provider keeps dialing the original URL.
 
 ---
 
