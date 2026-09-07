@@ -941,8 +941,9 @@ impl AnthropicProvider {
 |---|---|---|---|
 | Request deadline exceeded (send or body read) | `Timeout` | never — fails after one attempt | `attempts: 1` |
 | Other transport failure (connection refused, reset, …) | `Connect` | yes, within the attempt budget | — |
-| HTTP 429 | `RateLimited` | yes; integer-seconds `Retry-After` wins over backoff | `status: 429`, raw `body`, `retry_after` |
-| HTTP 500 / 502 / 503 / 529 | `ServerError` | yes (529 also honours `Retry-After`) | `status`, raw `body` |
+| HTTP 429 | `RateLimited` | yes; integer-seconds `Retry-After` wins over backoff, capped at the 16s backoff ceiling | `status: 429`, raw `body`, `retry_after` (the raw header value) |
+| HTTP 500 / 502 / 503 | `ServerError` | yes, same backoff — `Retry-After` is not honoured | `status`, raw `body` |
+| HTTP 529 | `ServerError` | yes; `Retry-After` honoured like 429 | `status`, raw `body`, `retry_after` |
 | Other 4xx | `ClientError` | never | `status`, raw `body`, the Anthropic error envelope's `error.message` when it parses |
 | Other 5xx | `ServerError` | never | `status`, raw `body` |
 | Success status, unparseable body | `Parse` | never | `status: 200`, raw `body` |
@@ -955,7 +956,8 @@ Per-call overrides and cancellation: `LlmConfig::timeout_secs` and
 cancelled `LlmConfig::cancel` token aborts the in-flight request.
 
 Wire mapping, request side — `LlmConfig::tool_choice` maps to Anthropic's
-exact shapes and is omitted entirely when unset:
+exact shapes and is omitted entirely when unset or when the request carries
+no tools (the Messages API rejects `tool_choice` without `tools`):
 
 | `ToolChoice` | Anthropic wire object |
 |---|---|
@@ -975,7 +977,9 @@ Wire mapping, response side — `stop_reason` is copied **verbatim** into
 this provider never requests `thinking` blocks. `chat_stream` is not
 supported by this provider today (every call returns a not-supported error).
 
-`AnthropicProvider::config()` returns a shared reference to the provider's
+`AnthropicProvider::config()` returns an `AnthropicConfigView`: the transport
+settings (endpoint, model, timeout, retry budget) with no path to the API
+key, which never renders in `Debug` either on the view or on
 `AnthropicConfig`.
 
 ### 6.2 pulsehive-openai
@@ -1026,29 +1030,30 @@ let ollama = OpenAICompatibleProvider::new(OpenAIConfig {
 });
 ```
 
-**Transport contract (2.1.0).** Every transport failure from `chat` is a typed `PulseHiveError::LlmTransport(LlmError)`; `PulseHiveError::Llm(String)` remains only for request-build serialization failures. Classification:
+**Transport contract (2.1.0).** Every transport failure from `chat` and `chat_stream` is a typed `PulseHiveError::LlmTransport(LlmError)`; `PulseHiveError::Llm(String)` remains only for request-build serialization failures. Classification:
 
 | Situation | `LlmErrorKind` | Retried? | Carries |
 |---|---|---|---|
 | Request exceeded its deadline (send or body read) | `Timeout` | **never** — one attempt (#46) | `attempts: 1` |
 | Connection-level error (connect refused, reset) | `Connect` | yes, exponential backoff (1s→2s→4s, cap 8s) | — |
-| HTTP 429 | `RateLimited` | yes; waits `Retry-After` when present, else backoff | `status`, verbatim `body`, `retry_after` |
-| HTTP 500 / 502 / 503 / 529 | `ServerError` | yes, same backoff | `status`, verbatim `body` |
+| HTTP 429 / 529 | `RateLimited` / `ServerError` | yes; waits `Retry-After` when present (capped at the 8s backoff ceiling), else backoff | `status`, verbatim `body`, `retry_after` (the raw header value) |
+| HTTP 500 / 502 / 503 | `ServerError` | yes, same backoff — `Retry-After` is not honored | `status`, verbatim `body` |
 | Any other 4xx | `ClientError` | never | `status`, verbatim `body` |
 | Any other 5xx | `ServerError` | never | `status`, verbatim `body` |
 | 2xx whose body fails to read or parse | `Parse` | never | `status`, verbatim `body` |
-| Tool-call `arguments` not a JSON object | `MalformedToolCall` | never | raw arguments as `body`, `finish_reason` |
+| Mid-stream SSE body-read failure (`chat_stream`) | `Timeout` / `Parse` | never — the stream ends after one typed error | `status: 200`, `attempts` |
+| Tool-call `arguments` not a JSON object (an empty/whitespace string is a zero-argument `{}` call) | `MalformedToolCall` | never | raw arguments as `body`, `finish_reason` |
 | `LlmConfig::cancel` token fires | `Cancelled` | never | `attempts` (0 if before the first send) |
 
 `attempts` counts the requests actually sent, the failed one included.
 
-**Per-call overrides.** `LlmConfig::timeout_secs` replaces the client-level deadline for that request only, and `LlmConfig::max_retries` replaces the provider's configured budget for that call (`Some(0)` = exactly one attempt) — both on a single provider instance. A cancelled `LlmConfig::cancel` token aborts the in-flight request, the body read and every backoff sleep.
+**Per-call overrides.** `LlmConfig::timeout_secs` replaces the client-level deadline for that request only, and `LlmConfig::max_retries` replaces the provider's configured budget for that call (`Some(0)` = exactly one attempt) — both on a single provider instance. A cancelled `LlmConfig::cancel` token aborts the in-flight request, the body read (including reads of a `chat_stream` body already in progress) and every backoff sleep.
 
-**Wire fields.** `reasoning_effort` and `tool_choice` are sent only when set; `tool_choice` maps to `"auto"` / `"none"` / `"required"` / `{"type":"function","function":{"name":…}}`. With both unset the request body is byte-identical to 2.0.2. On the response, `finish_reason` and `reasoning` (also read from the `reasoning_content` alias several compatible providers use) are surfaced on `LlmResponse`. A tool call whose `arguments` string does not parse as a JSON object is a `MalformedToolCall` error, never a call with `{}` arguments; a legitimate `"{}"` still yields `{}`.
+**Wire fields.** `reasoning_effort` is sent only when set; `tool_choice` is sent only when set **and** the request carries tools (the APIs reject `tool_choice` without `tools`), mapping to `"auto"` / `"none"` / `"required"` / `{"type":"function","function":{"name":…}}`. With both absent the request body is byte-identical to 2.0.2. On the response, `finish_reason` and `reasoning` (also read from the `reasoning_content` alias several compatible providers use) are surfaced on `LlmResponse`. A tool call whose `arguments` string does not parse as a JSON object is a `MalformedToolCall` error, never a call with `{}` arguments; a legitimate `"{}"` — and the `""` zero-argument spelling used by Ollama, LM Studio and vLLM — still yields `{}`.
 
 **Streaming limitation.** `chat_stream` carries neither `reasoning` nor `finish_reason` — only `chat` surfaces them.
 
-**Config accessor.** `OpenAICompatibleProvider::config() -> &OpenAIConfig` exposes the provider's configured defaults.
+**Config accessor.** `OpenAICompatibleProvider::config()` returns an `OpenAIConfigView`: the transport settings (endpoint, model, timeout, retry budget) with no path to the API key, which never renders in `Debug` either on the view or on `OpenAIConfig`.
 
 ---
 
@@ -1198,9 +1203,24 @@ match hive.deploy(agents, tasks).await {
         // Database error -- file permissions, corruption
         eprintln!("Storage error: {}", db_err);
     }
-    Err(PulseHiveError::Llm { provider, message }) => {
-        // LLM API error -- network, auth, rate limit
-        eprintln!("LLM error ({}): {}", provider, message);
+    Err(PulseHiveError::LlmTransport(err)) => {
+        // LLM transport error -- network, auth, rate limit; branch on the
+        // kind instead of matching on message text
+        match err.kind {
+            pulsehive_core::llm::LlmErrorKind::RateLimited => {
+                eprintln!("Rate limited; retry after {:?}", err.retry_after);
+            }
+            pulsehive_core::llm::LlmErrorKind::Timeout
+            | pulsehive_core::llm::LlmErrorKind::Connect => {
+                eprintln!("Transport failure: {}", err);
+            }
+            _ => eprintln!("LLM error: {}", err),
+        }
+    }
+    Err(PulseHiveError::Llm(msg)) => {
+        // Request-build or serialization failure -- a bug in the caller's
+        // message construction, not a transport issue
+        eprintln!("LLM request error: {}", msg);
     }
     Err(e) => {
         eprintln!("Unexpected error: {}", e);
