@@ -13,8 +13,8 @@ use std::time::Duration;
 
 use pulsehive_core::error::{PulseHiveError, Result as PhResult};
 use pulsehive_core::llm::{
-    LlmConfig, LlmError, LlmErrorKind, LlmProvider, LlmResponse, Message, ReasoningEffort,
-    ToolChoice, ToolDefinition,
+    LlmChunk, LlmConfig, LlmError, LlmErrorKind, LlmProvider, LlmResponse, Message,
+    ReasoningEffort, ToolChoice, ToolDefinition,
 };
 use pulsehive_openai::{OpenAICompatibleProvider, OpenAIConfig};
 use tokio_util::sync::CancellationToken;
@@ -41,6 +41,14 @@ enum Step {
         status: u16,
         reason: &'static str,
         content_length: usize,
+    },
+    /// Write response headers for `status` promising `content_length` bytes,
+    /// send `body`, then hold the connection open without sending the rest.
+    RespondBodyThenStall {
+        status: u16,
+        reason: &'static str,
+        content_length: usize,
+        body: String,
     },
     /// Write response headers for `status` promising a body, then drop the
     /// connection mid-body.
@@ -98,6 +106,22 @@ fn respond_head_then_stall(status: u16, reason: &'static str, content_length: us
         status,
         reason,
         content_length,
+    }
+}
+
+/// Send `status` headers, `body`, then stall with the rest of the promised
+/// body unsent.
+fn respond_body_then_stall(
+    status: u16,
+    reason: &'static str,
+    content_length: usize,
+    body: impl Into<String>,
+) -> Step {
+    Step::RespondBodyThenStall {
+        status,
+        reason,
+        content_length,
+        body: body.into(),
     }
 }
 
@@ -175,6 +199,20 @@ impl Fixture {
                             "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {content_length}\r\nConnection: close\r\n\r\n"
                         );
                         let _ = stream.write_all(head.as_bytes());
+                        let _ = stream.flush();
+                        thread::sleep(Duration::from_secs(3));
+                    }
+                    Step::RespondBodyThenStall {
+                        status,
+                        reason,
+                        content_length,
+                        body,
+                    } => {
+                        let head = format!(
+                            "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {content_length}\r\nConnection: close\r\n\r\n"
+                        );
+                        let _ = stream.write_all(head.as_bytes());
+                        let _ = stream.write_all(body.as_bytes());
                         let _ = stream.flush();
                         thread::sleep(Duration::from_secs(3));
                     }
@@ -339,6 +377,12 @@ async fn timeout_fails_once_with_typed_timeout_and_is_not_resent() {
     );
 
     fixture.next_body();
+    // Wait out the fixture's 3s stall before asserting: a buggy retry would
+    // only be accepted — and recorded — once the stalled step ends.
+    let target = Duration::from_millis(3300);
+    if started.elapsed() < target {
+        thread::sleep(target - started.elapsed());
+    }
     fixture.assert_no_more_requests();
 }
 
@@ -347,12 +391,13 @@ async fn timeout_fails_once_with_typed_timeout_and_is_not_resent() {
 #[tokio::test]
 async fn non_success_body_read_timeout_is_typed_timeout_not_retried() {
     // 503 headers arrive; the promised body never does. The per-call
-    // deadline fires while reading the error body.
-    let fixture = Fixture::spawn(vec![respond_head_then_stall(
-        503,
-        "Service Unavailable",
-        2048,
-    )]);
+    // deadline fires while reading the error body. The trailing spare step
+    // keeps the fixture (and its channel) alive past the 3s hold for the
+    // no-more-requests assertion.
+    let fixture = Fixture::spawn(vec![
+        respond_head_then_stall(503, "Service Unavailable", 2048),
+        respond_ok(minimal_completion()),
+    ]);
     let provider = fixture.provider();
 
     let started = std::time::Instant::now();
@@ -375,6 +420,12 @@ async fn non_success_body_read_timeout_is_typed_timeout_not_retried() {
     );
 
     fixture.next_body();
+    // Wait out the fixture's 3s hold before asserting, so any retry is
+    // recorded once the step ends (same intent as the timeout test above).
+    let target = Duration::from_millis(3300);
+    if started.elapsed() < target {
+        thread::sleep(target - started.elapsed());
+    }
     fixture.assert_no_more_requests();
 }
 
@@ -479,6 +530,41 @@ async fn max_retries_at_u32_max_does_not_overflow_to_zero_attempts() {
     assert_eq!(err.kind, LlmErrorKind::ClientError);
     assert_eq!(err.attempts, 1, "attempts must be at least 1");
     fixture.next_body();
+}
+
+// ── 2c. A builder error fails fast, untyped, unsendable (G02) ────────
+
+#[tokio::test]
+async fn malformed_base_url_fails_fast_without_retrying() {
+    // The URL cannot be parsed, so the request cannot be built: a
+    // request-build failure surfaced immediately via the Llm variant — no
+    // retry budget is spent, no backoff is slept, nothing is sent.
+    let provider = OpenAICompatibleProvider::new(
+        OpenAIConfig::new("test-key", "test-model").with_base_url("not a valid url"),
+    );
+
+    let started = std::time::Instant::now();
+    let error = provider
+        .chat(
+            vec![Message::user("hi")],
+            vec![],
+            &LlmConfig::new("openai", "test-model"),
+        )
+        .await
+        .expect_err("an unparseable URL must fail");
+    let elapsed = started.elapsed();
+
+    match error {
+        PulseHiveError::Llm(message) => assert!(
+            message.contains("failed to build request"),
+            "message: {message}"
+        ),
+        other => panic!("expected the request-build Llm error, got: {other:?}"),
+    }
+    assert!(
+        elapsed.as_millis() < 2500,
+        "a builder error must not burn the backoff budget, took {elapsed:?}"
+    );
 }
 
 // ── 3. Per-call timeout override shortens a long client timeout ─────
@@ -845,6 +931,60 @@ async fn mid_stream_body_failure_is_typed_transport_error() {
         elapsed.as_millis() >= 900 && elapsed.as_millis() < 2500,
         "expected the body-read timeout in about one second, got {elapsed:?}"
     );
+}
+
+// ── 8c. The stream ends at Done; cancel after Done is clean (G03) ────
+
+#[tokio::test]
+async fn stream_ends_after_done_and_cancel_after_done_is_clean() {
+    // [DONE] arrives, but the connection stays open with bytes still
+    // promised: polling past Done must end the stream immediately instead
+    // of racing further body reads against the cancel token.
+    let sse = "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\ndata: [DONE]\n\n";
+    let fixture = Fixture::spawn(vec![respond_body_then_stall(
+        200,
+        "OK",
+        sse.len() + 256,
+        sse,
+    )]);
+    let provider = fixture.provider();
+
+    let token = CancellationToken::new();
+    let stream = provider
+        .chat_stream(
+            vec![Message::user("hi")],
+            vec![],
+            &LlmConfig::new("openai", "test-model").with_cancel(token.clone()),
+        )
+        .await
+        .expect("headers arrive, so the stream is handed out");
+
+    let started = std::time::Instant::now();
+    let mut stream = stream;
+    let mut saw_done = false;
+    while let Some(item) = futures::StreamExt::next(&mut stream).await {
+        match item {
+            Ok(LlmChunk::Text(_)) => {}
+            Ok(LlmChunk::Done) => saw_done = true,
+            other => panic!("unexpected chunk before Done: {other:?}"),
+        }
+        if saw_done {
+            break;
+        }
+    }
+    assert!(saw_done, "the fixture must deliver a Done chunk");
+    assert!(
+        started.elapsed().as_millis() < 2500,
+        "Done must arrive promptly, took {:?}",
+        started.elapsed()
+    );
+
+    // Cancelling after the terminal Done must produce a clean end of
+    // stream, never a spurious Cancelled error.
+    token.cancel();
+    let next = futures::StreamExt::next(&mut stream).await;
+    assert!(next.is_none(), "stream must end after Done, got: {next:?}");
+    fixture.next_body();
 }
 
 // ── 8. Cancel token aborts the in-flight request (L3) ───────────────

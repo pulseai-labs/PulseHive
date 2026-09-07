@@ -379,6 +379,63 @@ async fn max_retries_at_u32_max_does_not_overflow_to_zero_attempts() {
     assert_eq!(requests_seen(&rx, 100).len(), 1);
 }
 
+// ── 3c. Builder errors fail fast without retrying (G02) ─────────────
+
+#[tokio::test]
+async fn malformed_base_url_fails_fast_without_retrying() {
+    // The URL cannot be parsed, so the request cannot be built: a
+    // request-build failure surfaced immediately via the Llm variant — no
+    // retry budget is spent, no backoff is slept, nothing is sent.
+    let provider = AnthropicProvider::with_config(
+        AnthropicConfig::new("test-key").with_base_url("not a valid url"),
+    );
+
+    let start = Instant::now();
+    let error = provider
+        .chat(one_user_message(), vec![], &chat_config())
+        .await
+        .expect_err("an unparseable URL must fail");
+    let elapsed = start.elapsed();
+
+    match error {
+        PulseHiveError::Llm(message) => assert!(
+            message.contains("failed to build request"),
+            "message: {message}"
+        ),
+        other => panic!("expected the request-build Llm error, got: {other:?}"),
+    }
+    assert!(
+        elapsed < Duration::from_millis(2500),
+        "a builder error must not burn the backoff budget, took {elapsed:?}"
+    );
+}
+
+#[tokio::test]
+async fn unheaderable_api_key_fails_fast_without_retrying() {
+    // An api_key containing a header-invalid byte cannot become an
+    // x-api-key value: same immediate request-build failure.
+    let provider = AnthropicProvider::with_config(AnthropicConfig::new("bad\nkey"));
+
+    let start = Instant::now();
+    let error = provider
+        .chat(one_user_message(), vec![], &chat_config())
+        .await
+        .expect_err("an unheaderable api key must fail");
+    let elapsed = start.elapsed();
+
+    match error {
+        PulseHiveError::Llm(message) => assert!(
+            message.contains("failed to build request"),
+            "message: {message}"
+        ),
+        other => panic!("expected the request-build Llm error, got: {other:?}"),
+    }
+    assert!(
+        elapsed < Duration::from_millis(2500),
+        "a builder error must not burn the backoff budget, took {elapsed:?}"
+    );
+}
+
 // ── 4. Per-call timeout overrides a long client timeout ───────────────
 
 #[tokio::test]

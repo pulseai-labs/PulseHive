@@ -121,7 +121,9 @@ impl AnthropicProvider {
     /// a cancelled `config.cancel` token aborts the in-flight exchange.
     /// Every `Err` on the transport path is a typed `LlmTransport` error;
     /// `PulseHiveError::llm(..)` remains reserved for request-build
-    /// failures, which this path cannot produce.
+    /// failures — reachable here only when the request itself cannot be
+    /// built (malformed `base_url`, an `api_key` that cannot be a header
+    /// value), which fails immediately without sending anything.
     async fn send_request(
         &self,
         request_body: &MessagesRequest,
@@ -166,6 +168,13 @@ impl AnthropicProvider {
             let response = match self.race_cancel(request.send(), config, attempts).await? {
                 Ok(response) => response,
                 Err(e) if e.is_timeout() => return Err(Self::timeout_error(&e, attempts)),
+                // A builder error (malformed base_url, an api_key that
+                // cannot be a header value) never reaches the network: a
+                // request-build failure, surfaced immediately — not retried
+                // through the budget and not classified as Connect.
+                Err(e) if e.is_builder() => {
+                    return Err(PulseHiveError::llm(format!("failed to build request: {e}")));
+                }
                 Err(e) => {
                     if attempts >= max_attempts {
                         return Err(Self::connect_error(&e, attempts));

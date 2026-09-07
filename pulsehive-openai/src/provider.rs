@@ -133,7 +133,10 @@ impl OpenAICompatibleProvider {
     /// Send a request under the provider's transport policy.
     ///
     /// Every failure is a typed [`LlmError`] inside
-    /// [`PulseHiveError::LlmTransport`] — never a bare string — and the two
+    /// [`PulseHiveError::LlmTransport`] — never a bare string, except a
+    /// builder error (malformed `base_url`), which never reaches the
+    /// network, fails immediately without retrying, and surfaces as the
+    /// request-build failure it is via [`PulseHiveError::llm`]. The two
     /// failure branches are distinguishable by kind (#46's second complaint):
     ///
     /// * **Status failures** — the provider answered a non-success status.
@@ -223,6 +226,13 @@ impl OpenAICompatibleProvider {
                     return Err(PulseHiveError::llm_transport(
                         LlmError::new(LlmErrorKind::Timeout, e.to_string()).with_attempts(attempt),
                     ));
+                }
+                // A builder error (malformed base_url) never reaches the
+                // network: a request-build failure, surfaced immediately —
+                // not retried through the budget and not classified as
+                // Connect.
+                Err(e) if e.is_builder() => {
+                    return Err(PulseHiveError::llm(format!("failed to build request: {e}")));
                 }
                 Err(e) => {
                     if attempt < max_attempts {
@@ -479,6 +489,13 @@ impl LlmProvider for OpenAICompatibleProvider {
 
         let stream = raced
             .scan(SseParseState::new(), |state, read| {
+                // Once the parser has emitted the terminal Done chunk the
+                // stream ends: a consumer polling past Done gets a clean
+                // end-of-stream instead of more body-read races, so a
+                // cancellation after Done cannot fabricate an error.
+                if state.finished {
+                    return futures::future::ready(None);
+                }
                 let chunks = match read {
                     Ok(bytes) => {
                         state.buffer.extend_from_slice(&bytes);
