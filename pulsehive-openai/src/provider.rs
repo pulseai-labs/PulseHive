@@ -513,6 +513,9 @@ impl LlmProvider for OpenAICompatibleProvider {
                     Some(token) => tokio::select! {
                         biased;
                         _ = token.cancelled() => {
+                            // Terminate exactly like a read failure: one
+                            // error emitted, every subsequent poll None.
+                            parser.finished = true;
                             Some(Err(cancelled_error(attempts)))
                         }
                         read = reads.next() => read,

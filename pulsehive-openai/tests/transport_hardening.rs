@@ -581,7 +581,7 @@ async fn cancel_during_backoff_reports_only_the_attempts_sent() {
 
     let provider = OpenAICompatibleProvider::new(
         OpenAIConfig::new("test-key", "test-model")
-            .with_base_url(&format!("http://{addr}"))
+            .with_base_url(format!("http://{addr}"))
             .with_max_retries(1),
     );
 
@@ -909,12 +909,20 @@ async fn cancel_mid_stream_aborts_the_returned_stream() {
     }
     let elapsed = started.elapsed();
 
+    // Exactly one error — the Cancelled one — and the poll after it was
+    // None (the while-let only ends on a clean end-of-stream).
+    let errors: Vec<_> = items.iter().filter(|item| item.is_err()).collect();
+    assert_eq!(
+        errors.len(),
+        1,
+        "cancellation must emit exactly one error: {items:?}"
+    );
     assert!(
-        items.iter().any(|item| matches!(
-            item,
+        matches!(
+            errors[0],
             Err(PulseHiveError::LlmTransport(err)) if err.kind == LlmErrorKind::Cancelled
-        )),
-        "expected a Cancelled transport error in the stream, got: {items:?}"
+        ),
+        "expected the single error to be Cancelled: {items:?}"
     );
     assert!(
         elapsed.as_millis() < 2500,
