@@ -67,13 +67,34 @@ impl AnthropicConfig {
     /// returns: transport settings only, with no path to the API key.
     pub(crate) fn view(&self) -> AnthropicConfigView {
         AnthropicConfigView {
-            base_url: self.base_url.clone(),
+            base_url: sanitized_base_url(&self.base_url),
             model: self.model.clone(),
             max_tokens: self.max_tokens,
             timeout_secs: self.timeout_secs,
             max_retries: self.max_retries,
             anthropic_version: self.anthropic_version.clone(),
         }
+    }
+}
+
+/// `base_url` with any URL userinfo (`https://user:pass@host`) removed, so a
+/// credential embedded in the endpoint never reaches a log line through the
+/// view or `Debug`. The provider keeps dialing the original URL.
+fn sanitized_base_url(base_url: &str) -> String {
+    let Some(scheme_end) = base_url.find("://") else {
+        return base_url.to_string();
+    };
+    let after = &base_url[scheme_end + 3..];
+    let authority_end = after.find(['/', '?', '#']).unwrap_or(after.len());
+    let (authority, rest) = after.split_at(authority_end);
+    match authority.rfind('@') {
+        Some(at) => format!(
+            "{}{}{}",
+            &base_url[..scheme_end + 3],
+            &authority[at + 1..],
+            rest
+        ),
+        None => base_url.to_string(),
     }
 }
 
@@ -96,13 +117,14 @@ pub struct AnthropicConfigView {
     pub anthropic_version: String,
 }
 
-// The API key is deliberately absent from Debug: a config that reaches a log
-// line or an error report must not leak the credential.
+// The API key is deliberately absent from Debug and base_url renders with
+// its userinfo stripped: a config that reaches a log line or an error report
+// must not leak either credential.
 impl fmt::Debug for AnthropicConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("AnthropicConfig")
             .field("api_key", &"<redacted>")
-            .field("base_url", &self.base_url)
+            .field("base_url", &sanitized_base_url(&self.base_url))
             .field("model", &self.model)
             .field("max_tokens", &self.max_tokens)
             .field("timeout_secs", &self.timeout_secs)
@@ -138,5 +160,33 @@ mod tests {
     fn test_config_with_model() {
         let config = AnthropicConfig::new("sk-test").with_model("claude-opus-4-6");
         assert_eq!(config.model, "claude-opus-4-6");
+    }
+
+    #[test]
+    fn userinfo_in_base_url_is_redacted_from_view_and_debug() {
+        let secret = "supersecret";
+        let config = AnthropicConfig::new("k")
+            .with_base_url(format!("https://user:{secret}@api.example.com"));
+
+        let view = config.view();
+        assert_eq!(view.base_url, "https://api.example.com");
+        assert!(
+            !format!("{view:?}").contains(secret),
+            "view Debug leaked the URL credential: {view:?}"
+        );
+        assert!(
+            !format!("{config:?}").contains(secret),
+            "config Debug leaked the URL credential"
+        );
+
+        // A URL without userinfo passes through untouched.
+        let plain = AnthropicConfig::new("k").with_base_url("http://localhost:9999");
+        assert_eq!(plain.view().base_url, "http://localhost:9999");
+
+        // Transport still dials the original URL, credentials included.
+        assert_eq!(
+            config.messages_url(),
+            format!("https://user:{secret}@api.example.com/v1/messages")
+        );
     }
 }
