@@ -2,7 +2,7 @@
 
 **Status:** Accepted
 **Category:** 8 - Stack
-**Touch Surface:** `Cargo.toml,pulsehive*/src/`
+**Touch Surface:** `Cargo.toml,pulsehive*/src/,pulsehive-py/pyproject.toml,pulsehive-js/package.json`
 **Revisit Trigger:** When requiring unsafe or changing runtime
 
 ## Context
