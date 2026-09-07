@@ -14,7 +14,7 @@ PulseHive is published to crates.io as versioned releases with multiple downstre
 **Rollback Strategy:**
 - **Crates.io versioned releases:** Each version is permanently published
 - **Semantic versioning:** MAJOR.MINOR.PATCH indicates breaking/feature/fix level
-- **Rollback mechanism:** Consumers downgrade to previous published version
+- **Rollback mechanism:** Consumers downgrade to the previous published version. The rollback release unit is the coordinated set of seven crates published together (`pulsehive`, `pulsehive-core`, `pulsehive-runtime`, `pulsehive-openai`, `pulsehive-anthropic`, `pulsehive-py`, `pulsehive-js`); a rollback must use exact matching version constraints (e.g. `=x.y.z`) across the set, and consumers must rely on their own `Cargo.lock` for reproducible resolution. Rollback for the PyPI and npm bindings is not specified here (tracked in #59)
 - **Deprecation policy:** Deprecated features persist for one major version cycle
 
 **Evolution Strategy:**
@@ -24,7 +24,7 @@ PulseHive is published to crates.io as versioned releases with multiple downstre
 - **CHANGELOG.md:** Document all changes per release
 
 **Load-bearing vs Replaceable:**
-- **Load-bearing:** Five primitives, PulseDB boundary, AGPL-3.0 licensing (deliberately fixed)
+- **Load-bearing:** Five primitives, PulseDB boundary, AGPL-3.0-only licensing (open-source option, commercial license available; deliberately fixed)
 - **Replaceable:** Provider implementations, tool implementations, specific algorithms
 
 **Rationale:** Semantic versioning provides clear rollback signals. Permanent publication enables downgrades. Additive evolution respects consumer upgrade cycles.
