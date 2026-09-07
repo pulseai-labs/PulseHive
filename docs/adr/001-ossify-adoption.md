@@ -48,12 +48,12 @@ Adopt ossify 1.0.3 as the development workflow framework, retiring scaffold-dev.
 - AI workspace artifacts maintained (memory-bank, MASTER-SPEC.md)
 
 **Negative:**
-- No ADR directory existed at adoption (created, bones back-derivation skipped)
+- No ADR directory existed at adoption; it was created immediately after, and ADRs 002–010 are that back-derivation of the baseline's nine bones
 - Sprint 1.1 partial completion required explicit handoff to Release 1
 
 ## Implementation
 
-**Adoption Record:** See `/Users/draco/projects/PulseHive/pulsehive-ai/ADOPTION.md`
+**Adoption Record:** The adoption record is summarized by this ADR; the full record lives in the private ossify workspace and is not part of this repository.
 
 **Next Steps:**
 - `/ossify:plan-release` for Release 1 feature mapping
@@ -63,5 +63,4 @@ Adopt ossify 1.0.3 as the development workflow framework, retiring scaffold-dev.
 ## References
 
 - Ossify 1.0.3 adoption ceremony: `/ossify:adopt`
-- Build session protocol: claude-agent-scaffolding-ai-52
 - Baseline SHA: 60503db38514a4a4d5d6e6405a6dc2465dd9744a
