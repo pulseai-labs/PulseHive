@@ -14,7 +14,7 @@ PulseHive is published to crates.io as versioned releases with multiple downstre
 **Rollback Strategy:**
 - **Crates.io versioned releases:** Each version is permanently published
 - **Semantic versioning:** MAJOR.MINOR.PATCH indicates breaking/feature/fix level
-- **Rollback mechanism:** Consumers downgrade to the previous published version. The rollback release unit is the coordinated set of seven crates published together (`pulsehive`, `pulsehive-core`, `pulsehive-runtime`, `pulsehive-openai`, `pulsehive-anthropic`, `pulsehive-py`, `pulsehive-js`); a rollback must use exact matching version constraints (e.g. `=x.y.z`) across the set, and consumers must rely on their own `Cargo.lock` for reproducible resolution. Rollback for the PyPI and npm bindings is not specified here (tracked in #59)
+- **Rollback mechanism:** Consumers downgrade to the previous published version. The rollback release unit is the five crates jointly published to crates.io (`pulsehive`, `pulsehive-core`, `pulsehive-runtime`, `pulsehive-openai`, `pulsehive-anthropic`); a rollback must use exact matching version constraints (e.g. `=x.y.z`) across the five, and consumers must rely on their own `Cargo.lock` for reproducible resolution. The PyPI Python artifact (independently versioned, currently 0.3.0b2) and the npm `@pulsehive/sdk` package are separately versioned binding artifacts; their rollback is not specified here (tracked in #59)
 - **Deprecation policy:** Deprecated features persist for one major version cycle
 
 **Evolution Strategy:**
