@@ -996,7 +996,8 @@ pub struct OpenAIConfig {
     pub api_key: String,
     pub base_url: String,       // Default: "https://api.openai.com/v1"
     pub model: String,
-    pub organization: Option<String>,
+    pub timeout_secs: u64,      // Default: 60
+    pub max_retries: u32,       // Default: 3
 }
 
 impl OpenAICompatibleProvider {
@@ -1015,7 +1016,8 @@ let openai = OpenAICompatibleProvider::new(OpenAIConfig {
     api_key: env::var("OPENAI_API_KEY")?,
     base_url: "https://api.openai.com/v1".into(),
     model: "gpt-4o".into(),
-    organization: None,
+    timeout_secs: 60,
+    max_retries: 3,
 });
 
 // GLM-5
@@ -1023,7 +1025,8 @@ let glm = OpenAICompatibleProvider::new(OpenAIConfig {
     api_key: env::var("GLM_API_KEY")?,
     base_url: "https://open.bigmodel.cn/api/paas/v4".into(),
     model: "glm-5".into(),
-    organization: None,
+    timeout_secs: 60,
+    max_retries: 3,
 });
 
 // Ollama (local)
@@ -1031,7 +1034,8 @@ let ollama = OpenAICompatibleProvider::new(OpenAIConfig {
     api_key: "not-needed".into(),
     base_url: "http://localhost:11434/v1".into(),
     model: "llama3.1".into(),
-    organization: None,
+    timeout_secs: 120,
+    max_retries: 3,
 });
 ```
 
@@ -1048,14 +1052,14 @@ let ollama = OpenAICompatibleProvider::new(OpenAIConfig {
 | Any other 5xx | `ServerError` | never | `status`, verbatim `body` |
 | 2xx whose body fails to read or parse | `Parse` | never | `status`, verbatim `body` |
 | Mid-stream SSE body-read failure (`chat_stream`) | `Timeout` / `Parse` | never — the stream ends after one typed error | `status: 200`, `attempts` |
-| Tool-call `arguments` not a JSON object (an empty/whitespace string is a zero-argument `{}` call) | `MalformedToolCall` | never | raw arguments as `body`, `finish_reason` |
+| Tool-call `arguments` not a JSON object (an empty/whitespace string is a zero-argument `{}` call — unless `finish_reason` is `"length"`, where it was truncated and is malformed) | `MalformedToolCall` | never | raw arguments as `body`, `finish_reason` |
 | `LlmConfig::cancel` token fires | `Cancelled` | never | `attempts` (0 if before the first send) |
 
 `attempts` counts the requests actually sent, the failed one included.
 
 **Per-call overrides.** `LlmConfig::timeout_secs` replaces the client-level deadline for that request only, and `LlmConfig::max_retries` replaces the provider's configured budget for that call (`Some(0)` = exactly one attempt) — both on a single provider instance. A cancelled `LlmConfig::cancel` token aborts the in-flight request, the body read (including reads of a `chat_stream` body already in progress) and every backoff sleep.
 
-**Wire fields.** `reasoning_effort` is sent only when set; `tool_choice` is sent only when set **and** the request carries tools (the APIs reject `tool_choice` without `tools`), mapping to `"auto"` / `"none"` / `"required"` / `{"type":"function","function":{"name":…}}`. With both absent the request body is byte-identical to 2.0.2. On the response, `finish_reason` and `reasoning` (also read from the `reasoning_content` alias several compatible providers use) are surfaced on `LlmResponse`. A tool call whose `arguments` string does not parse as a JSON object is a `MalformedToolCall` error, never a call with `{}` arguments; a legitimate `"{}"` — and the `""` zero-argument spelling used by Ollama, LM Studio and vLLM — still yields `{}`.
+**Wire fields.** `reasoning_effort` is sent only when set; `tool_choice` is sent only when set **and** the request carries tools (the APIs reject `tool_choice` without `tools`), mapping to `"auto"` / `"none"` / `"required"` / `{"type":"function","function":{"name":…}}`. With both absent the request body is byte-identical to 2.0.2. On the response, `finish_reason` and `reasoning` (also read from the `reasoning_content` alias several compatible providers use) are surfaced on `LlmResponse`; a non-string `reasoning`/`reasoning_content` value is ignored as `None` rather than failing the response. A tool call whose `arguments` string does not parse as a JSON object is a `MalformedToolCall` error, never a call with `{}` arguments; a legitimate `"{}"` — and the `""` zero-argument spelling used by Ollama, LM Studio and vLLM — still yields `{}`, except under `finish_reason: "length"` where an empty string means the arguments were cut off before any JSON was emitted.
 
 **Streaming limitation.** `chat_stream` carries neither `reasoning` nor `finish_reason` — only `chat` surfaces them. The stream ends at the `Done` chunk: polling past it yields end-of-stream, so a cancellation after `Done` produces no error.
 
