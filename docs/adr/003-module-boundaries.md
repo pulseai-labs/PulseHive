@@ -15,7 +15,7 @@ PulseHive is organized around five core primitives with strict separation from t
 - **Five primitives hard cap:** HiveMind, Agent, Tool, Lens, Experience
 - **PulseDB strict separation:** PulseHive owns intelligence layer; PulseDB owns storage
 - **Dependency direction:** PulseHive → PulseDB (never reverse)
-- **Primitive homes:** `pulsehive-core` defines the Agent, Tool, and Lens interfaces; `HiveMind` and its builder are defined in `pulsehive-runtime/src/hivemind.rs`; `Experience` is defined by PulseDB and re-exported by `pulsehive-core`
+- **Primitive homes:** `pulsehive-core` defines the Agent and Tool interfaces and the concrete `Lens` value type; `HiveMind` and its builder are defined in `pulsehive-runtime/src/hivemind.rs`; `Experience` is defined by PulseDB and re-exported by `pulsehive-core`
 - **Provider modules:** `pulsehive-anthropic`, `pulsehive-openai` implement LlmProvider trait
 - **Runtime module:** `pulsehive-runtime` implements agentic loop and workflow execution
 

@@ -22,7 +22,7 @@ PulseHive operates in complex distributed systems (LLM providers, substrate) whe
   - relationship detection and insight synthesis log and continue when their substrate queries (`search_similar`, `get_related`) or insight LLM calls fail (`intelligence/`)
 - **Known panic path:** the built-in provider constructors panic via `.expect` if reqwest client construction fails instead of returning `Result` (tracked in #61)
 - **Documented error conditions:** All error variants documented in API docs
-- **Provider failures:** LLM provider errors propagate to consumer
+- **Provider failures:** LLM provider request errors propagate to consumer (constructor client-build failures panic; tracked in #61)
 - **Substrate failures:** PulseDB errors (connection, query) surface through Result types, excepting the best-effort paths above
 
 **What Must Never Fail Silently (intent; the best-effort exceptions above are the known gaps):**
