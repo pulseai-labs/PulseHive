@@ -134,31 +134,28 @@ fn llm_error_display_and_conversion() {
     let with_status = err.clone().with_status(503);
     assert!(with_status.to_string().contains("HTTP 503"));
 
-    // The body renders in Display — truncated when unbounded — so
-    // string-only consumers (agentic loop, bindings) keep the diagnostics.
-    let with_body = err
-        .clone()
-        .with_status(401)
-        .with_body("{\"error\":\"invalid api key\"}");
+    // Display never renders the body: provider bodies can echo prompt
+    // content, tenant or credential data, and to_string() feeds logs and
+    // persisted outcomes. The structured field still carries it verbatim.
+    let secret_body = "{\"error\":\"invalid api key\",\"tenant\":\"acme\"}";
+    let with_body = err.clone().with_status(401).with_body(secret_body);
     let rendered = with_body.to_string();
     assert!(rendered.contains("HTTP 401"), "{rendered}");
     assert!(
-        rendered.contains("{\"error\":\"invalid api key\"}"),
-        "{rendered}"
+        !rendered.contains("invalid api key"),
+        "Display leaked the body: {rendered}"
     );
-
-    let oversized = err.clone().with_body("x".repeat(10_000));
-    let rendered = oversized.to_string();
     assert!(
-        rendered.chars().count() < 1_000,
-        "an unbounded body must be truncated in Display, got {} chars",
-        rendered.chars().count()
+        !rendered.contains("acme"),
+        "Display leaked the body: {rendered}"
     );
-    assert!(rendered.ends_with('…'), "{rendered}");
-    assert_eq!(
-        rendered.matches('x').count(),
-        512,
-        "exactly the first 512 chars render, then the ellipsis"
+    assert_eq!(with_body.body.as_deref(), Some(secret_body));
+
+    // Also true for an oversized body: nothing of it reaches Display.
+    let oversized = err.clone().with_body("x".repeat(10_000));
+    assert!(
+        !oversized.to_string().contains('x'),
+        "Display leaked the body"
     );
 
     let full = LlmError::new(LlmErrorKind::RateLimited, "slow down")

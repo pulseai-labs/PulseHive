@@ -434,7 +434,9 @@ pub struct LlmError {
     /// included. `0` means the call was cancelled before any request was
     /// sent.
     pub attempts: u32,
-    /// Response body, verbatim. The consumer decides what to redact.
+    /// Response body, verbatim. For explicit inspection only — the consumer
+    /// decides what to redact, and it is never rendered by `Display`, so
+    /// logging an error cannot leak provider bodies.
     pub body: Option<String>,
     /// The finish reason that accompanied the failure — set for
     /// [`LlmErrorKind::MalformedToolCall`].
@@ -500,30 +502,11 @@ impl fmt::Display for LlmError {
         if let Some(status) = self.status {
             write!(f, " (HTTP {status})")?;
         }
-        // The body carries the provider's diagnostics (an auth error's
-        // message, a parse failure's payload); render it — truncated, since
-        // it is verbatim and can be arbitrarily large — so string-only
-        // consumers see more than "HTTP 401".
-        if let Some(body) = &self.body {
-            write!(f, " body: {}", display_body(body))?;
-        }
+        // The verbatim body is deliberately NOT rendered here: provider
+        // bodies can echo prompt content, tenant or credential data, and
+        // Display feeds every `%e` / `to_string()` consumer (the agent loop
+        // logs and persists that string). Inspect `body` explicitly instead.
         Ok(())
-    }
-}
-
-/// The most body text [`LlmError`]'s `Display` renders; the rest is cut with
-/// an ellipsis. Char-boundary safe: truncation never splits a UTF-8 sequence.
-const MAX_DISPLAY_BODY_CHARS: usize = 512;
-
-/// `body` capped at [`MAX_DISPLAY_BODY_CHARS`] characters, with an ellipsis
-/// marker when something was cut.
-fn display_body(body: &str) -> String {
-    if body.chars().count() <= MAX_DISPLAY_BODY_CHARS {
-        body.to_string()
-    } else {
-        let mut shown: String = body.chars().take(MAX_DISPLAY_BODY_CHARS).collect();
-        shown.push('…');
-        shown
     }
 }
 
