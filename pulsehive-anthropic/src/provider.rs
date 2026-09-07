@@ -2,6 +2,9 @@
 
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -162,10 +165,34 @@ impl AnthropicProvider {
                 request = request.timeout(Duration::from_secs(timeout_secs));
             }
 
-            // Phase 1 — send. A timeout here fails once and is never
-            // re-sent; any other transport failure (connection refused,
-            // reset, ...) retries within the attempt budget.
-            let response = match self.race_cancel(request.send(), config, attempts).await? {
+            // Phase 1 — send, latched as started and raced against
+            // cancellation. A timeout here fails once and is never re-sent;
+            // any other transport failure (connection refused, reset, ...)
+            // retries within the attempt budget. A cancellation that wins
+            // before the send future was ever polled never sent anything
+            // and reports the previous attempt count (0 on the first
+            // attempt): attempts counts requests actually sent.
+            let started = Arc::new(AtomicBool::new(false));
+            let send = MarkStarted {
+                future: Box::pin(request.send()),
+                started: Arc::clone(&started),
+            };
+            let response = match config.cancel.as_ref() {
+                Some(token) => tokio::select! {
+                    biased;
+                    _ = token.cancelled() => {
+                        let sent = if started.load(Ordering::Relaxed) {
+                            attempts
+                        } else {
+                            attempts - 1
+                        };
+                        return Err(Self::cancelled_error(sent));
+                    }
+                    response = send => response,
+                },
+                None => send.await,
+            };
+            let response = match response {
                 Ok(response) => response,
                 Err(e) if e.is_timeout() => return Err(Self::timeout_error(&e, attempts)),
                 // A builder error (malformed base_url, an api_key that
@@ -382,6 +409,25 @@ fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
     Some(Duration::from_secs(secs))
 }
 
+/// A future that latches whether it has been polled, so a cancellation
+/// racing it can distinguish "never started" from "in flight": `attempts`
+/// counts requests actually sent, and a cancellation observed before the
+/// send future's first poll never sent anything.
+struct MarkStarted<F> {
+    future: Pin<Box<F>>,
+    started: Arc<AtomicBool>,
+}
+
+impl<F: Future> Future for MarkStarted<F> {
+    type Output = F::Output;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<F::Output> {
+        let this = self.get_mut();
+        this.started.store(true, Ordering::Relaxed);
+        this.future.as_mut().poll(cx)
+    }
+}
+
 #[async_trait]
 impl LlmProvider for AnthropicProvider {
     async fn chat(
@@ -511,6 +557,29 @@ mod tests {
     fn test_provider_is_send_sync() {
         fn _assert_send_sync<T: Send + Sync>() {}
         _assert_send_sync::<AnthropicProvider>();
+    }
+
+    #[tokio::test]
+    async fn test_mark_started_latches_on_first_poll() {
+        let started = Arc::new(AtomicBool::new(false));
+        let mut future = std::pin::pin!(MarkStarted {
+            future: Box::pin(std::future::pending::<()>()),
+            started: Arc::clone(&started),
+        });
+        assert!(
+            !started.load(Ordering::Relaxed),
+            "not started before the first poll"
+        );
+
+        // One poll of the wrapper polls the inner future; a pending result
+        // still counts as started.
+        let first =
+            std::future::poll_fn(|cx| std::task::Poll::Ready(future.as_mut().poll(cx))).await;
+        assert!(first.is_pending());
+        assert!(
+            started.load(Ordering::Relaxed),
+            "started once the future has been polled"
+        );
     }
 
     #[tokio::test]

@@ -1,7 +1,11 @@
 //! OpenAI-compatible LLM provider implementation.
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -204,12 +208,26 @@ impl OpenAICompatibleProvider {
                 builder = builder.timeout(Duration::from_secs(secs));
             }
 
-            let send = builder.send();
+            // The send future is latched as started so a cancellation that
+            // wins before it was ever polled reports the previous attempt
+            // count: attempts counts requests actually sent.
+            let started = Arc::new(AtomicBool::new(false));
+            let send = MarkStarted {
+                future: Box::pin(builder.send()),
+                started: Arc::clone(&started),
+            };
             let response = match cancel {
                 Some(token) => tokio::select! {
                     // Dropping the send future is what aborts the connection.
                     biased;
-                    _ = token.cancelled() => return Err(cancelled_error(attempt)),
+                    _ = token.cancelled() => {
+                        let sent = if started.load(Ordering::Relaxed) {
+                            attempt
+                        } else {
+                            attempt - 1
+                        };
+                        return Err(cancelled_error(sent));
+                    }
                     response = send => response,
                 },
                 None => send.await,
@@ -381,6 +399,25 @@ fn cancelled_error(attempts: u32) -> PulseHiveError {
     )
 }
 
+/// A future that latches whether it has been polled, so a cancellation
+/// racing it can distinguish "never started" from "in flight": `attempts`
+/// counts requests actually sent, and a cancellation observed before the
+/// send future's first poll never sent anything.
+struct MarkStarted<F> {
+    future: Pin<Box<F>>,
+    started: Arc<AtomicBool>,
+}
+
+impl<F: Future> Future for MarkStarted<F> {
+    type Output = F::Output;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<F::Output> {
+        let this = self.get_mut();
+        this.started.store(true, Ordering::Relaxed);
+        this.future.as_mut().poll(cx)
+    }
+}
+
 #[async_trait]
 impl LlmProvider for OpenAICompatibleProvider {
     async fn chat(
@@ -457,15 +494,19 @@ impl LlmProvider for OpenAICompatibleProvider {
             .bytes_stream()
             .map(move |read| read.map_err(|e| stream_body_error(&e, status, attempts)));
 
-        // Race each body read against the cancellation token. A read failure
-        // (cancellation included) yields exactly one typed error and then
-        // ends the stream — the underlying body is sticky after an error and
-        // would re-report it on every poll — while a body that ends cleanly
-        // ends the stream the same way.
-        let raced = futures::stream::unfold(
-            (reads, cancel, false),
-            move |(mut reads, cancel, done)| async move {
-                if done {
+        // A terminating adapter over the raced body reads. The parser state
+        // lives inside the unfold, so termination is decided BEFORE any body
+        // read is polled: once the parser has emitted Done, the next poll
+        // ends the stream outright and a stalled body (or a later
+        // cancellation) can neither delay termination nor fabricate an
+        // error. A read failure yields exactly one typed error — the
+        // underlying body is sticky after an error and would re-report it
+        // on every poll — and a body that ends without a [DONE] marker
+        // still ends the stream cleanly.
+        let stream = futures::stream::unfold(
+            (reads, cancel, SseParseState::new()),
+            move |(mut reads, cancel, mut parser)| async move {
+                if parser.finished {
                     return None;
                 }
                 let next = match cancel.as_ref() {
@@ -482,32 +523,21 @@ impl LlmProvider for OpenAICompatibleProvider {
                     Some(read) => read,
                     None => return None,
                 };
-                let done = read.is_err();
-                Some((read, (reads, cancel, done)))
-            },
-        );
-
-        let stream = raced
-            .scan(SseParseState::new(), |state, read| {
-                // Once the parser has emitted the terminal Done chunk the
-                // stream ends: a consumer polling past Done gets a clean
-                // end-of-stream instead of more body-read races, so a
-                // cancellation after Done cannot fabricate an error.
-                if state.finished {
-                    return futures::future::ready(None);
-                }
                 let chunks = match read {
                     Ok(bytes) => {
-                        state.buffer.extend_from_slice(&bytes);
-                        state.emit_chunks()
+                        parser.buffer.extend_from_slice(&bytes);
+                        parser.emit_chunks()
                     }
-                    Err(e) => vec![Err(e)],
+                    Err(e) => {
+                        parser.finished = true;
+                        vec![Err(e)]
+                    }
                 };
-                // Return Some to keep scanning, None would stop
-                futures::future::ready(Some(chunks))
-            })
-            .flat_map(futures::stream::iter)
-            .boxed();
+                Some((chunks, (reads, cancel, parser)))
+            },
+        )
+        .flat_map(futures::stream::iter)
+        .boxed();
 
         Ok(stream)
     }
@@ -683,6 +713,29 @@ mod tests {
     fn test_provider_construction() {
         let config = OpenAIConfig::new("sk-test", "gpt-4");
         let _provider = OpenAICompatibleProvider::new(config);
+    }
+
+    #[tokio::test]
+    async fn test_mark_started_latches_on_first_poll() {
+        let started = Arc::new(AtomicBool::new(false));
+        let mut future = std::pin::pin!(MarkStarted {
+            future: Box::pin(std::future::pending::<()>()),
+            started: Arc::clone(&started),
+        });
+        assert!(
+            !started.load(Ordering::Relaxed),
+            "not started before the first poll"
+        );
+
+        // One poll of the wrapper polls the inner future; a pending result
+        // still counts as started.
+        let first =
+            std::future::poll_fn(|cx| std::task::Poll::Ready(future.as_mut().poll(cx))).await;
+        assert!(first.is_pending());
+        assert!(
+            started.load(Ordering::Relaxed),
+            "started once the future has been polled"
+        );
     }
 
     #[test]

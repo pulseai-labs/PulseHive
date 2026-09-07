@@ -567,6 +567,44 @@ async fn malformed_base_url_fails_fast_without_retrying() {
     );
 }
 
+// ── 2d. Cancellation keeps attempt accounting honest (H03) ──────────
+
+#[tokio::test]
+async fn cancel_during_backoff_reports_only_the_attempts_sent() {
+    // Attempt 1 fails fast against a refused port; the token fires during
+    // the 1s backoff sleep. Exactly one request was sent, so the Cancelled
+    // error must report attempts == 1 — never the un-attempted retry. (A
+    // token cancelled before the first send reports 0; pinned by test 8.)
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback listener");
+    let addr = listener.local_addr().expect("read listener address");
+    drop(listener);
+
+    let provider = OpenAICompatibleProvider::new(
+        OpenAIConfig::new("test-key", "test-model")
+            .with_base_url(&format!("http://{addr}"))
+            .with_max_retries(1),
+    );
+
+    let token = CancellationToken::new();
+    let canceller = token.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        canceller.cancel();
+    });
+
+    let result = provider
+        .chat(
+            vec![Message::user("hi")],
+            vec![],
+            &LlmConfig::new("openai", "test-model").with_cancel(token),
+        )
+        .await;
+
+    let err = transport_error(result);
+    assert_eq!(err.kind, LlmErrorKind::Cancelled);
+    assert_eq!(err.attempts, 1, "one request was sent, the retry was not");
+}
+
 // ── 3. Per-call timeout override shortens a long client timeout ─────
 
 #[tokio::test]
@@ -984,6 +1022,62 @@ async fn stream_ends_after_done_and_cancel_after_done_is_clean() {
     token.cancel();
     let next = futures::StreamExt::next(&mut stream).await;
     assert!(next.is_none(), "stream must end after Done, got: {next:?}");
+    fixture.next_body();
+}
+
+// ── 8d. Termination after Done is not delayed by a stalled body (H02) ─
+
+#[tokio::test]
+async fn stream_terminates_promptly_after_done_on_a_stalled_body() {
+    // [DONE] arrives while the connection stalls mid-body, with NO cancel
+    // token anywhere: the poll after Done must end the stream promptly,
+    // not wait out the stalled body or the client deadline.
+    let sse = "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\ndata: [DONE]\n\n";
+    let fixture = Fixture::spawn(vec![respond_body_then_stall(
+        200,
+        "OK",
+        sse.len() + 256,
+        sse,
+    )]);
+    let provider = OpenAICompatibleProvider::new(
+        OpenAIConfig::new("test-key", "test-model")
+            .with_base_url(&fixture.base_url)
+            .with_timeout(30),
+    );
+
+    let stream = provider
+        .chat_stream(
+            vec![Message::user("hi")],
+            vec![],
+            &LlmConfig::new("openai", "test-model"),
+        )
+        .await
+        .expect("headers arrive, so the stream is handed out");
+
+    let started = std::time::Instant::now();
+    let mut stream = stream;
+    let mut saw_done = false;
+    while let Some(item) = futures::StreamExt::next(&mut stream).await {
+        match item {
+            Ok(LlmChunk::Text(_)) => {}
+            Ok(LlmChunk::Done) => saw_done = true,
+            other => panic!("unexpected chunk before Done: {other:?}"),
+        }
+        if saw_done {
+            break;
+        }
+    }
+    assert!(saw_done, "the fixture must deliver a Done chunk");
+
+    let after_done = std::time::Instant::now();
+    let next = futures::StreamExt::next(&mut stream).await;
+    let promptness = after_done.elapsed();
+    assert!(next.is_none(), "stream must end after Done, got: {next:?}");
+    assert!(
+        promptness.as_millis() < 2500,
+        "termination after Done must not wait out the stalled body, took {promptness:?}"
+    );
+    assert!(started.elapsed().as_millis() < 2500);
     fixture.next_body();
 }
 
