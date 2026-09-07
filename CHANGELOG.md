@@ -36,7 +36,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`pulsehive-anthropic`: `tool_choice` is mapped to Anthropic's wire shapes** — `Auto` → `{"type":"auto"}`, `Required` → `{"type":"any"}`, `Function { name }` → `{"type":"tool","name":…}`, `None` → `{"type":"none"}`, sent only when `LlmConfig::tool_choice` is set; the request body is unchanged when it is not.
 - **`pulsehive-anthropic`: `reasoning_effort` is accepted and ignored** — the field is never sent on the wire (no `reasoning_effort` and no `thinking` parameter); mapping it to Anthropic extended thinking is a recorded feature-map entry, not provider parity.
 - **`pulsehive-anthropic`: `config()` accessor** — `AnthropicProvider::config()` returns the provider's `AnthropicConfig`.
-- **`pulsehive-anthropic`: new hermetic fixture suite** `tests/transport_hardening.rs` — thirteen loopback-only `TcpListener` tests pinning the kind table, retries, overrides, cancellation, wire mapping and `config()`; `tokio-util` becomes a dev-dependency of the crate for constructing cancellation tokens in tests.
+- **`pulsehive-anthropic`: new hermetic fixture suite** `tests/transport_hardening.rs` — sixteen loopback-only `TcpListener` tests pinning the kind table, retries, overrides, cancellation, wire mapping and `config()`; `tokio-util` becomes a dev-dependency of the crate for constructing cancellation tokens in tests.
 
 ## [2.0.2] - 2026-07-01
 

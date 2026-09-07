@@ -617,7 +617,7 @@ async fn cancel_token_aborts_in_flight_request() {
     assert_eq!(requests_seen(&rx, 200).len(), 1);
 }
 
-// ── 14. Success status, body dropped mid-stream => Parse, no retry ────
+// ── 13. Success status, body dropped mid-stream => Parse, no retry ────
 
 #[tokio::test]
 async fn success_body_dropped_mid_stream_is_parse_error() {
@@ -644,7 +644,7 @@ async fn success_body_dropped_mid_stream_is_parse_error() {
     assert_eq!(requests_seen(&rx, 200).len(), 1);
 }
 
-// ── 15. Success status, body stalls past the timeout => Timeout, no retry ─
+// ── 14. Success status, body stalls past the timeout => Timeout, no retry ─
 
 #[tokio::test]
 async fn success_body_stall_past_timeout_is_timeout_not_retried() {
@@ -671,7 +671,7 @@ async fn success_body_stall_past_timeout_is_timeout_not_retried() {
     assert_eq!(requests_seen(&rx, 200).len(), 1);
 }
 
-// ── 16. Error status, body dropped mid-stream => Connect, retried ─────
+// ── 15. Error status, body dropped mid-stream => Connect, retried ─────
 
 #[tokio::test]
 async fn error_body_dropped_mid_stream_is_connect_and_retries() {
@@ -701,7 +701,7 @@ async fn error_body_dropped_mid_stream_is_connect_and_retries() {
     assert_eq!(requests_seen(&rx, 200).len(), 2);
 }
 
-// ── 13. config() returns the provider's configuration (E7) ────────────
+// ── 16. config() returns the provider's configuration (E7) ────────────
 
 #[tokio::test]
 async fn config_accessor_returns_the_provider_config() {
