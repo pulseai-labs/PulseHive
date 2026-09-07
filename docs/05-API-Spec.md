@@ -948,7 +948,7 @@ immediately without retrying or sending anything:
 | HTTP 429 | `RateLimited` | yes; integer-seconds `Retry-After` wins over backoff, capped at the 16s backoff ceiling | `status: 429`, raw `body`, `retry_after` (the raw header value) |
 | HTTP 500 / 502 / 503 | `ServerError` | yes, same backoff — `Retry-After` is not honoured | `status`, raw `body` |
 | HTTP 529 | `ServerError` | yes; `Retry-After` honoured like 429 | `status`, raw `body`, `retry_after` |
-| Other 4xx | `ClientError` | never | `status`, raw `body`, the Anthropic error envelope's `error.message` when it parses |
+| Any other non-5xx status (4xx, or a terminal 3xx) | `ClientError` | never | `status`, raw `body` (structured only — the envelope's `error.message` renders in the displayed message when it parses; an unparseable body does not) |
 | Other 5xx | `ServerError` | never | `status`, raw `body` |
 | Success status, unparseable body | `Parse` | never | `status: 200`, raw `body` |
 | `tool_use` block whose `input` is not a JSON object | `MalformedToolCall` | never | `status: 200`, the input's JSON text as `body`, the response's `stop_reason` |
@@ -1048,7 +1048,7 @@ let ollama = OpenAICompatibleProvider::new(OpenAIConfig {
 | Request could not be built (malformed `base_url`) | — (`PulseHiveError::Llm(String)`) | never — fails before anything is sent | — |
 | HTTP 429 / 529 | `RateLimited` / `ServerError` | yes; waits `Retry-After` when present (capped at the 8s backoff ceiling), else backoff | `status`, verbatim `body`, `retry_after` (the raw header value) |
 | HTTP 500 / 502 / 503 | `ServerError` | yes, same backoff — `Retry-After` is not honored | `status`, verbatim `body` |
-| Any other 4xx | `ClientError` | never | `status`, verbatim `body` |
+| Any other 4xx, or a terminal 3xx (a 304 / redirect without usable `Location`) | `ClientError` | never | `status`, verbatim `body` |
 | Any other 5xx | `ServerError` | never | `status`, verbatim `body` |
 | 2xx whose body fails to read or parse | `Parse` | never | `status`, verbatim `body` |
 | Mid-stream SSE body-read failure (`chat_stream`) | `Timeout` / `Parse` | never — the stream ends after one typed error | `status: 200`, `attempts` |

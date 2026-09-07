@@ -345,8 +345,15 @@ impl OpenAICompatibleProvider {
                 LlmErrorKind::ServerError
             } else if status.is_client_error() {
                 LlmErrorKind::ClientError
-            } else {
+            } else if status.is_server_error() {
                 LlmErrorKind::ServerError
+            } else {
+                // The non-4xx/non-5xx remainder — a terminal 3xx such as a
+                // 304 or a redirect without a usable Location — is a
+                // client-side response problem: ServerError is publicly
+                // defined as a provider 5xx, and callers would apply
+                // server-outage fallback logic to it.
+                LlmErrorKind::ClientError
             };
 
             let mut err = LlmError::new(kind, format!("HTTP {status}"))

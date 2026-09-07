@@ -814,6 +814,40 @@ async fn client_error_is_immediate_and_carries_body() {
     fixture.assert_no_more_requests();
 }
 
+// ── 5b. A terminal 3xx is a client-side error, not ServerError (Y03) ─
+
+#[tokio::test]
+async fn terminal_3xx_is_client_error_not_server_error() {
+    // A 304 (or any redirect that surfaced without a usable Location) is
+    // an endpoint/client-side response problem: ServerError is defined as
+    // a provider 5xx, and callers would apply server-outage fallback
+    // logic to it.
+    let fixture = Fixture::spawn(vec![
+        respond_status(304, "Not Modified", ""),
+        // Spare step: keeps the fixture alive for the no-more-requests
+        // assertion and records any unexpected retry.
+        respond_ok(minimal_completion()),
+    ]);
+    let provider = fixture.provider();
+
+    let result = provider
+        .chat(
+            vec![Message::user("hi")],
+            vec![],
+            &LlmConfig::new("openai", "test-model"),
+        )
+        .await;
+
+    let err = transport_error(result);
+    assert_eq!(err.kind, LlmErrorKind::ClientError);
+    assert_eq!(err.status, Some(304));
+    assert_eq!(err.attempts, 1, "a 3xx must not be retried");
+    assert_eq!(err.body.as_deref(), Some(""));
+
+    fixture.next_body();
+    fixture.assert_no_more_requests();
+}
+
 // ── 6. Unparseable success body is a typed Parse error ──────────────
 
 #[tokio::test]
