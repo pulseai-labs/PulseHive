@@ -17,7 +17,7 @@ PulseHive is a Rust library with specific technology choices that enable its des
 - **Key frameworks:** pulsehive-db 0.5, serde, tokio
 - **Storage:** PulseDB (HNSW vector search, knowledge graph, watch system)
 - **Build tooling:** Cargo, workspace structure
-- **Test tooling:** cargo test, cargo doc (doc-tests)
+- **Test tooling:** cargo test (including doc-tests), cargo doc (documentation checks)
 
 **Code Quality Constraints:**
 - **Unsafe-free library crates (intent):** Library crates are to stay free of `unsafe` code; `pulsehive-py`'s `unsafe impl Send`/`Sync` for its Python tool bridge is the known binding exception. No crate currently carries `#![forbid(unsafe_code)]`, so this is recorded as intent — lint enforcement is tracked in #55

@@ -16,7 +16,7 @@ PulseHive is published as a library crate with multiple downstream consumers.
 - **Breaking change policy:** Breaking changes batched into next major version
 - **Additive evolution:** Minor releases never break consumers (v2.1.0 exception: `HiveEvent` variants were added under `#[non_exhaustive]` without a major bump — see Event contracts below)
 - **License:** AGPL-3.0-only (open-source option), commercial license available
-- **Documentation guarantees:** Public APIs documented with compiling doc-tests
+- **Documentation guarantees:** Public APIs are documented and `cargo doc` checks the documentation builds; public examples are currently marked `rust,ignore`, so doc-tests do not compile them (wiring examples into compiled doc-tests is tracked in #58)
 
 **Compatibility:**
 - **Trait contracts:** Every public trait in PulseHive's published crates is a stable interface: `LlmProvider`, `EmbeddingProvider`, `EventExporter`, `Tool`, `StreamingTool`, `ApprovalHandler`, and `ExperienceExtractor`, all defined in `pulsehive-core` (the only crate defining public traits)
