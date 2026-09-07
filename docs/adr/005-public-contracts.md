@@ -2,7 +2,7 @@
 
 **Status:** Accepted
 **Category:** 4 - Public contracts & compatibility policy
-**Touch Surface:** `pulsehive-*/src/`
+**Touch Surface:** `pulsehive*/src/`
 **Revisit Trigger:** When breaking changes needed
 
 ## Context

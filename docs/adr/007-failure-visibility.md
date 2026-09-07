@@ -2,7 +2,7 @@
 
 **Status:** Accepted
 **Category:** 6 - Failure visibility
-**Touch Surface:** `pulsehive-*/src/`
+**Touch Surface:** `pulsehive*/src/`
 **Revisit Trigger:** When introducing panic paths or silent error swallowing
 
 ## Context

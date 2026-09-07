@@ -2,7 +2,7 @@
 
 **Status:** Accepted
 **Category:** 1 - System shape & deployment topology
-**Touch Surface:** `pulsehive-*/src/`
+**Touch Surface:** `pulsehive*/src/`
 **Revisit Trigger:** When spawning separate runtime processes
 
 ## Context

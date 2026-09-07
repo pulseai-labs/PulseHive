@@ -2,7 +2,7 @@
 
 **Status:** Accepted
 **Category:** 2 - Module boundaries & dependency direction
-**Touch Surface:** `pulsehive-core/src/`
+**Touch Surface:** `pulsehive/src/,pulsehive-core/src/,pulsehive-runtime/src/,pulsehive-openai/src/,pulsehive-anthropic/src/,pulsehive-py/src/,pulsehive-js/src/`
 **Revisit Trigger:** When adding sixth primitive or blurring PulseDB boundary
 
 ## Context
