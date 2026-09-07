@@ -1,0 +1,66 @@
+# ADR 001: Ossify Adoption
+
+**Status:** Accepted
+**Date:** 2026-08-23
+**Context:** Adoption ceremony from scaffold-dev to ossify 1.0.3
+
+## Context
+
+PulseHive was developed using the scaffold-dev workflow (sprint → slice → work-item loop). As the project matured beyond v2.0.2 with multiple slices planned for v2.1.0, the need arose for:
+- Formal architectural decision tracking (bones registry)
+- Release-level planning with exit criteria
+- Ceremony-driven development with fail-closed gates
+- Retrospective recording and harvest discipline
+
+## Decision
+
+Adopt ossify 1.0.3 as the development workflow framework, retiring scaffold-dev.
+
+### Adoption Details
+
+**Baseline:** Release 0, closed retroactively at SHA 60503db
+- v2.0.2 shipped: five primitives, agentic loop, intelligence layer, providers, bindings
+- VS-1.1.1 shipped: streaming tool execution + ToolProgress events
+
+**Transition:**
+- Sprint 1.1 closed at 1/4 completion (VS-1.1.1 merged via PR #44)
+- Remaining slices (VS-1.1.2/1.1.3/1.1.4) handed to Release 1 for planning
+- scaffold-dev ceremonies retired
+- ossify ceremonies activated (`/ossify:*` slash commands in the ossify workspace, not repository files)
+
+**Rationale:**
+- Ossify provides ADR-backed bones (nine categories with touch surfaces)
+- Release planning with feature mapping and exit criteria
+- Fail-closed gates at every ceremony (adoption, planning, execution, close)
+- Retrospective discipline with harvest → known-issues/decisions-log
+
+### Consequences
+
+**Positive:**
+- Structured release planning with the ossify workspace's plan-release ceremony
+- Architectural decisions tracked as bones with touch glob triggers
+- Demo-ledger discipline (seed candidates recorded, exercised at spine close)
+- State-driven workflow (project-state.json as source of truth)
+
+**Neutral:**
+- Learning curve for ossify ceremonies
+- Legacy scaffold-dev stack preserved but inactive
+- AI workspace artifacts maintained (memory-bank, MASTER-SPEC.md)
+
+**Negative:**
+- No ADR directory existed at adoption; it was created immediately after, and ADRs 002–010 are that back-derivation of the baseline's nine bones
+- Sprint 1.1 partial completion required explicit handoff to Release 1
+
+## Implementation
+
+**Adoption Record:** The adoption record is summarized by this ADR; the full record lives in the private ossify workspace and is not part of this repository.
+
+**Next Steps:**
+- Release 1 feature mapping via the ossify workspace's plan-release ceremony
+- Plan first spine with VS-1.1.2 (cancellation infrastructure)
+- Author bones forward starting with Release 1
+
+## References
+
+- Ossify 1.0.3 adoption ceremony: `/ossify:adopt` (ossify-workspace slash command, not a repository file)
+- Baseline SHA: 60503db38514a4a4d5d6e6405a6dc2465dd9744a
