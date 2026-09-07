@@ -2,7 +2,7 @@
 
 **Status:** Accepted
 **Category:** 8 - Stack
-**Touch Surface:** `Cargo.toml,pulsehive-core/src/lib.rs`
+**Touch Surface:** `Cargo.toml,pulsehive*/src/`
 **Revisit Trigger:** When requiring unsafe or changing runtime
 
 ## Context

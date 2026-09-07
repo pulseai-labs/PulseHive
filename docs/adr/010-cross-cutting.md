@@ -2,7 +2,7 @@
 
 **Status:** Accepted
 **Category:** 9 - Cross-cutting constraints
-**Touch Surface:** `pulsehive-core/src/`
+**Touch Surface:** `pulsehive*/src/`
 **Revisit Trigger:** When considering sixth primitive or license change
 
 ## Context
