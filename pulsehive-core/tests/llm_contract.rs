@@ -134,6 +134,33 @@ fn llm_error_display_and_conversion() {
     let with_status = err.clone().with_status(503);
     assert!(with_status.to_string().contains("HTTP 503"));
 
+    // The body renders in Display — truncated when unbounded — so
+    // string-only consumers (agentic loop, bindings) keep the diagnostics.
+    let with_body = err
+        .clone()
+        .with_status(401)
+        .with_body("{\"error\":\"invalid api key\"}");
+    let rendered = with_body.to_string();
+    assert!(rendered.contains("HTTP 401"), "{rendered}");
+    assert!(
+        rendered.contains("{\"error\":\"invalid api key\"}"),
+        "{rendered}"
+    );
+
+    let oversized = err.clone().with_body("x".repeat(10_000));
+    let rendered = oversized.to_string();
+    assert!(
+        rendered.chars().count() < 1_000,
+        "an unbounded body must be truncated in Display, got {} chars",
+        rendered.chars().count()
+    );
+    assert!(rendered.ends_with('…'), "{rendered}");
+    assert_eq!(
+        rendered.matches('x').count(),
+        512,
+        "exactly the first 512 chars render, then the ellipsis"
+    );
+
     let full = LlmError::new(LlmErrorKind::RateLimited, "slow down")
         .with_attempts(3)
         .with_body("{\"error\":\"rate\"}")
