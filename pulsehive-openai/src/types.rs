@@ -140,14 +140,28 @@ pub(crate) struct ChatChoice {
 pub(crate) struct ChatMessage {
     pub content: Option<String>,
     pub tool_calls: Option<Vec<OpenAIToolCall>>,
-    /// Reasoning trace, under OpenAI's `reasoning` key or the
-    /// `reasoning_content` spelling several compatible providers use.
-    #[serde(
-        default,
-        alias = "reasoning_content",
-        deserialize_with = "deserialize_reasoning"
-    )]
+    /// Reasoning trace, under OpenAI's `reasoning` key.
+    #[serde(default, deserialize_with = "deserialize_reasoning")]
     pub reasoning: Option<String>,
+    /// The same trace under the `reasoning_content` spelling several
+    /// compatible providers use. Captured separately rather than as a serde
+    /// alias: when a response carries BOTH keys — commonly with one of them
+    /// null — serde's alias rejects it as a duplicate field. Merged into
+    /// `reasoning` by [`ChatMessage::reasoning_trace`] with `reasoning`
+    /// preferred.
+    #[serde(default, deserialize_with = "deserialize_reasoning")]
+    pub reasoning_content: Option<String>,
+}
+
+impl ChatMessage {
+    /// The message's reasoning trace with deterministic precedence: the
+    /// `reasoning` spelling when it carries a string, else
+    /// `reasoning_content` when it does.
+    pub(crate) fn reasoning_trace(&self) -> Option<&str> {
+        self.reasoning
+            .as_deref()
+            .or(self.reasoning_content.as_deref())
+    }
 }
 
 /// Deserializes a reasoning field permissively: a string populates it, any
@@ -249,6 +263,7 @@ impl ChatCompletionResponse {
                     message,
                     finish_reason,
                 } = c;
+                let reasoning = message.reasoning_trace().map(str::to_string);
                 let mut tool_calls = Vec::new();
                 for tc in message.tool_calls.unwrap_or_default() {
                     let arguments =
@@ -259,12 +274,7 @@ impl ChatCompletionResponse {
                         arguments,
                     });
                 }
-                (
-                    message.content,
-                    tool_calls,
-                    message.reasoning,
-                    finish_reason,
-                )
+                (message.content, tool_calls, reasoning, finish_reason)
             }
             None => (None, vec![], None, None),
         };
@@ -548,6 +558,64 @@ mod tests {
             let llm = response.into_llm_response(1).unwrap();
             assert_eq!(llm.reasoning.as_deref(), Some("thinking"), "key: {key}");
             assert_eq!(llm.finish_reason.as_deref(), Some("length"), "key: {key}");
+        }
+    }
+
+    #[test]
+    fn test_both_reasoning_spellings_coexist_with_deterministic_precedence() {
+        // Precedence: the `reasoning` spelling wins whenever it carries a
+        // string; otherwise `reasoning_content` when it does. Responses
+        // carrying both keys (one commonly null) must parse — serde's alias
+        // would have rejected them as a duplicate field.
+        let cases: Vec<(&str, &str, Option<&str>)> = vec![
+            // (reasoning, reasoning_content, expected)
+            ("\"via reasoning\"", "null", Some("via reasoning")),
+            (
+                "null",
+                "\"via reasoning_content\"",
+                Some("via reasoning_content"),
+            ),
+            (
+                "\"primary\"",
+                "\"secondary\"",
+                Some("primary"), // both non-null: reasoning wins
+            ),
+            (
+                "{\"summary\":[\"structured\"]}",
+                "\"fallback string\"",
+                Some("fallback string"), // reasoning is a non-string: ignored
+            ),
+            (
+                "\"primary string\"",
+                "[\"steps\"]",
+                Some("primary string"), // reasoning_content is a non-string
+            ),
+            ("null", "null", None),
+        ];
+        for (reasoning, reasoning_content, expected) in cases {
+            let json = format!(
+                r#"{{
+                    "id": "chatcmpl-abc",
+                    "choices": [{{
+                        "message": {{
+                            "content": "ok",
+                            "reasoning": {reasoning},
+                            "reasoning_content": {reasoning_content},
+                            "tool_calls": null
+                        }},
+                        "finish_reason": "stop"
+                    }}],
+                    "usage": {{"prompt_tokens": 1, "completion_tokens": 1}}
+                }}"#
+            );
+            let response: ChatCompletionResponse = serde_json::from_str(&json)
+                .unwrap_or_else(|e| panic!("both-key response must parse: {e}"));
+            let llm = response.into_llm_response(1).unwrap();
+            assert_eq!(
+                llm.reasoning.as_deref(),
+                expected,
+                "reasoning {reasoning} / reasoning_content {reasoning_content}"
+            );
         }
     }
 
