@@ -13,7 +13,7 @@ PulseHive operates in complex distributed systems (LLM providers, substrate) whe
 
 **Failure Visibility:**
 - **Result types:** Public APIs return `Result<T, E>` for fallible operations
-- **No silent failures, with documented best-effort exceptions:** Most failures surface through `Result`, but known paths are best-effort today: `HiveMind::deploy` only logs a failed Watch subscription, and `record_experience` logs and continues after an embedding failure and silently ignores `get_experience` errors (`pulsehive-runtime/src/hivemind.rs`); error propagation for these paths is tracked in #57
+- **No silent failures, with documented best-effort exceptions:** Most failures surface through `Result`, but known paths are best-effort today: `HiveMind::deploy` only logs a failed Watch subscription; `record_experience` logs and continues after an embedding failure, silently ignores `get_experience` errors, and logs-and-continues after `store_relation` and `store_insight` failures; and the event stream drops events with a warning when a subscriber lags (`pulsehive-runtime/src/hivemind.rs`); error propagation for these paths is tracked in #57
 - **Documented error conditions:** All error variants documented in API docs
 - **Provider failures:** LLM provider errors propagate to consumer
 - **Substrate failures:** PulseDB errors (connection, query) surface through Result types, excepting the best-effort paths above
@@ -39,5 +39,5 @@ PulseHive operates in complex distributed systems (LLM providers, substrate) whe
 - Some operations become fallible that could be infallible in theory
 
 **Negative:**
-- Deploy-time Watch subscription and record_experience embedding/get_experience failures are currently log-only or silent (propagation tracked in #57)
+- The best-effort paths above (Watch subscription, embedding, `get_experience`, `store_relation`, `store_insight`, lagged event delivery) are currently log-only or silent (propagation tracked in #57)
 - Error propagation requires careful consumer design
