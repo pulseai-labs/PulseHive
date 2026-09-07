@@ -2,7 +2,7 @@
 
 **Status:** Accepted
 **Category:** 5 - Trust boundaries & destructive operations
-**Touch Surface:** `pulsehive-core/src/,pulsehive-runtime/src/,pulsehive-anthropic/src/,pulsehive-openai/src/`
+**Touch Surface:** `pulsehive-core/src/,pulsehive-runtime/src/,pulsehive-anthropic/src/,pulsehive-openai/src/,pulsehive-py/src/,pulsehive-js/src/`
 **Revisit Trigger:** When adding provider with different trust model
 
 ## Context

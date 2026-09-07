@@ -2,7 +2,7 @@
 
 **Status:** Accepted
 **Category:** 9 - Cross-cutting constraints
-**Touch Surface:** `pulsehive*/src/`
+**Touch Surface:** `Cargo.toml,LICENSE,LICENSING.md,pulsehive-py/pyproject.toml,pulsehive-js/package.json,pulsehive*/src/`
 **Revisit Trigger:** When considering sixth primitive or license change
 
 ## Context
