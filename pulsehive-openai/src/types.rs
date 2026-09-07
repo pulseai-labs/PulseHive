@@ -268,9 +268,11 @@ impl ChatCompletionResponse {
 
 /// Parses one tool call's `arguments` string, requiring a JSON object.
 ///
-/// Anything else — a parse error, an empty string, a non-object value — is a
-/// typed [`LlmErrorKind::MalformedToolCall`] carrying the raw arguments as the
-/// body and the choice's finish reason when present.
+/// An empty or whitespace-only string is a zero-argument call —
+/// OpenAI-compatible backends (Ollama, LM Studio, vLLM) emit `""` for those —
+/// and parses as `{}`. Anything else non-object — a parse error, a non-object
+/// value — is a typed [`LlmErrorKind::MalformedToolCall`] carrying the raw
+/// arguments as the body and the choice's finish reason when present.
 fn parse_tool_arguments(raw: &str, finish_reason: &Option<String>, attempts: u32) -> Result<Value> {
     let invalid = |message: String| {
         let mut err = LlmError::new(LlmErrorKind::MalformedToolCall, message)
@@ -282,6 +284,10 @@ fn parse_tool_arguments(raw: &str, finish_reason: &Option<String>, attempts: u32
         }
         PulseHiveError::llm_transport(err)
     };
+
+    if raw.trim().is_empty() {
+        return Ok(serde_json::json!({}));
+    }
 
     match serde_json::from_str::<Value>(raw) {
         Ok(value) if value.is_object() => Ok(value),
@@ -402,6 +408,17 @@ mod tests {
         assert_eq!(llm_response.tool_calls[0].name, "read_file");
         // Arguments parsed from string into Value
         assert_eq!(llm_response.tool_calls[0].arguments["path"], "config.toml");
+    }
+
+    #[test]
+    fn test_empty_tool_arguments_parse_as_empty_object() {
+        // OpenAI-compatible backends (Ollama, LM Studio, vLLM) emit "" for
+        // zero-argument tool calls; whitespace-only is the same shape.
+        for raw in ["", "   "] {
+            let value = parse_tool_arguments(raw, &Some("tool_calls".into()), 1)
+                .expect("empty arguments are a zero-argument call");
+            assert_eq!(value, serde_json::json!({}), "raw: {raw:?}");
+        }
     }
 
     #[test]

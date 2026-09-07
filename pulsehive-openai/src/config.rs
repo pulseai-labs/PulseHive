@@ -1,9 +1,14 @@
 //! Configuration for OpenAI-compatible LLM providers.
 
+use std::fmt;
+
 /// Configuration for connecting to any OpenAI-compatible API.
 ///
 /// Works with OpenAI, GLM (BigModel), vLLM, LM Studio, Ollama, Together, Groq,
 /// and any other service exposing the OpenAI chat completions endpoint.
+///
+/// The `api_key` is never rendered by `Debug` — it prints as `<redacted>` —
+/// so a config that reaches a log line does not leak the credential.
 ///
 /// # Example
 /// ```
@@ -20,7 +25,7 @@
 /// let config = OpenAIConfig::new("unused", "llama3")
 ///     .with_base_url("http://localhost:11434/v1");
 /// ```
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct OpenAIConfig {
     /// API key for authentication (sent as Bearer token).
     pub api_key: String,
@@ -69,6 +74,46 @@ impl OpenAIConfig {
     pub(crate) fn chat_completions_url(&self) -> String {
         let base = self.base_url.trim_end_matches('/');
         format!("{base}/chat/completions")
+    }
+
+    /// The non-secret view [`OpenAICompatibleProvider::config`](crate::OpenAICompatibleProvider::config)
+    /// returns: transport settings only, with no path to the API key.
+    pub(crate) fn view(&self) -> OpenAIConfigView {
+        OpenAIConfigView {
+            base_url: self.base_url.clone(),
+            model: self.model.clone(),
+            timeout_secs: self.timeout_secs,
+            max_retries: self.max_retries,
+        }
+    }
+}
+
+/// A non-secret view of an [`OpenAIConfig`]: the transport settings a
+/// caller may inspect (endpoint, model, timeout, retry budget), with no
+/// field or method that reaches the API key.
+#[derive(Debug, Clone)]
+pub struct OpenAIConfigView {
+    /// Base URL of the API endpoint.
+    pub base_url: String,
+    /// Model identifier.
+    pub model: String,
+    /// Request timeout in seconds.
+    pub timeout_secs: u64,
+    /// Maximum retry attempts for transient errors.
+    pub max_retries: u32,
+}
+
+// The API key is deliberately absent from Debug: a config that reaches a log
+// line or an error report must not leak the credential.
+impl fmt::Debug for OpenAIConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("OpenAIConfig")
+            .field("api_key", &"<redacted>")
+            .field("base_url", &self.base_url)
+            .field("model", &self.model)
+            .field("timeout_secs", &self.timeout_secs)
+            .field("max_retries", &self.max_retries)
+            .finish()
     }
 }
 

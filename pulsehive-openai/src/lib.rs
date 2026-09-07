@@ -16,5 +16,5 @@ mod config;
 mod provider;
 pub(crate) mod types;
 
-pub use config::OpenAIConfig;
+pub use config::{OpenAIConfig, OpenAIConfigView};
 pub use provider::OpenAICompatibleProvider;

@@ -14,7 +14,7 @@ use pulsehive_core::llm::{
     LlmChunk, LlmConfig, LlmError, LlmErrorKind, LlmProvider, LlmResponse, Message, ToolDefinition,
 };
 
-use crate::config::OpenAIConfig;
+use crate::config::{OpenAIConfig, OpenAIConfigView};
 use crate::types::{
     ChatCompletionRequest, ChatCompletionResponse, OpenAITool, OpenAIToolChoice, StreamChunk,
 };
@@ -111,14 +111,23 @@ impl OpenAICompatibleProvider {
             // New wire fields go out only when the caller set them, so an
             // unset config sends a body byte-identical to 2.0.2 (#47 R1, R6).
             reasoning_effort: config.reasoning_effort,
-            tool_choice: config.tool_choice.as_ref().map(OpenAIToolChoice::from),
+            // tool_choice without tools is a 400 on every OpenAI-compatible
+            // endpoint, so it is omitted whenever the request carries no
+            // tools, caller intent or not.
+            tool_choice: if tools.is_empty() {
+                None
+            } else {
+                config.tool_choice.as_ref().map(OpenAIToolChoice::from)
+            },
         })
     }
 
-    /// The provider's configuration (E7): defaults for timeout, retry budget
-    /// and endpoint, as constructed.
-    pub fn config(&self) -> &OpenAIConfig {
-        &self.config
+    /// The provider's configuration (E7): a non-secret view of the defaults
+    /// for endpoint, model, timeout and retry budget as constructed. There is
+    /// no path from the view to the API key, and neither the view nor
+    /// [`OpenAIConfig`] renders the key in its `Debug` output.
+    pub fn config(&self) -> OpenAIConfigView {
+        self.config.view()
     }
 
     /// Send a request under the provider's transport policy.
@@ -129,9 +138,11 @@ impl OpenAICompatibleProvider {
     ///
     /// * **Status failures** — the provider answered a non-success status.
     ///   `429`, `500`, `502`, `503` and `529` are retried up to the attempt
-    ///   budget, a `429` waiting for `Retry-After` when present (else
-    ///   exponential backoff: 1s → 2s → 4s, capped at 8s). Every other 4xx is
-    ///   [`LlmErrorKind::ClientError`] and every other 5xx
+    ///   budget. `429` and `529` — the overload statuses — wait for an
+    ///   integer-seconds `Retry-After` when present, capped at the same 8s
+    ///   ceiling as the exponential backoff (1s → 2s → 4s → 8s) that `500` /
+    ///   `502` / `503` and a header-less `429`/`529` always use. Every other
+    ///   4xx is [`LlmErrorKind::ClientError`] and every other 5xx
     ///   [`LlmErrorKind::ServerError`], both failing immediately with the raw
     ///   body attached verbatim.
     /// * **Transport failures** — the request never completed. A deadline
@@ -158,7 +169,13 @@ impl OpenAICompatibleProvider {
         call: &LlmConfig,
     ) -> Result<(reqwest::Response, u32)> {
         let url = self.config.chat_completions_url();
-        let max_attempts = call.max_retries.unwrap_or(self.config.max_retries) + 1;
+        // Saturating: `LlmConfig` is an unvalidated Deserialize, so a
+        // `max_retries` of `u32::MAX` must still yield at least one attempt
+        // instead of overflowing (debug) or wrapping to zero (release).
+        let max_attempts = call
+            .max_retries
+            .unwrap_or(self.config.max_retries)
+            .saturating_add(1);
         let cancel = call.cancel.as_ref();
 
         // A token cancelled before the call never sends anything.
@@ -239,7 +256,11 @@ impl OpenAICompatibleProvider {
             }
 
             let status = response.status();
-            let retry_after = parse_retry_after(&response);
+            // Retry-After is honored only on the overload statuses (429/529):
+            // 500/502/503 use the same exponential backoff as any other
+            // retryable failure, and the header is not reported as retry
+            // guidance where it is not honored.
+            let retry_after = parse_retry_after(&response).filter(|_| honors_retry_after(status));
             let text = response.text();
             let text = match cancel {
                 Some(token) => tokio::select! {
@@ -305,11 +326,13 @@ impl OpenAICompatibleProvider {
                 .with_attempts(attempt)
                 .with_body(body);
             if let Some(delay) = retry_after {
+                // The error carries the server's verbatim guidance; only the
+                // honored sleep below is capped.
                 err = err.with_retry_after(delay);
             }
 
             if is_retryable_status(status) && attempt < max_attempts {
-                let delay = retry_after.unwrap_or_else(|| retry_delay(attempt));
+                let delay = honored_retry_delay(retry_after, attempt);
                 tracing::warn!(
                     attempt = attempt,
                     status = %status,
@@ -404,7 +427,11 @@ impl LlmProvider for OpenAICompatibleProvider {
     /// Limitation (E11, #47 R4): the streaming path carries neither
     /// `reasoning` nor `finish_reason` — only [`Self::chat`] surfaces them.
     /// Transport failures before the stream starts surface as the same typed
-    /// [`PulseHiveError::LlmTransport`] errors as `chat`.
+    /// [`PulseHiveError::LlmTransport`] errors as `chat`, and so does every
+    /// mid-stream body-read failure (classified like `chat()`'s body read).
+    /// A cancelled [`LlmConfig::cancel`] token aborts the in-flight request,
+    /// every backoff sleep and every read of the streamed body: a server that
+    /// answers `200` and then stalls cannot hold the stream past the token.
     async fn chat_stream(
         &self,
         messages: Vec<Message>,
@@ -412,19 +439,52 @@ impl LlmProvider for OpenAICompatibleProvider {
         config: &LlmConfig,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<LlmChunk>> + Send>>> {
         let request = self.build_request(&messages, &tools, config, true)?;
-        let (response, _attempts) = self.send_request(&request, config).await?;
+        let (response, attempts) = self.send_request(&request, config).await?;
+        let status = response.status();
+        let cancel = config.cancel.clone();
 
-        let stream = response
+        let reads = response
             .bytes_stream()
-            .scan(SseParseState::new(), |state, bytes_result| {
-                let chunks = match bytes_result {
+            .map(move |read| read.map_err(|e| stream_body_error(&e, status, attempts)));
+
+        // Race each body read against the cancellation token. A read failure
+        // (cancellation included) yields exactly one typed error and then
+        // ends the stream — the underlying body is sticky after an error and
+        // would re-report it on every poll — while a body that ends cleanly
+        // ends the stream the same way.
+        let raced = futures::stream::unfold(
+            (reads, cancel, false),
+            move |(mut reads, cancel, done)| async move {
+                if done {
+                    return None;
+                }
+                let next = match cancel.as_ref() {
+                    Some(token) => tokio::select! {
+                        biased;
+                        _ = token.cancelled() => {
+                            Some(Err(cancelled_error(attempts)))
+                        }
+                        read = reads.next() => read,
+                    },
+                    None => reads.next().await,
+                };
+                let read = match next {
+                    Some(read) => read,
+                    None => return None,
+                };
+                let done = read.is_err();
+                Some((read, (reads, cancel, done)))
+            },
+        );
+
+        let stream = raced
+            .scan(SseParseState::new(), |state, read| {
+                let chunks = match read {
                     Ok(bytes) => {
                         state.buffer.extend_from_slice(&bytes);
                         state.emit_chunks()
                     }
-                    Err(e) => {
-                        vec![Err(PulseHiveError::llm(format!("Stream error: {e}")))]
-                    }
+                    Err(e) => vec![Err(e)],
                 };
                 // Return Some to keep scanning, None would stop
                 futures::future::ready(Some(chunks))
@@ -434,6 +494,27 @@ impl LlmProvider for OpenAICompatibleProvider {
 
         Ok(stream)
     }
+}
+
+/// A mid-stream body-read failure on a success response, classified like
+/// `chat()`'s body read: a timeout is `Timeout`; any other read failure on
+/// the streamed body is `Parse` — a success status was already delivered, so
+/// nothing parseable arrived.
+fn stream_body_error(
+    error: &reqwest::Error,
+    status: reqwest::StatusCode,
+    attempts: u32,
+) -> PulseHiveError {
+    let kind = if error.is_timeout() {
+        LlmErrorKind::Timeout
+    } else {
+        LlmErrorKind::Parse
+    };
+    PulseHiveError::llm_transport(
+        LlmError::new(kind, error.to_string())
+            .with_status(status.as_u16())
+            .with_attempts(attempts),
+    )
 }
 
 // ── SSE Parse State Machine ──────────────────────────────────────────
@@ -537,6 +618,25 @@ impl SseParseState {
 /// Returns true if the HTTP status indicates a transient error worth retrying.
 fn is_retryable_status(status: reqwest::StatusCode) -> bool {
     matches!(status.as_u16(), 429 | 500 | 502 | 503 | 529)
+}
+
+/// Returns true for the overload statuses whose `Retry-After` header is
+/// honored as retry guidance (and reported on the error).
+fn honors_retry_after(status: reqwest::StatusCode) -> bool {
+    matches!(status.as_u16(), 429 | 529)
+}
+
+/// The exponential backoff ceiling: an honored `Retry-After` never sleeps
+/// longer than this, so a hostile or misconfigured header cannot stall the
+/// call for hours.
+const RETRY_DELAY_CEILING: Duration = Duration::from_secs(8);
+
+/// The delay honored before the next retry: a 429/529 `Retry-After` (already
+/// filtered to those statuses) capped at the backoff ceiling, else backoff.
+fn honored_retry_delay(retry_after: Option<Duration>, attempt: u32) -> Duration {
+    retry_after
+        .map(|delay| delay.min(RETRY_DELAY_CEILING))
+        .unwrap_or_else(|| retry_delay(attempt))
 }
 
 /// Computes exponential backoff delay: 1s * 2^(attempt-1), capped at 8s.
@@ -844,6 +944,35 @@ mod tests {
         assert_eq!(retry_delay(3), Duration::from_secs(4)); // 2^2
         assert_eq!(retry_delay(4), Duration::from_secs(8)); // 2^3, capped
         assert_eq!(retry_delay(5), Duration::from_secs(8)); // still capped
+    }
+
+    #[test]
+    fn test_honored_retry_delay_capped_at_backoff_ceiling() {
+        // A hostile Retry-After never sleeps past the backoff ceiling...
+        assert_eq!(
+            honored_retry_delay(Some(Duration::from_secs(100_000)), 1),
+            RETRY_DELAY_CEILING
+        );
+        // ...but a short one is honored verbatim, and no header means backoff.
+        assert_eq!(
+            honored_retry_delay(Some(Duration::from_secs(2)), 1),
+            Duration::from_secs(2)
+        );
+        assert_eq!(honored_retry_delay(None, 1), retry_delay(1));
+    }
+
+    #[test]
+    fn test_retry_after_honored_only_on_overload_statuses() {
+        let four_twenty_nine = reqwest::StatusCode::from_u16(429).expect("429 is a valid status");
+        let five_hundred = reqwest::StatusCode::from_u16(500).expect("500 is a valid status");
+        assert!(honors_retry_after(four_twenty_nine));
+        assert!(honors_retry_after(
+            reqwest::StatusCode::from_u16(529).expect("529 is a valid status")
+        ));
+        assert!(!honors_retry_after(five_hundred));
+        assert!(!honors_retry_after(
+            reqwest::StatusCode::from_u16(401).expect("401 is a valid status")
+        ));
     }
 
     // ── HTTP-level tests ─────────────────────────────────────────────
