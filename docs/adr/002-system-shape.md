@@ -15,14 +15,14 @@ PulseHive is a library/SDK, not a deployed service. It runs in the caller's proc
 - PulseHive runs in the calling application's process
 - No separate deployment topology
 - No client-server split within PulseHive itself
-- Distribution unit is the crate (published to crates.io); the deployment unit is the consuming application
+- Distribution units are the crates.io crate, the PyPI wheels/sdist, and the npm `@pulsehive/sdk` package; the deployment unit is the consuming application
 
 **Rationale:** As an SDK, PulseHive's runtime is embedded in consumer applications. Splitting into separate deployables would require measured pressure that the product imposes, not anticipatory scaling.
 
 ## Consequences
 
 **Positive:**
-- Simple deployment model - consumers depend on crates.io published version
+- Simple deployment model - consumers install from crates.io, PyPI, or npm
 - No inter-process communication complexity
 - Direct access to PulseHive APIs in consumer code
 
