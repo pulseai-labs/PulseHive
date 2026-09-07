@@ -294,7 +294,12 @@ impl AnthropicProvider {
 
             // Non-retryable failure status: other 5xx stays ServerError,
             // anything else is a ClientError carrying the Anthropic error
-            // envelope's message when the body parses as one.
+            // envelope's message when the body parses as one. A body that
+            // does not parse as an envelope keeps the displayed message
+            // generic (status only): the verbatim body can carry prompt or
+            // credential content, and Display feeds logs and persisted
+            // error outcomes — the raw text lives only in the structured
+            // `body` field.
             let kind = if (500..600).contains(&status_code) {
                 LlmErrorKind::ServerError
             } else {
@@ -303,7 +308,7 @@ impl AnthropicProvider {
             let message = if kind == LlmErrorKind::ClientError {
                 serde_json::from_str::<types::AnthropicError>(&body_raw)
                     .map(|envelope| envelope.error.message)
-                    .unwrap_or_else(|_| body_raw.clone())
+                    .unwrap_or_else(|_| format!("Anthropic API error {status}"))
             } else {
                 format!("Anthropic API error {status}")
             };

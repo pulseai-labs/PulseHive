@@ -566,6 +566,38 @@ async fn client_error_is_immediate_with_anthropic_message_and_body() {
     assert_eq!(requests_seen(&rx, 100).len(), 1);
 }
 
+// ── 6b. A plain-text 4xx body stays out of the message (Y01) ────────
+
+#[tokio::test]
+async fn plain_text_client_error_body_stays_out_of_the_message() {
+    // A nonstandard or plain-text error body can carry prompt or
+    // credential content; the displayed message stays generic and the raw
+    // text lives only in the structured `body` field, never in Display.
+    let leak = "token=sk-live-supersecret";
+    let (base, rx) = spawn_server(vec![respond(400, "Bad Request", None, leak)]);
+    let provider = AnthropicProvider::with_config(base_config(&base, 3));
+
+    let error = provider
+        .chat(one_user_message(), vec![], &chat_config())
+        .await
+        .expect_err("400 must fail");
+    let err = transport_error(error);
+    assert_eq!(err.kind, LlmErrorKind::ClientError);
+    assert_eq!(err.status, Some(400));
+    assert!(
+        !err.message.contains("sk-live-supersecret"),
+        "message leaked the body: {}",
+        err.message
+    );
+    let rendered = err.to_string();
+    assert!(
+        !rendered.contains("sk-live-supersecret"),
+        "Display leaked the body: {rendered}"
+    );
+    assert_eq!(err.body.as_deref(), Some(leak));
+    assert_eq!(requests_seen(&rx, 100).len(), 1);
+}
+
 // ── 7. Success status with unparseable body is a Parse error ─────────
 
 #[tokio::test]
