@@ -26,7 +26,8 @@ use crate::types::{self, AnthropicTool, AnthropicToolChoice, MessagesRequest, Me
 /// carrying an [`LlmError`](pulsehive_core::llm::LlmError). A timeout fails
 /// once (`Timeout`) and is never re-sent; connection failures and
 /// 429/500/502/503/529 retry within the attempt budget, honouring an
-/// integer-seconds `Retry-After` header on 429/529; any other 4xx/5xx fails
+/// integer-seconds `Retry-After` header on 429/529 (capped at the backoff
+/// ceiling); any other 4xx/5xx fails
 /// immediately; a success status with an unreadable or unparseable body is
 /// `Parse`, while a body that cannot be read on an error status is a
 /// Connect-class failure that retries.
@@ -63,9 +64,12 @@ impl AnthropicProvider {
         Self { config, client }
     }
 
-    /// The provider's configuration.
-    pub fn config(&self) -> &AnthropicConfig {
-        &self.config
+    /// The provider's configuration: a non-secret view of the defaults for
+    /// endpoint, model, timeout and retry budget as constructed. There is no
+    /// path from the view to the API key, and neither the view nor
+    /// [`AnthropicConfig`] renders the key in its `Debug` output.
+    pub fn config(&self) -> crate::config::AnthropicConfigView {
+        self.config.view()
     }
 
     /// Build the request body for the Messages API.
@@ -83,7 +87,13 @@ impl AnthropicProvider {
         } else {
             config.model.clone()
         };
-        let tool_choice = config.tool_choice.as_ref().map(AnthropicToolChoice::from);
+        // tool_choice without tools is rejected by the Messages API, so it is
+        // omitted whenever the request carries no tools, caller intent or not.
+        let tool_choice = if tools.is_empty() {
+            None
+        } else {
+            config.tool_choice.as_ref().map(AnthropicToolChoice::from)
+        };
         if config.reasoning_effort.is_some() {
             tracing::debug!(
                 "reasoning_effort is set on LlmConfig but is ignored by the Anthropic \
@@ -117,7 +127,13 @@ impl AnthropicProvider {
         request_body: &MessagesRequest,
         config: &LlmConfig,
     ) -> Result<LlmResponse> {
-        let max_attempts = config.max_retries.unwrap_or(self.config.max_retries) + 1;
+        // Saturating: `LlmConfig` is an unvalidated Deserialize, so a
+        // `max_retries` of `u32::MAX` must still yield at least one attempt
+        // instead of overflowing (debug) or wrapping to zero (release).
+        let max_attempts = config
+            .max_retries
+            .unwrap_or(self.config.max_retries)
+            .saturating_add(1);
         let mut attempts: u32 = 0;
 
         loop {
@@ -210,11 +226,10 @@ impl AnthropicProvider {
                     return Err(PulseHiveError::llm_transport(error));
                 }
                 // An integer-seconds Retry-After wins over backoff on
-                // 429/529; everything else uses this crate's backoff shape.
-                let delay = match retry_after {
-                    Some(delay) if matches!(status_code, 429 | 529) => delay,
-                    _ => backoff_delay(attempts),
-                };
+                // 429/529, capped at the same ceiling as the backoff so a
+                // hostile header cannot stall the call for hours; everything
+                // else uses this crate's backoff shape.
+                let delay = honored_retry_delay(retry_after, status_code, attempts);
                 self.sleep_cancelled(delay, config, attempts).await?;
                 continue;
             }
@@ -266,7 +281,10 @@ impl AnthropicProvider {
     }
 
     /// Race a future against the call's cancellation token, if any. Dropping
-    /// the future on cancellation aborts the in-flight request.
+    /// the future on cancellation aborts the in-flight request. The race is
+    /// `biased` with cancellation polled first, matching the OpenAI
+    /// provider's copies: a completed result is never nondeterministically
+    /// discarded as `Cancelled`.
     async fn race_cancel<F: Future>(
         &self,
         future: F,
@@ -276,6 +294,7 @@ impl AnthropicProvider {
         let cancel = config.cancel.as_ref().map(|token| token.cancelled());
         match cancel {
             Some(cancelled) => tokio::select! {
+                biased;
                 _ = cancelled => Err(Self::cancelled_error(attempts)),
                 output = future => Ok(output),
             },
@@ -332,6 +351,19 @@ impl AnthropicProvider {
 /// `1 << n` seconds capped at 16s, where `n` counts failed attempts so far.
 fn backoff_delay(failed_attempts: u32) -> Duration {
     Duration::from_secs(1u64 << failed_attempts.min(4))
+}
+
+/// The backoff ceiling: an honored `Retry-After` never sleeps longer than
+/// this, so a hostile or misconfigured header cannot stall the call for hours.
+const BACKOFF_CEILING: Duration = Duration::from_secs(16);
+
+/// The delay honored before the next retry: a 429/529 `Retry-After` capped at
+/// the backoff ceiling, else this crate's backoff shape.
+fn honored_retry_delay(retry_after: Option<Duration>, status_code: u16, attempts: u32) -> Duration {
+    match retry_after {
+        Some(delay) if matches!(status_code, 429 | 529) => delay.min(BACKOFF_CEILING),
+        _ => backoff_delay(attempts),
+    }
 }
 
 /// Parse an integer-seconds `Retry-After` header, when present and integral.
@@ -416,6 +448,54 @@ mod tests {
         let config = LlmConfig::new("anthropic", "claude-sonnet-4-6");
         let request = provider.build_request(&messages, &[], &config, true);
         assert_eq!(request.stream, Some(true));
+    }
+
+    #[test]
+    fn test_build_request_omits_tool_choice_without_tools() {
+        let provider = AnthropicProvider::new("sk-test");
+        let config = LlmConfig::new("anthropic", "claude-sonnet-4-6")
+            .with_tool_choice(pulsehive_core::llm::ToolChoice::Required);
+
+        // No tools: the Messages API would reject the request, so the key is
+        // omitted even though the caller set a choice.
+        let request = provider.build_request(&[Message::user("hi")], &[], &config, false);
+        assert!(request.tool_choice.is_none());
+
+        // One tool: the choice goes out.
+        let tools = vec![ToolDefinition {
+            name: "search".into(),
+            description: "Search the web".into(),
+            parameters: serde_json::json!({"type": "object"}),
+        }];
+        let request = provider.build_request(&[Message::user("hi")], &tools, &config, false);
+        assert!(matches!(
+            request.tool_choice,
+            Some(crate::types::AnthropicToolChoice::Required)
+        ));
+    }
+
+    #[test]
+    fn test_honored_retry_delay_capped_at_backoff_ceiling() {
+        // A hostile Retry-After never sleeps past the backoff ceiling...
+        assert_eq!(
+            honored_retry_delay(Some(Duration::from_secs(100_000)), 429, 1),
+            BACKOFF_CEILING
+        );
+        assert_eq!(
+            honored_retry_delay(Some(Duration::from_secs(100_000)), 529, 1),
+            BACKOFF_CEILING
+        );
+        // 500/502/503 use the backoff shape even when the header is present...
+        assert_eq!(
+            honored_retry_delay(Some(Duration::from_secs(0)), 503, 1),
+            backoff_delay(1)
+        );
+        // ...and a short honored value passes through verbatim.
+        assert_eq!(
+            honored_retry_delay(Some(Duration::from_secs(2)), 429, 1),
+            Duration::from_secs(2)
+        );
+        assert_eq!(honored_retry_delay(None, 429, 1), backoff_delay(1));
     }
 
     #[test]

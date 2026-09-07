@@ -18,5 +18,5 @@ pub mod config;
 pub mod provider;
 pub mod types;
 
-pub use config::AnthropicConfig;
+pub use config::{AnthropicConfig, AnthropicConfigView};
 pub use provider::AnthropicProvider;

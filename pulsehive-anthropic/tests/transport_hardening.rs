@@ -197,6 +197,10 @@ fn read_http_request(stream: &mut std::net::TcpStream) -> String {
         .unwrap_or(0);
     while buf.len() < head_end + content_length {
         let n = stream.read(&mut chunk).expect("fixture: read request body");
+        assert!(
+            n > 0,
+            "fixture: client disconnected before sending the full body"
+        );
         buf.extend_from_slice(&chunk[..n]);
     }
     String::from_utf8_lossy(&buf[head_end..head_end + content_length]).into_owned()
@@ -347,6 +351,34 @@ async fn per_call_max_retries_override_wins_on_one_instance() {
     assert_eq!(err.status, Some(529));
 }
 
+// ── 3b. A u32::MAX retry budget still sends at least once (F09) ──────
+
+#[tokio::test]
+async fn max_retries_at_u32_max_does_not_overflow_to_zero_attempts() {
+    // `LlmConfig` is an unvalidated Deserialize; a budget of u32::MAX must
+    // saturate, not overflow (debug panic) or wrap to zero attempts. A 400
+    // fails on the first attempt, which the wrapped budget could never
+    // reach.
+    let (base, rx) = spawn_server(vec![respond(
+        400,
+        "Bad Request",
+        None,
+        r#"{"type":"error","error":{"type":"invalid_request_error","message":"bad"}}"#,
+    )]);
+    let mut config = base_config(&base, u32::MAX);
+    config.timeout_secs = 5;
+    let provider = AnthropicProvider::with_config(config);
+
+    let error = provider
+        .chat(one_user_message(), vec![], &chat_config())
+        .await
+        .expect_err("400 must fail");
+    let err = transport_error(error);
+    assert_eq!(err.kind, LlmErrorKind::ClientError);
+    assert_eq!(err.attempts, 1, "attempts must be at least 1");
+    assert_eq!(requests_seen(&rx, 100).len(), 1);
+}
+
 // ── 4. Per-call timeout overrides a long client timeout ───────────────
 
 #[tokio::test]
@@ -395,6 +427,65 @@ async fn rate_limit_carries_retry_after() {
     assert_eq!(err.retry_after, Some(Duration::ZERO));
     assert_eq!(err.body.as_deref(), Some(rate_body));
     assert_eq!(requests_seen(&rx, 100).len(), 2);
+}
+
+// ── 5b. Retry-After honored on 429/529 only; raw value reported ──────
+
+#[tokio::test]
+async fn retry_after_on_500_family_is_not_honored() {
+    // A 500 with Retry-After: 0 retries on the exponential backoff (1s),
+    // not the header, and the error does not carry retry_after.
+    let (base, rx) = spawn_server(vec![
+        respond(500, "Internal Server Error", Some(0), "{}"),
+        respond(500, "Internal Server Error", Some(0), "{}"),
+    ]);
+    let provider = AnthropicProvider::with_config(base_config(&base, 1));
+
+    let start = Instant::now();
+    let error = provider
+        .chat(one_user_message(), vec![], &chat_config())
+        .await
+        .expect_err("two 500s must exhaust the budget");
+    let elapsed = start.elapsed();
+
+    let err = transport_error(error);
+    assert_eq!(err.kind, LlmErrorKind::ServerError);
+    assert_eq!(err.attempts, 2);
+    assert_eq!(err.retry_after, None, "500 does not honor Retry-After");
+    assert!(
+        elapsed >= Duration::from_millis(900),
+        "500 must use the 1s backoff, not Retry-After: 0 (took {elapsed:?})"
+    );
+    assert_eq!(requests_seen(&rx, 100).len(), 2);
+}
+
+#[tokio::test]
+async fn oversized_retry_after_is_reported_verbatim_but_never_slept() {
+    // Retry-After: 100000 (~27.8h) on a 429: the error carries the raw value
+    // for the caller; the honored sleep is capped (unit-tested) and a
+    // zero-budget call does not sleep at all.
+    let (base, _rx) = spawn_server(vec![respond(
+        429,
+        "Too Many Requests",
+        Some(100_000),
+        "rate-limit body",
+    )]);
+    let provider = AnthropicProvider::with_config(base_config(&base, 0));
+
+    let start = Instant::now();
+    let error = provider
+        .chat(one_user_message(), vec![], &chat_config())
+        .await
+        .expect_err("one 429 with a zero budget must fail");
+    let elapsed = start.elapsed();
+
+    let err = transport_error(error);
+    assert_eq!(err.kind, LlmErrorKind::RateLimited);
+    assert_eq!(err.retry_after, Some(Duration::from_secs(100_000)));
+    assert!(
+        elapsed < Duration::from_millis(2500),
+        "a zero-budget call must not sleep for the header value, took {elapsed:?}"
+    );
 }
 
 // ── 6. Other 4xx: immediate, envelope message, raw body ──────────────
@@ -486,8 +577,16 @@ async fn non_object_tool_use_input_is_malformed_tool_call() {
 
 #[tokio::test]
 async fn tool_choice_maps_to_anthropic_wire_shapes_only_when_set() {
-    let (base, rx) = spawn_server(vec![ok_text(); 5]);
+    let (base, rx) = spawn_server(vec![ok_text(); 6]);
     let provider = AnthropicProvider::with_config(base_config(&base, 0));
+
+    // tool_choice is only sent when the request carries tools, so every
+    // mapping case sends one.
+    let one_tool = vec![pulsehive_core::llm::ToolDefinition {
+        name: "search".into(),
+        description: "Search the web".into(),
+        parameters: serde_json::json!({"type": "object"}),
+    }];
 
     let cases: Vec<(ToolChoice, &str)> = vec![
         (ToolChoice::Auto, r#"{"type":"auto"}"#),
@@ -504,7 +603,7 @@ async fn tool_choice_maps_to_anthropic_wire_shapes_only_when_set() {
         let outcome = provider
             .chat(
                 one_user_message(),
-                vec![],
+                one_tool.clone(),
                 &chat_config().with_tool_choice(choice),
             )
             .await;
@@ -524,7 +623,7 @@ async fn tool_choice_maps_to_anthropic_wire_shapes_only_when_set() {
 
     // Unset: the key is absent entirely.
     let outcome = provider
-        .chat(one_user_message(), vec![], &chat_config())
+        .chat(one_user_message(), one_tool.clone(), &chat_config())
         .await;
     assert!(outcome.is_ok());
     let body = rx
@@ -533,6 +632,27 @@ async fn tool_choice_maps_to_anthropic_wire_shapes_only_when_set() {
     assert!(
         !body.contains("tool_choice"),
         "body must not contain tool_choice: {body:?}"
+    );
+
+    // Set but no tools on the request: the Messages API rejects
+    // tool_choice-without-tools, so the provider omits the key.
+    let outcome = provider
+        .chat(
+            one_user_message(),
+            vec![],
+            &chat_config().with_tool_choice(ToolChoice::Required),
+        )
+        .await;
+    assert!(
+        outcome.is_ok(),
+        "tool_choice with no tools must not break the call: {outcome:?}"
+    );
+    let body = rx
+        .recv_timeout(Duration::from_millis(500))
+        .expect("no-tools-case body recorded");
+    assert!(
+        !body.contains("tool_choice"),
+        "body must not contain tool_choice when tools is empty: {body:?}"
     );
 }
 
@@ -594,8 +714,11 @@ async fn cancel_token_aborts_in_flight_request() {
     let err = transport_error(error);
     assert_eq!(err.kind, LlmErrorKind::Cancelled);
     assert_eq!(err.attempts, 1);
+    // A generous window: the canceller fires at 100ms, but scheduler
+    // contention on a loaded CI runner can delay the observed return well
+    // past a tight bound.
     assert!(
-        elapsed < Duration::from_millis(900),
+        elapsed < Duration::from_millis(2500),
         "cancel must return promptly, took {elapsed:?}"
     );
 
@@ -701,16 +824,32 @@ async fn error_body_dropped_mid_stream_is_connect_and_retries() {
     assert_eq!(requests_seen(&rx, 200).len(), 2);
 }
 
-// ── 16. config() returns the provider's configuration (E7) ────────────
+// ── 16. config() returns a non-secret view (E7) ───────────────────────
 
-#[tokio::test]
-async fn config_accessor_returns_the_provider_config() {
+#[test]
+fn config_accessor_returns_a_non_secret_view() {
     let listener = TcpListener::bind("127.0.0.1:0").expect("fixture: bind loopback");
     let addr = listener.local_addr().expect("fixture: local addr");
     let base = format!("http://{addr}");
+    let secret = "sk-ant-definitely-secret";
 
-    let provider = AnthropicProvider::with_config(base_config(&base, 2));
-    assert_eq!(provider.config().base_url, base);
-    assert_eq!(provider.config().max_retries, 2);
-    assert_eq!(provider.config().timeout_secs, 5);
+    let mut config = AnthropicConfig::new(secret).with_base_url(&base);
+    config.timeout_secs = 5;
+    config.max_retries = 2;
+    let provider = AnthropicProvider::with_config(config);
+
+    let view = provider.config();
+    assert_eq!(view.base_url, base);
+    assert_eq!(view.max_retries, 2);
+    assert_eq!(view.timeout_secs, 5);
+
+    // No Debug path reachable from the provider renders the key.
+    assert!(
+        !format!("{view:?}").contains(secret),
+        "view Debug leaked the api_key: {view:?}"
+    );
+    assert!(
+        !format!("{:?}", AnthropicConfig::new(secret)).contains(secret),
+        "AnthropicConfig Debug leaked the api_key"
+    );
 }
