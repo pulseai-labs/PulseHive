@@ -3,7 +3,7 @@
 **Status:** Accepted
 **Category:** 3 - Data ownership & migration posture
 **Touch Surface:** `pulsehive-runtime/src/`
-**Revisit Trigger:** When introducing in-process persistence
+**Revisit Trigger:** When PulseHive starts owning persistence or bypassing the substrate abstraction
 
 ## Context
 
@@ -15,7 +15,7 @@ PulseHive processes agent experiences but does not own the persistent storage la
 - **PulseDB owns storage:** Vectors, graph, watch system, context assembly
 - **PulseHive owns intelligence:** Attractor dynamics, lens warping, conflict reasoning, insight synthesis
 - **Consumer owns PulseDB instance:** Substrate path provided by consumer
-- **No in-process persistence:** PulseHive does not embed database
+- **Execution location, not ownership:** PulseHive does not own persistence, but it does run the database engine in-process — `HiveMindBuilder::build()` opens PulseDB at the consumer-configured substrate path inside the consumer's process and wraps it in `PulseDBSubstrate` (`pulsehive-runtime/src/hivemind.rs`)
 
 **Migration Posture:** Expand/contract via PulseDB
 - PulseHive operates through substrate abstraction
