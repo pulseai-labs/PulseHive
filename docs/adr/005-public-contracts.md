@@ -2,7 +2,7 @@
 
 **Status:** Accepted
 **Category:** 4 - Public contracts & compatibility policy
-**Touch Surface:** `pulsehive*/src/`
+**Touch Surface:** `pulsehive*/src/,pulsehive-js/package.json,pulsehive-js/wrapper.d.ts,pulsehive-py/python/pulsehive/__init__.py`
 **Revisit Trigger:** When breaking changes needed
 
 ## Context

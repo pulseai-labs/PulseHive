@@ -2,7 +2,7 @@
 
 **Status:** Accepted
 **Category:** 7 - Rollback & evolution strategy
-**Touch Surface:** `Cargo.toml,CHANGELOG.md`
+**Touch Surface:** `Cargo.toml,pulsehive*/Cargo.toml,.github/workflows/crates-release.yml,CHANGELOG.md`
 **Revisit Trigger:** When introducing breaking migration
 
 ## Context
