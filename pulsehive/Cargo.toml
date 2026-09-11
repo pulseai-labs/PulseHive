@@ -16,9 +16,21 @@ categories = ["science", "asynchronous"]
 default = []
 openai = ["dep:pulsehive-openai"]
 anthropic = ["dep:pulsehive-anthropic"]
+testing = ["pulsehive-core/testing"]
 
 [dependencies]
 pulsehive-core = { workspace = true }
 pulsehive-runtime = { workspace = true }
 pulsehive-openai = { workspace = true, optional = true }
 pulsehive-anthropic = { workspace = true, optional = true }
+
+[dev-dependencies]
+async-trait = { workspace = true }
+futures-core = { workspace = true }
+serde_json = { workspace = true }
+tempfile = { workspace = true }
+tokio = { workspace = true }
+
+[[test]]
+name = "scripted_agent_turn"
+required-features = ["testing"]

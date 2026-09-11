@@ -27,6 +27,7 @@ uuid = { workspace = true }
 async-trait = { workspace = true }
 criterion = { workspace = true }
 dotenvy = "0.15"
+pulsehive-core = { workspace = true, features = ["testing"] }
 pulsehive-openai = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }

@@ -15,6 +15,8 @@ pub mod event;
 pub mod export;
 pub mod lens;
 pub mod llm;
+#[cfg(feature = "testing")]
+pub mod testing;
 pub mod tool;
 
 /// Re-exports of the most commonly used types.
