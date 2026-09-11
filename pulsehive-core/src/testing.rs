@@ -1,9 +1,9 @@
 //! Test doubles for driving PulseHive agents deterministically, offline.
 //!
-//! [`ScriptedProvider`] is an [`LlmProvider`](crate::llm::LlmProvider) whose
+//! [`ScriptedProvider`] is an [`LlmProvider`] whose
 //! replies are queued in advance with a `then_*` builder. A test scripts the
-//! conversation it wants, hands a clone to the [`HiveMindBuilder`] (providers
-//! are taken by value), drives the agent, and reads back what the agent sent.
+//! conversation it wants, hands a clone to `HiveMindBuilder` (providers are
+//! taken by value), drives the agent, and reads back what the agent sent.
 //! No API key and no network are involved — the provider is the product-owned
 //! swappable interface, so the turn it drives is the real agent loop.
 //!
@@ -11,11 +11,12 @@
 //! module through the meta-crate as `pulsehive::testing`):
 //!
 //! ```rust,ignore
-//! use std::sync::Arc;
+//! use std::{future::poll_fn, sync::Arc, time::Duration};
 //!
+//! use futures_core::Stream;
 //! use pulsehive::testing::ScriptedProvider;
-//! use pulsehive::{AgentDefinition, AgentKind, HiveEvent, HiveMind, LlmAgentConfig,
-//!                 LlmConfig, Lens, Task, Tool, ToolContext, ToolResult};
+//! use pulsehive::{AgentDefinition, AgentKind, AgentOutcome, HiveEvent, HiveMind,
+//!                 LlmAgentConfig, LlmConfig, Lens, Task, Tool, ToolContext, ToolResult};
 //! use serde_json::json;
 //!
 //! #[tokio::test]
@@ -57,13 +58,24 @@
 //!         .deploy(vec![agent], vec![Task::new("echo hi")])
 //!         .await
 //!         .unwrap();
-//!     // drain until HiveEvent::AgentCompleted { .. } (as in the streaming_tool
-//!     // example), then:
+//!     let outcome = tokio::time::timeout(Duration::from_secs(60), async {
+//!         loop {
+//!             match poll_fn(|cx| stream.as_mut().poll_next(cx)).await {
+//!                 Some(HiveEvent::AgentCompleted { outcome, .. }) => break outcome,
+//!                 Some(_) => {}
+//!                 None => panic!("stream ended before AgentCompleted"),
+//!             }
+//!         }
+//!     })
+//!     .await
+//!     .unwrap();
+//!     match outcome {
+//!         AgentOutcome::Complete { response } => assert_eq!(response, "done"),
+//!         other => panic!("expected a complete outcome, got {other:?}"),
+//!     }
 //!     assert_eq!(provider.requests().len(), 2); // the tool result went back in
 //! }
 //! ```
-//!
-//! [`HiveMindBuilder`]: pulsehive_runtime::hivemind::HiveMindBuilder
 
 use std::collections::VecDeque;
 use std::pin::Pin;
@@ -101,7 +113,7 @@ struct Inner {
     served: usize,
 }
 
-/// A queued-response [`LlmProvider`](crate::llm::LlmProvider) for tests.
+/// A queued-response [`LlmProvider`] for tests.
 ///
 /// Script replies in call order with the `then_*` builders, hand the provider
 /// (or a clone — all clones share one queue and one request log) to the
@@ -110,7 +122,7 @@ struct Inner {
 /// Each `chat`/`chat_stream` call first records its inputs, then takes exactly
 /// one step from the front of the queue; a cancelled call still consumes its
 /// step. When the queue is empty the call fails with
-/// [`PulseHiveError::Llm`](crate::error::PulseHiveError::Llm) naming how many
+/// [`PulseHiveError::Llm`] naming how many
 /// calls were served — never a panic, never a default reply. Exhaustion wins
 /// over cancellation: an already-cancelled call with an empty queue gets the
 /// exhaustion error, because step-taking is checked first.
@@ -118,7 +130,7 @@ struct Inner {
 /// Cancellation follows the provider transport contract: a token already
 /// cancelled at call start, or a [`ScriptedProvider::then_hang`] step whose
 /// token fires, returns
-/// [`PulseHiveError::LlmTransport`](crate::error::PulseHiveError::LlmTransport)
+/// [`PulseHiveError::LlmTransport`]
 /// with kind [`Cancelled`](crate::llm::LlmErrorKind::Cancelled) and
 /// `attempts == 1`.
 ///
