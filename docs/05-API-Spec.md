@@ -711,6 +711,20 @@ Behaviour:
 - **Clones share state.** All clones share one queue and one request log, so
   the clone registered on a `HiveMindBuilder` writes the log the test's
   original reads.
+- **Insight synthesis is an extra consumer.** `HiveMind`'s builder enables
+  insight synthesis by default (`InsightSynthesizer::with_defaults()`,
+  relation-density threshold 5). Once a cluster crosses the threshold,
+  `record_experience` — the Record phase of every agent turn — issues one
+  additional `chat` completion per synthesis through the **first registered
+  provider in arbitrary `HashMap` order**, with a fresh
+  `LlmConfig::new(provider_name, "default")` that carries no cancel token.
+  Against a `ScriptedProvider` that call consumes a scripted step and lands
+  in `requests()` even when the synthesizer discards the outcome (a queued
+  text reply becomes the insight; script exhaustion or a `then_error` yields
+  no insight — the step is spent either way). A test that crosses the
+  threshold should either script the extra steps or disable synthesis with
+  `HiveMindBuilder::no_insight_synthesizer()` (or install a custom
+  synthesizer via `HiveMindBuilder::insight_synthesizer`).
 - **Deterministic ids and defaults.** Tool-call ids are numbered per provider
   at script time (`call_1`, `call_2`, …), whatever steps sit between them.
   `then_text` sets finish reason `"stop"`, `then_tool_call` sets

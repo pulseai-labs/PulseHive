@@ -36,6 +36,11 @@
 //! the integration test `pulsehive/tests/scripted_agent_turn.rs` (behind the
 //! meta-crate's `testing` feature). It is the source of truth for every
 //! import path and builder call this sketch abbreviates.
+//!
+//! One runtime interaction to know before scripting long turns: when insight
+//! synthesis is enabled (the `HiveMind` builder's default),
+//! `record_experience` consumes one extra completion per synthesis from the
+//! first registered provider — see the note on [`ScriptedProvider`].
 
 use std::collections::VecDeque;
 use std::future::Future;
@@ -96,6 +101,21 @@ struct Inner {
 /// `attempts == 0` in the first case (nothing was sent, per
 /// [`LlmError::attempts`](crate::llm::LlmError::attempts)) and `attempts == 1`
 /// in the second (the hang models one in-flight request).
+///
+/// **Insight synthesis is an extra consumer.** `HiveMind`'s builder enables
+/// insight synthesis by default (`InsightSynthesizer::with_defaults()`,
+/// relation-density threshold 5), and `record_experience` — the Record phase
+/// of every agent turn — issues one additional `chat` completion per
+/// synthesis once a cluster crosses that threshold. It takes the first
+/// registered provider in arbitrary `HashMap` order and a fresh synthesis
+/// config (`LlmConfig::new(provider_name, "default")`, no cancel token), so
+/// against a `ScriptedProvider` the call consumes a scripted step and lands
+/// in `requests()` even when the synthesizer discards the outcome (a queued
+/// text reply becomes the insight; script exhaustion or a `then_error`
+/// yields no insight — the step is spent either way). A test that crosses
+/// the threshold should either script the extra steps or disable synthesis
+/// with `HiveMindBuilder::no_insight_synthesizer()` (or install a custom
+/// synthesizer via `HiveMindBuilder::insight_synthesizer`).
 ///
 /// The type is non-exhaustive and grows only through `new()` and the builders.
 #[derive(Debug, Clone, Default)]
