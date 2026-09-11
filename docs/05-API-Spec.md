@@ -725,23 +725,28 @@ Behaviour:
   cancellation as a stream item. `then_error` and script exhaustion fail the
   call itself, matching that provider's pre-stream failure path.
 
-Agent-turn example (no API key, no network):
+Agent-turn example (no API key, no network) — sketch; the complete,
+compiling version is the integration test
+`pulsehive/tests/scripted_agent_turn.rs` (behind the meta-crate's `testing`
+feature), which is the source of truth for every import path:
 
 ```rust,ignore
-#[tokio::test]
-async fn drives_an_agent_turn_offline() {
-    let provider = ScriptedProvider::new()
-        .then_tool_call("echo", json!({"text": "hi"}))
-        .then_text("done");
-    let hive = HiveMind::builder()
-        .substrate_path(dir.path().join("test.db"))
-        .llm_provider("scripted", provider.clone())
-        .build()?;
-    let stream = hive.deploy(vec![agent], vec![Task::new("echo hi")]).await?;
-    // drain until HiveEvent::AgentCompleted { outcome: AgentOutcome::Complete { response }, .. }
-    // with response == "done"; then:
-    assert_eq!(provider.requests().len(), 2); // tool result went back in
-}
+use pulsehive::agent::{AgentDefinition, AgentKind, LlmAgentConfig};
+use pulsehive::llm::LlmConfig;
+use pulsehive::testing::ScriptedProvider;
+use pulsehive::{HiveMind, Task};
+
+let provider = ScriptedProvider::new()
+    .then_tool_call("echo", json!({"text": "hi"}))
+    .then_text("done");
+let hive = HiveMind::builder()
+    .substrate_path(dir.path().join("test.db"))
+    .llm_provider("scripted", provider.clone())
+    .build()?;
+// Deploy an AgentKind::Llm agent whose llm_config routes to "scripted",
+// drain the deploy stream to HiveEvent::AgentCompleted, then assert on
+// what the provider saw:
+assert_eq!(provider.requests().len(), 2); // tool result went back in
 ```
 
 ---

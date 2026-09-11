@@ -7,75 +7,35 @@
 //! No API key and no network are involved — the provider is the product-owned
 //! swappable interface, so the turn it drives is the real agent loop.
 //!
-//! One complete consumer example (the `testing` feature also exposes this
-//! module through the meta-crate as `pulsehive::testing`):
+//! Sketch of the consumer flow (the `testing` feature also exposes this
+//! module through the meta-crate as `pulsehive::testing`; the paths below are
+//! the meta-crate's — swap the `pulsehive::` prefix for `pulsehive_core::`
+//! when depending on the core crate directly):
 //!
 //! ```rust,ignore
-//! use std::{future::poll_fn, sync::Arc, time::Duration};
-//!
-//! use futures_core::Stream;
+//! use pulsehive::agent::{AgentDefinition, AgentKind, LlmAgentConfig};
+//! use pulsehive::llm::LlmConfig;
 //! use pulsehive::testing::ScriptedProvider;
-//! use pulsehive::{AgentDefinition, AgentKind, AgentOutcome, HiveEvent, HiveMind,
-//!                 LlmAgentConfig, LlmConfig, Lens, Task, Tool, ToolContext, ToolResult};
-//! use serde_json::json;
+//! use pulsehive::{HiveMind, Task};
 //!
-//! #[tokio::test]
-//! async fn drives_one_agent_turn_offline() {
-//!     struct Echo;
-//!     #[async_trait::async_trait]
-//!     impl Tool for Echo {
-//!         fn name(&self) -> &str { "echo" }
-//!         fn description(&self) -> &str { "echoes its text argument back" }
-//!         fn parameters(&self) -> serde_json::Value { json!({"type": "object"}) }
-//!         async fn execute(&self, params: serde_json::Value, _: &ToolContext)
-//!             -> pulsehive::Result<ToolResult>
-//!         {
-//!             Ok(ToolResult::text(params["text"].as_str().unwrap_or_default()))
-//!         }
-//!     }
-//!
-//!     let dir = tempfile::tempdir().unwrap();
-//!     let provider = ScriptedProvider::new()
-//!         .then_tool_call("echo", json!({"text": "hi"}))
-//!         .then_text("done");
-//!     let hive = HiveMind::builder()
-//!         .substrate_path(dir.path().join("test.db"))
-//!         .llm_provider("scripted", provider.clone())
-//!         .build()
-//!         .unwrap();
-//!     let agent = AgentDefinition {
-//!         name: "echoer".into(),
-//!         kind: AgentKind::Llm(Box::new(LlmAgentConfig {
-//!             system_prompt: "You echo.".into(),
-//!             tools: vec![Arc::new(Echo)],
-//!             lens: Lens::default(),
-//!             llm_config: LlmConfig::new("scripted", "test"),
-//!             experience_extractor: None,
-//!             refresh_every_n_tool_calls: None,
-//!         })),
-//!     };
-//!     let mut stream = hive
-//!         .deploy(vec![agent], vec![Task::new("echo hi")])
-//!         .await
-//!         .unwrap();
-//!     let outcome = tokio::time::timeout(Duration::from_secs(60), async {
-//!         loop {
-//!             match poll_fn(|cx| stream.as_mut().poll_next(cx)).await {
-//!                 Some(HiveEvent::AgentCompleted { outcome, .. }) => break outcome,
-//!                 Some(_) => {}
-//!                 None => panic!("stream ended before AgentCompleted"),
-//!             }
-//!         }
-//!     })
-//!     .await
-//!     .unwrap();
-//!     match outcome {
-//!         AgentOutcome::Complete { response } => assert_eq!(response, "done"),
-//!         other => panic!("expected a complete outcome, got {other:?}"),
-//!     }
-//!     assert_eq!(provider.requests().len(), 2); // the tool result went back in
-//! }
+//! let provider = ScriptedProvider::new()
+//!     .then_tool_call("echo", json!({"text": "hi"}))
+//!     .then_text("done");
+//! let hive = HiveMind::builder()
+//!     .substrate_path(dir.path().join("test.db"))
+//!     .llm_provider("scripted", provider.clone())
+//!     .build()?;
+//! // Deploy an AgentKind::Llm agent whose llm_config routes to "scripted",
+//! // drain the deploy stream to HiveEvent::AgentCompleted, then assert on
+//! // what the provider saw:
+//! assert_eq!(provider.requests().len(), 2); // the tool result went back in
 //! ```
+//!
+//! The complete, compiling version — tool definition, agent assembly, event
+//! drain with a hang guard, and the assertions on the recorded requests — is
+//! the integration test `pulsehive/tests/scripted_agent_turn.rs` (behind the
+//! meta-crate's `testing` feature). It is the source of truth for every
+//! import path and builder call this sketch abbreviates.
 
 use std::collections::VecDeque;
 use std::future::Future;

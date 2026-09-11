@@ -20,6 +20,16 @@
 //! ```bash
 //! cargo run -p pulsehive-runtime --example streaming_tool
 //! ```
+//!
+//! **Feature note:** the scripted provider lives behind `pulsehive-core`'s
+//! `testing` feature. In-repo this example builds with no extra flags
+//! because cargo compiles examples against dev-dependencies and
+//! `pulsehive-runtime` dev-depends on `pulsehive-core` with
+//! `features = ["testing"]`. Copying this example into your own crate means
+//! enabling that feature yourself — `pulsehive-core = { features = ["testing"] }`
+//! on your dependency (or, through the meta-crate,
+//! `pulsehive = { features = ["testing"] }`, then import it as
+//! `pulsehive::testing::ScriptedProvider`).
 
 use std::sync::Arc;
 use std::time::Duration;
