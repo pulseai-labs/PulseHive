@@ -78,6 +78,7 @@
 //! ```
 
 use std::collections::VecDeque;
+use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::task::{Context, Poll};
@@ -131,8 +132,10 @@ struct Inner {
 /// cancelled at call start, or a [`ScriptedProvider::then_hang`] step whose
 /// token fires, returns
 /// [`PulseHiveError::LlmTransport`]
-/// with kind [`Cancelled`](crate::llm::LlmErrorKind::Cancelled) and
-/// `attempts == 1`.
+/// with kind [`Cancelled`](crate::llm::LlmErrorKind::Cancelled) — with
+/// `attempts == 0` in the first case (nothing was sent, per
+/// [`LlmError::attempts`](crate::llm::LlmError::attempts)) and `attempts == 1`
+/// in the second (the hang models one in-flight request).
 ///
 /// The type is non-exhaustive and grows only through `new()` and the builders.
 #[derive(Debug, Clone, Default)]
@@ -181,13 +184,19 @@ impl ScriptedProvider {
     }
 
     /// Queues a response returned verbatim — several tool calls, usage,
-    /// reasoning, all preserved.
+    /// reasoning, all preserved. A token already cancelled when the call
+    /// starts pre-empts this outcome: the step is still consumed and the
+    /// `Cancelled` transport error (`attempts == 0`) is returned instead
+    /// (on `chat_stream`, as the stream's single `Err` item).
     pub fn then_response(self, response: LlmResponse) -> Self {
         self.lock().steps.push_back(Step::Response(response));
         self
     }
 
-    /// Queues an error returned as-is.
+    /// Queues an error returned as-is. A token already cancelled when the
+    /// call starts pre-empts this outcome: the step is still consumed and the
+    /// `Cancelled` transport error (`attempts == 0`) is returned instead (on
+    /// `chat_stream`, as the stream's single `Err` item).
     pub fn then_error(self, error: PulseHiveError) -> Self {
         self.lock().steps.push_back(Step::Error(error));
         self
@@ -261,10 +270,15 @@ pub struct RecordedRequest {
     pub config: LlmConfig,
 }
 
-/// S3 — the error every cancelled scripted call returns.
-fn cancelled_error() -> PulseHiveError {
+/// S3 — the error every cancelled scripted call returns. `attempts` follows
+/// the transport contract ([`LlmError::attempts`](crate::llm::LlmError)):
+/// `0` when the token was already cancelled at call start — nothing was
+/// sent — and `1` when a `then_hang` step's token fired mid-flight, the hang
+/// modelling one in-flight request.
+fn cancelled_error(attempts: u32) -> PulseHiveError {
     PulseHiveError::llm_transport(
-        LlmError::new(LlmErrorKind::Cancelled, "scripted call was cancelled").with_attempts(1),
+        LlmError::new(LlmErrorKind::Cancelled, "scripted call was cancelled")
+            .with_attempts(attempts),
     )
 }
 
@@ -277,7 +291,7 @@ async fn resolve_step(step: Step, config: &LlmConfig) -> Result<LlmResponse> {
         .as_ref()
         .is_some_and(CancellationToken::is_cancelled)
     {
-        return Err(cancelled_error());
+        return Err(cancelled_error(0));
     }
     match step {
         Step::Response(response) => Ok(response),
@@ -285,7 +299,7 @@ async fn resolve_step(step: Step, config: &LlmConfig) -> Result<LlmResponse> {
         Step::Hang => match config.cancel.as_ref() {
             Some(token) => {
                 token.cancelled().await;
-                Err(cancelled_error())
+                Err(cancelled_error(1))
             }
             // Documented in `then_hang`: a hang without a token never resolves.
             None => Err(std::future::pending::<PulseHiveError>().await),
@@ -311,13 +325,62 @@ impl LlmProvider for ScriptedProvider {
         tools: Vec<ToolDefinition>,
         config: &LlmConfig,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<LlmChunk>> + Send>>> {
+        // S2 — record, then take exactly one step. Exhaustion stays a
+        // call-level error, like a request that cannot be built on
+        // `pulsehive-openai`'s streaming path.
         let step = self.record_and_take(messages, tools, config)?;
-        let response = resolve_step(step, config).await?;
 
-        // S6 — replay the response as prepared chunks: text (when set), then
-        // ToolCallStart + one full-arguments ToolCallDelta per tool call, then
-        // Done. Errors, hangs, cancellation and exhaustion were already
-        // returned above, from `chat_stream` itself.
+        // S6 — cancellation is delivered in the stream, not by the call: like
+        // `pulsehive-openai`'s `chat_stream`, the call itself returns
+        // `Ok(stream)` and a cancellation surfaces as exactly one `Err` item
+        // — an already-cancelled token immediately (`attempts == 0`), a
+        // `then_hang` step when its token fires (`attempts == 1`). A queued
+        // `then_error` stays a call-level error, matching that provider's
+        // pre-stream failure path, where a request that fails before the
+        // stream starts fails the call.
+        if config
+            .cancel
+            .as_ref()
+            .is_some_and(CancellationToken::is_cancelled)
+        {
+            return Ok(Box::pin(ScriptedStream::error(cancelled_error(0))));
+        }
+        match step {
+            Step::Error(error) => Err(error),
+            Step::Response(response) => Ok(Box::pin(ScriptedStream::replay(response))),
+            Step::Hang => match config.cancel.clone() {
+                Some(token) => Ok(Box::pin(ScriptedStream::await_cancel(token))),
+                // Documented in `then_hang`: a hang without a token never
+                // resolves.
+                None => Ok(Box::pin(ScriptedStream::hang_forever())),
+            },
+        }
+    }
+}
+
+/// The stream `chat_stream` returns, over `futures_core::Stream` (no
+/// `futures` dependency): either the prepared chunks — text (when set), then
+/// `ToolCallStart` + one full-arguments `ToolCallDelta` per tool call, then
+/// `Done`, each an `Ok` item — or a pending cancellation that resolves to
+/// exactly one `Err` item.
+enum ScriptedStream {
+    /// Prepared chunks, one `Ok` item each.
+    Replay(std::vec::IntoIter<Result<LlmChunk>>),
+    /// Pends until the cancel token fires, then yields one `Err` item — the
+    /// shape `pulsehive-openai`'s `chat_stream` gives a cancelled in-flight
+    /// request. `done` latches after that item: the underlying wait future
+    /// cannot be polled again, and every later poll ends the stream.
+    AwaitCancel {
+        wait: Pin<Box<dyn Future<Output = ()> + Send>>,
+        done: bool,
+    },
+}
+
+impl ScriptedStream {
+    /// A stream that replays a response as prepared chunks: text (when set),
+    /// then `ToolCallStart` + one full-arguments `ToolCallDelta` per tool
+    /// call, then `Done`.
+    fn replay(response: LlmResponse) -> Self {
         let mut chunks: Vec<Result<LlmChunk>> = Vec::new();
         if let Some(text) = response.content.as_ref() {
             chunks.push(Ok(LlmChunk::Text(text.clone())));
@@ -333,22 +396,57 @@ impl LlmProvider for ScriptedProvider {
             }));
         }
         chunks.push(Ok(LlmChunk::Done));
-        Ok(Box::pin(ChunkStream {
-            chunks: chunks.into_iter(),
-        }))
+        Self::Replay(chunks.into_iter())
+    }
+
+    /// A stream whose single item is `error` — a cancellation already
+    /// latched when the call returned.
+    fn error(error: PulseHiveError) -> Self {
+        Self::Replay(vec![Err(error)].into_iter())
+    }
+
+    /// A stream that pends until `token` fires, then yields the mid-flight
+    /// `Cancelled` error (`attempts == 1`).
+    fn await_cancel(token: CancellationToken) -> Self {
+        Self::AwaitCancel {
+            wait: Box::pin(async move {
+                token.cancelled().await;
+            }),
+            done: false,
+        }
+    }
+
+    /// A stream that never yields — `then_hang` without a token.
+    fn hang_forever() -> Self {
+        Self::AwaitCancel {
+            wait: Box::pin(std::future::pending::<()>()),
+            done: false,
+        }
     }
 }
 
-/// The stream `chat_stream` returns: the prepared chunks, one `Ok` per item,
-/// over `futures_core::Stream` (no `futures` dependency).
-struct ChunkStream {
-    chunks: std::vec::IntoIter<Result<LlmChunk>>,
-}
-
-impl Stream for ChunkStream {
+impl Stream for ScriptedStream {
     type Item = Result<LlmChunk>;
 
-    fn poll_next(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        Poll::Ready(self.get_mut().chunks.next())
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        match self.get_mut() {
+            Self::Replay(chunks) => Poll::Ready(chunks.next()),
+            // A hang models one in-flight request, so its cancellation
+            // reports one attempt (S3).
+            Self::AwaitCancel { wait, done } => {
+                if *done {
+                    return Poll::Ready(None);
+                }
+                match wait.as_mut().poll(cx) {
+                    // Latch after the one error item; the wait future cannot
+                    // be polled past completion.
+                    Poll::Ready(()) => {
+                        *done = true;
+                        Poll::Ready(Some(Err(cancelled_error(1))))
+                    }
+                    Poll::Pending => Poll::Pending,
+                }
+            }
+        }
     }
 }

@@ -701,9 +701,13 @@ Behaviour:
   over cancellation: an already-cancelled call with an empty queue gets the
   exhaustion error, because step-taking is checked first.
 - **Cancellation follows the transport contract.** A token already cancelled
-  at call start, or a `then_hang` step whose token fires, returns
-  `PulseHiveError::LlmTransport` with kind `Cancelled` and `attempts == 1`.
-  A `then_hang` step without a token pends forever.
+  at call start returns `PulseHiveError::LlmTransport` with kind `Cancelled`
+  and `attempts == 0` — nothing was sent; a `then_hang` step whose token
+  fires returns the same kind with `attempts == 1` — the hang models one
+  in-flight request. A `then_hang` step without a token pends forever. An
+  already-cancelled token pre-empts the scripted outcome (`then_response`,
+  `then_error`): the step is still consumed and the `Cancelled` error is
+  returned instead.
 - **Clones share state.** All clones share one queue and one request log, so
   the clone registered on a `HiveMindBuilder` writes the log the test's
   original reads.
@@ -715,8 +719,11 @@ Behaviour:
 - **`chat_stream` takes the same step.** A response replays as
   `LlmChunk::Text` (when content is set), then `ToolCallStart` and one
   full-arguments `ToolCallDelta` per tool call, then `Done`, each item `Ok`.
-  Errors, hangs, cancellation and exhaustion are returned from `chat_stream`
-  itself.
+  Cancellation arrives inside the stream, not from the call: `chat_stream`
+  returns `Ok(stream)` and the `Cancelled` error is its single `Err` item —
+  like `pulsehive-openai`'s `chat_stream`, which delivers mid-flight
+  cancellation as a stream item. `then_error` and script exhaustion fail the
+  call itself, matching that provider's pre-stream failure path.
 
 Agent-turn example (no API key, no network):
 

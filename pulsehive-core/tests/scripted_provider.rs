@@ -168,7 +168,8 @@ async fn requests_capture_inputs_and_clones_share_one_log() {
 }
 
 /// S3 — a token already cancelled at call start returns `Cancelled` with
-/// `attempts == 1`, consumes its step, and still records the request.
+/// `attempts == 0` (nothing was sent), consumes its step, and still records
+/// the request.
 #[tokio::test(start_paused = true)]
 async fn pre_cancelled_token_returns_cancelled_and_consumes_its_step() {
     let token = CancellationToken::new();
@@ -184,7 +185,7 @@ async fn pre_cancelled_token_returns_cancelled_and_consumes_its_step() {
     match outcome.expect("a pre-cancelled call must resolve immediately") {
         Err(PulseHiveError::LlmTransport(err)) => {
             assert_eq!(err.kind, LlmErrorKind::Cancelled);
-            assert_eq!(err.attempts, 1);
+            assert_eq!(err.attempts, 0);
         }
         other => panic!("expected Cancelled transport error, got {other:?}"),
     }
@@ -193,7 +194,8 @@ async fn pre_cancelled_token_returns_cancelled_and_consumes_its_step() {
 }
 
 /// S3 — a `then_hang` step pends until its token fires (cancelled from another
-/// task), then returns the same `Cancelled` error.
+/// task), then returns the same `Cancelled` error with `attempts == 1` — the
+/// hang models one in-flight request.
 #[tokio::test(start_paused = true)]
 async fn hang_step_resolves_cancelled_when_another_task_cancels_the_token() {
     let provider = ScriptedProvider::new().then_hang();
@@ -219,6 +221,100 @@ async fn hang_step_resolves_cancelled_when_another_task_cancels_the_token() {
     }
     assert_eq!(provider.remaining(), 0);
     assert_eq!(provider.requests().len(), 1);
+}
+
+/// S3/S6 — on `chat_stream` a token already cancelled at call start yields
+/// `Ok(stream)` whose single item is the `Cancelled` error with
+/// `attempts == 0`; the step is still consumed and the call still records.
+#[tokio::test(start_paused = true)]
+async fn chat_stream_pre_cancelled_token_errors_inside_the_stream() {
+    let token = CancellationToken::new();
+    token.cancel();
+    let provider = ScriptedProvider::new().then_text("a").then_text("b");
+    let cancelled_config = config().with_cancel(token);
+
+    let stream = provider
+        .chat_stream(vec![Message::user("hi")], vec![], &cancelled_config)
+        .await;
+    let stream = stream.expect("chat_stream must return Ok(stream) for a pre-cancelled call");
+    let chunks = tokio::time::timeout(Duration::from_secs(1_000), collect_stream(stream))
+        .await
+        .expect("a pre-cancelled stream must resolve immediately");
+    assert_eq!(chunks.len(), 1);
+    match &chunks[0] {
+        Err(PulseHiveError::LlmTransport(err)) => {
+            assert_eq!(err.kind, LlmErrorKind::Cancelled);
+            assert_eq!(err.attempts, 0);
+        }
+        other => panic!("expected Cancelled transport error item, got {other:?}"),
+    }
+    assert_eq!(provider.remaining(), 1);
+    assert_eq!(provider.requests().len(), 1);
+}
+
+/// S6 — a `then_hang` step on `chat_stream` pends inside the stream until
+/// its token fires (cancelled from another task), then yields exactly one
+/// `Cancelled` item with `attempts == 1`.
+#[tokio::test(start_paused = true)]
+async fn chat_stream_hang_step_errors_in_stream_when_token_fires() {
+    let provider = ScriptedProvider::new().then_hang();
+    let token = CancellationToken::new();
+    let hang_config = config().with_cancel(token.clone());
+
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        token.cancel();
+    });
+
+    let stream = provider
+        .chat_stream(vec![Message::user("hi")], vec![], &hang_config)
+        .await
+        .expect("chat_stream must return Ok(stream) for a hang step");
+    let chunks = tokio::time::timeout(Duration::from_secs(1_000), collect_stream(stream))
+        .await
+        .expect("hang step must resolve once the token fires");
+    assert_eq!(chunks.len(), 1);
+    match &chunks[0] {
+        Err(PulseHiveError::LlmTransport(err)) => {
+            assert_eq!(err.kind, LlmErrorKind::Cancelled);
+            assert_eq!(err.attempts, 1);
+        }
+        other => panic!("expected Cancelled transport error item, got {other:?}"),
+    }
+    assert_eq!(provider.remaining(), 0);
+    assert_eq!(provider.requests().len(), 1);
+}
+
+/// S6 — `then_error` and script exhaustion are call-level errors on
+/// `chat_stream`, like a pre-stream request failure on `pulsehive-openai`;
+/// both calls still record.
+#[tokio::test]
+async fn chat_stream_then_error_and_exhaustion_fail_the_call_itself() {
+    let provider = ScriptedProvider::new().then_error(PulseHiveError::llm("boom"));
+
+    match provider
+        .chat_stream(vec![Message::user("hi")], vec![], &config())
+        .await
+    {
+        Err(PulseHiveError::Llm(message)) => assert_eq!(message, "boom"),
+        Ok(_) => panic!("expected call-level Llm error, got Ok(stream)"),
+        Err(other) => panic!("expected call-level Llm error, got {other:?}"),
+    }
+
+    match provider
+        .chat_stream(vec![Message::user("hi")], vec![], &config())
+        .await
+    {
+        Err(PulseHiveError::Llm(message)) => {
+            assert!(
+                message.contains('1'),
+                "message should name the calls served: {message}"
+            );
+        }
+        Ok(_) => panic!("expected call-level exhaustion error, got Ok(stream)"),
+        Err(other) => panic!("expected call-level exhaustion error, got {other:?}"),
+    }
+    assert_eq!(provider.requests().len(), 2);
 }
 
 /// S6 — `chat_stream` takes the same step and replays `Text` (when content is
