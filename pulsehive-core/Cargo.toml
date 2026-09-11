@@ -12,6 +12,9 @@ documentation = "https://docs.rs/pulsehive-core"
 keywords = ["ai", "agent", "llm", "traits", "sdk"]
 categories = ["science", "asynchronous"]
 
+[features]
+testing = []
+
 [dependencies]
 pulsehive-db = { workspace = true }
 serde = { workspace = true }
@@ -27,3 +30,7 @@ tracing = { workspace = true }
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
 tempfile = { workspace = true }
+
+[[test]]
+name = "scripted_provider"
+required-features = ["testing"]
