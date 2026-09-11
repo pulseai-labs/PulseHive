@@ -658,6 +658,111 @@ impl Default for ContextBudget {
 }
 ```
 
+### 3.12 ScriptedProvider (feature `testing`)
+
+A queued-response `LlmProvider` for deterministic, offline tests. Available
+behind the `testing` feature on `pulsehive-core` (`pulsehive_core::testing`)
+and on the `pulsehive` meta-crate (`pulsehive::testing`). It is not exported
+through the prelude — import it explicitly.
+
+```rust
+#[non_exhaustive]
+pub struct ScriptedProvider { /* shared queue + request log */ }
+
+impl ScriptedProvider {
+    pub fn new() -> Self;
+    pub fn then_text(self, content: impl Into<String>) -> Self;
+    pub fn then_tool_call(self, name: impl Into<String>, arguments: serde_json::Value) -> Self;
+    pub fn then_response(self, response: LlmResponse) -> Self;
+    pub fn then_error(self, error: PulseHiveError) -> Self;
+    pub fn then_hang(self) -> Self;
+    pub fn requests(&self) -> Vec<RecordedRequest>;
+    pub fn remaining(&self) -> usize;
+}
+
+#[non_exhaustive]
+pub struct RecordedRequest {
+    pub messages: Vec<Message>,
+    pub tools: Vec<ToolDefinition>,
+    pub config: LlmConfig,
+}
+```
+
+Behaviour:
+
+- **One step per call, in order.** Every `chat` / `chat_stream` call first
+  records its inputs (messages, tools, config — visible through `requests()`),
+  then takes exactly one step from the front of the queue. Calls that were
+  cancelled or found the script exhausted still record their request, and a
+  cancelled call still consumes its step.
+- **Exhaustion is a typed error.** An empty queue returns
+  `Err(PulseHiveError::Llm(..))` whose message names how many calls were
+  served — never a panic, never a default reply. Exhaustion takes precedence
+  over cancellation: an already-cancelled call with an empty queue gets the
+  exhaustion error, because step-taking is checked first.
+- **Cancellation follows the transport contract.** A token already cancelled
+  at call start returns `PulseHiveError::LlmTransport` with kind `Cancelled`
+  and `attempts == 0` — nothing was sent; a `then_hang` step whose token
+  fires returns the same kind with `attempts == 1` — the hang models one
+  in-flight request. A `then_hang` step without a token pends forever. An
+  already-cancelled token pre-empts the scripted outcome (`then_response`,
+  `then_error`): the step is still consumed and the `Cancelled` error is
+  returned instead.
+- **Clones share state.** All clones share one queue and one request log, so
+  the clone registered on a `HiveMindBuilder` writes the log the test's
+  original reads.
+- **Insight synthesis is an extra consumer.** `HiveMind`'s builder enables
+  insight synthesis by default (`InsightSynthesizer::with_defaults()`,
+  relation-density threshold 5). Once a cluster crosses the threshold,
+  `record_experience` — the Record phase of every agent turn — issues one
+  additional `chat` completion per synthesis through the **first registered
+  provider in arbitrary `HashMap` order**, with a fresh
+  `LlmConfig::new(provider_name, "default")` that carries no cancel token.
+  Against a `ScriptedProvider` that call consumes a scripted step and lands
+  in `requests()` even when the synthesizer discards the outcome (a queued
+  text reply becomes the insight; script exhaustion or a `then_error` yields
+  no insight — the step is spent either way). A test that crosses the
+  threshold should either script the extra steps or disable synthesis with
+  `HiveMindBuilder::no_insight_synthesizer()` (or install a custom
+  synthesizer via `HiveMindBuilder::insight_synthesizer`).
+- **Deterministic ids and defaults.** Tool-call ids are numbered per provider
+  at script time (`call_1`, `call_2`, …), whatever steps sit between them.
+  `then_text` sets finish reason `"stop"`, `then_tool_call` sets
+  `"tool_calls"`; usage on both is zero. `then_response` returns its response
+  verbatim; `then_error` returns its error as-is.
+- **`chat_stream` takes the same step.** A response replays as
+  `LlmChunk::Text` (when content is set), then `ToolCallStart` and one
+  full-arguments `ToolCallDelta` per tool call, then `Done`, each item `Ok`.
+  Cancellation arrives inside the stream, not from the call: `chat_stream`
+  returns `Ok(stream)` and the `Cancelled` error is its single `Err` item —
+  like `pulsehive-openai`'s `chat_stream`, which delivers mid-flight
+  cancellation as a stream item. `then_error` and script exhaustion fail the
+  call itself, matching that provider's pre-stream failure path.
+
+Agent-turn example (no API key, no network) — sketch; the complete,
+compiling version is the integration test
+`pulsehive/tests/scripted_agent_turn.rs` (behind the meta-crate's `testing`
+feature), which is the source of truth for every import path:
+
+```rust,ignore
+use pulsehive::agent::{AgentDefinition, AgentKind, LlmAgentConfig};
+use pulsehive::llm::LlmConfig;
+use pulsehive::testing::ScriptedProvider;
+use pulsehive::{HiveMind, Task};
+
+let provider = ScriptedProvider::new()
+    .then_tool_call("echo", json!({"text": "hi"}))
+    .then_text("done");
+let hive = HiveMind::builder()
+    .substrate_path(dir.path().join("test.db"))
+    .llm_provider("scripted", provider.clone())
+    .build()?;
+// Deploy an AgentKind::Llm agent whose llm_config routes to "scripted",
+// drain the deploy stream to HiveEvent::AgentCompleted, then assert on
+// what the provider saw:
+assert_eq!(provider.requests().len(), 2); // tool result went back in
+```
+
 ---
 
 ## 4. Public Enums

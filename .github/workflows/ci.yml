@@ -77,16 +77,21 @@ jobs:
       - name: Format check
         run: cargo fmt --all --check
 
+      # The `testing` features are off by default (ScriptedProvider is a
+      # test-only API), and both scripted suites are `required-features`
+      # targets — without these flags CI would never compile or run
+      # pulsehive-core's `scripted_provider` contract tests or pulsehive's
+      # `scripted_agent_turn` integration test.
       - name: Clippy
-        run: cargo clippy --all-targets --workspace -- -D warnings
+        run: cargo clippy --all-targets --workspace --features pulsehive/testing,pulsehive-core/testing -- -D warnings
 
       - name: Build
-        run: cargo build --workspace
+        run: cargo build --workspace --features pulsehive/testing,pulsehive-core/testing
 
       # Exclude cdylib crates from Rust tests (they have language-runtime-dependent doc-tests).
       # Python bindings tested in python-tests job; Node.js bindings tested in node-tests job.
       - name: Test
-        run: cargo test --workspace --exclude pulsehive-py --exclude pulsehive-js
+        run: cargo test --workspace --exclude pulsehive-py --exclude pulsehive-js --features pulsehive/testing,pulsehive-core/testing
 
       - name: Doc
         run: cargo doc --no-deps --workspace

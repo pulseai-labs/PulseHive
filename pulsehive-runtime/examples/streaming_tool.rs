@@ -1,8 +1,9 @@
 //! PulseHive Streaming Tool Example
 //!
 //! Demonstrates a long-running [`StreamingTool`] that reports **live progress**
-//! through the agent loop instead of a frozen wait. A scripted (in-file) LLM
-//! provider requests the streaming tool once; the tool emits fractional
+//! through the agent loop instead of a frozen wait. The SDK's scripted test
+//! provider ([`ScriptedProvider`], behind `pulsehive-core`'s `testing` feature)
+//! requests the streaming tool once; the tool emits fractional
 //! `ToolProgress::Progress` events roughly once per second for ~5s. The agent
 //! loop (v2.1.0) forwards each one as a `HiveEvent::ToolProgress` and brackets
 //! them with loop-generated `Started` / `Completed` bookends.
@@ -19,24 +20,30 @@
 //! ```bash
 //! cargo run -p pulsehive-runtime --example streaming_tool
 //! ```
+//!
+//! **Feature note:** the scripted provider lives behind `pulsehive-core`'s
+//! `testing` feature. In-repo this example builds with no extra flags
+//! because cargo compiles examples against dev-dependencies and
+//! `pulsehive-runtime` dev-depends on `pulsehive-core` with
+//! `features = ["testing"]`. Copying this example into your own crate means
+//! enabling that feature yourself — `pulsehive-core = { features = ["testing"] }`
+//! on your dependency (or, through the meta-crate,
+//! `pulsehive = { features = ["testing"] }`, then import it as
+//! `pulsehive::testing::ScriptedProvider`).
 
-use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::Mutex;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use futures::StreamExt;
-use futures_core::Stream;
 use serde_json::Value;
 
 use pulsehive_core::agent::{AgentDefinition, AgentKind, LlmAgentConfig};
-use pulsehive_core::error::{PulseHiveError, Result};
+use pulsehive_core::error::Result;
 use pulsehive_core::event::HiveEvent;
 use pulsehive_core::lens::Lens;
-use pulsehive_core::llm::{
-    LlmChunk, LlmConfig, LlmProvider, LlmResponse, Message, TokenUsage, ToolCall, ToolDefinition,
-};
+use pulsehive_core::llm::LlmConfig;
+use pulsehive_core::testing::ScriptedProvider;
 use pulsehive_core::tool::{StreamingTool, Tool, ToolContext, ToolProgress, ToolResult};
 use pulsehive_runtime::hivemind::{HiveMind, Task};
 use tokio::sync::mpsc;
@@ -48,66 +55,6 @@ const PROGRESS_STEPS: usize = 6;
 /// Delay between progress emissions. `< 1000ms` keeps the rate at `>= 1
 /// Progress` per second across ~5s of simulated work.
 const STEP_MS: u64 = 800;
-
-// ── Scripted LLM ────────────────────────────────────────────────────────
-// Requests the streaming tool once, then returns a final text answer. No API
-// key, no network — same in-file provider pattern as `custom_tool.rs`.
-
-struct ScriptedLlm {
-    responses: Mutex<Vec<LlmResponse>>,
-}
-
-impl ScriptedLlm {
-    fn new(responses: Vec<LlmResponse>) -> Self {
-        Self {
-            responses: Mutex::new(responses),
-        }
-    }
-
-    fn text(content: &str) -> LlmResponse {
-        LlmResponse::text(content)
-    }
-
-    fn tool_call(id: &str, name: &str, args: Value) -> LlmResponse {
-        LlmResponse::new(
-            None,
-            vec![ToolCall {
-                id: id.into(),
-                name: name.into(),
-                arguments: args,
-            }],
-            TokenUsage::default(),
-        )
-    }
-}
-
-#[async_trait]
-impl LlmProvider for ScriptedLlm {
-    async fn chat(
-        &self,
-        _messages: Vec<Message>,
-        _tools: Vec<ToolDefinition>,
-        _config: &LlmConfig,
-    ) -> Result<LlmResponse> {
-        let mut responses = self.responses.lock().unwrap();
-        if responses.is_empty() {
-            Err(PulseHiveError::llm("No more scripted responses"))
-        } else {
-            Ok(responses.remove(0))
-        }
-    }
-
-    async fn chat_stream(
-        &self,
-        _messages: Vec<Message>,
-        _tools: Vec<ToolDefinition>,
-        _config: &LlmConfig,
-    ) -> Result<Pin<Box<dyn Stream<Item = Result<LlmChunk>> + Send>>> {
-        Err(PulseHiveError::llm(
-            "LLM token streaming is not used in this example",
-        ))
-    }
-}
 
 // ── Streaming tool ──────────────────────────────────────────────────────
 // Emits a `Progress` event every ~800ms for ~5s. The `Started` / `Completed`
@@ -165,14 +112,16 @@ impl StreamingTool for ProgressStreamTool {
 #[tokio::main]
 async fn main() {
     let dir = tempfile::tempdir().expect("create tempdir");
+    // The SDK's scripted provider (same script the in-file double used to
+    // encode): one tool call — the provider numbers its id `call_1` — then a
+    // final text answer.
     let hive = HiveMind::builder()
         .substrate_path(dir.path().join("streaming.db"))
         .llm_provider(
             "mock",
-            ScriptedLlm::new(vec![
-                ScriptedLlm::tool_call("call_1", "progress_stream", serde_json::json!({})),
-                ScriptedLlm::text("Streaming tool finished."),
-            ]),
+            ScriptedProvider::new()
+                .then_tool_call("progress_stream", serde_json::json!({}))
+                .then_text("Streaming tool finished."),
         )
         .build()
         .expect("build HiveMind");
