@@ -30,25 +30,12 @@ impl ExperienceExtractor for DefaultExperienceExtractor {
         outcome: &AgentOutcome,
         context: &ExtractionContext,
     ) -> Vec<NewExperience> {
-        let base = || NewExperience {
-            collective_id: context.collective_id,
-            content: String::new(),
-            experience_type: ExperienceType::Generic { category: None },
-            embedding: None, // Builtin computes
-            importance: 0.5,
-            confidence: 0.5,
-            domain: vec![],
-            source_agent: AgentId(context.agent_id.clone()),
-            source_task: None,
-            related_files: vec![],
-        };
-
         match outcome {
             AgentOutcome::Complete { response } => {
                 if response.is_empty() {
                     return vec![];
                 }
-                let mut exp = base();
+                let mut exp = new_experience(context);
                 exp.content = format!(
                     "Task: {}\n\nResult: {}",
                     context.task_description,
@@ -62,48 +49,10 @@ impl ExperienceExtractor for DefaultExperienceExtractor {
                 vec![exp]
             }
             AgentOutcome::Error { error } => {
-                let mut experiences = Vec::new();
-
-                // Check conversation for successful tool results before the error.
-                // This captures partial progress even when the agent ultimately fails.
-                let tool_results = extract_tool_summaries(conversation);
-                if !tool_results.is_empty() {
-                    let mut partial = base();
-                    let summaries: String = tool_results
-                        .iter()
-                        .map(|s| format!("- {s}"))
-                        .collect::<Vec<_>>()
-                        .join("\n");
-                    partial.content = format!(
-                        "Task: {}\n\nPartial progress ({} tool calls completed):\n{}\n\nFailed with: {}",
-                        context.task_description,
-                        tool_results.len(),
-                        summaries,
-                        error,
-                    );
-                    partial.experience_type = ExperienceType::Generic {
-                        category: Some("partial_completion".into()),
-                    };
-                    partial.importance = 0.6;
-                    partial.confidence = 0.6;
-                    experiences.push(partial);
-                }
-
-                let mut exp = base();
-                exp.content = format!("Task: {}\n\nError: {}", context.task_description, error);
-                exp.experience_type = ExperienceType::ErrorPattern {
-                    signature: truncate(error, 500),
-                    fix: String::new(),
-                    prevention: String::new(),
-                };
-                exp.importance = 0.5;
-                exp.confidence = 0.5;
-                experiences.push(exp);
-
-                experiences
+                extract_error_experiences(conversation, error, context)
             }
             AgentOutcome::MaxIterationsReached => {
-                let mut exp = base();
+                let mut exp = new_experience(context);
                 exp.content = format!(
                     "Task: {}\n\nAgent reached maximum iterations without completing.",
                     context.task_description
@@ -118,6 +67,64 @@ impl ExperienceExtractor for DefaultExperienceExtractor {
             }
         }
     }
+}
+
+fn new_experience(context: &ExtractionContext) -> NewExperience {
+    NewExperience {
+        collective_id: context.collective_id,
+        content: String::new(),
+        experience_type: ExperienceType::Generic { category: None },
+        embedding: None, // Builtin computes
+        importance: 0.5,
+        confidence: 0.5,
+        domain: vec![],
+        tags: Default::default(),
+        source_agent: AgentId(context.agent_id.clone()),
+        source_task: None,
+        related_files: vec![],
+    }
+}
+
+fn extract_error_experiences(
+    conversation: &[Message],
+    error: &str,
+    context: &ExtractionContext,
+) -> Vec<NewExperience> {
+    let tool_results = extract_tool_summaries(conversation);
+    let mut experiences = Vec::new();
+    if !tool_results.is_empty() {
+        let mut partial = new_experience(context);
+        let summaries = tool_results
+            .iter()
+            .map(|summary| format!("- {summary}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        partial.content = format!(
+            "Task: {}\n\nPartial progress ({} tool calls completed):\n{}\n\nFailed with: {}",
+            context.task_description,
+            tool_results.len(),
+            summaries,
+            error,
+        );
+        partial.experience_type = ExperienceType::Generic {
+            category: Some("partial_completion".into()),
+        };
+        partial.importance = 0.6;
+        partial.confidence = 0.6;
+        experiences.push(partial);
+    }
+
+    let mut exp = new_experience(context);
+    exp.content = format!("Task: {}\n\nError: {}", context.task_description, error);
+    exp.experience_type = ExperienceType::ErrorPattern {
+        signature: truncate(error, 500),
+        fix: String::new(),
+        prevention: String::new(),
+    };
+    exp.importance = 0.5;
+    exp.confidence = 0.5;
+    experiences.push(exp);
+    experiences
 }
 
 /// Extract summaries of successful tool results from the conversation.

@@ -18,8 +18,10 @@ use crate::events::PyHiveEvent;
 /// Obtained from ``await hive.deploy(agents, tasks)``.
 /// Consumed via::
 ///
-///     async for event in stream:
-///         print(event.event_type, event.data)
+/// ```text
+/// async for event in stream:
+///     print(event.event_type, event.data)
+/// ```
 #[pyclass(name = "EventStream")]
 pub struct PyEventStream {
     pub(crate) stream: Arc<Mutex<Pin<Box<dyn futures::Stream<Item = HiveEvent> + Send>>>>,
