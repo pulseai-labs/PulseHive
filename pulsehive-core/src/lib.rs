@@ -13,11 +13,14 @@ pub mod embedding;
 pub mod error;
 pub mod event;
 pub mod export;
+pub mod ids;
 pub mod lens;
 pub mod llm;
 #[cfg(feature = "testing")]
 pub mod testing;
 pub mod tool;
+
+pub use crate::ids::{CollectiveId, ExperienceId, InsightId, RelationId};
 
 /// Re-exports of the most commonly used types.
 ///
@@ -62,9 +65,11 @@ pub mod prelude {
     // ── Tool types ───────────────────────────────────────────────────
     pub use crate::tool::{LogLevel, ToolContext, ToolProgress, ToolResult};
 
+    // ── Core-owned public identifiers (ADR-013) ──────────────────────
+    pub use crate::ids::{CollectiveId, ExperienceId, InsightId, RelationId};
+
     // ── PulseDB re-exports ───────────────────────────────────────────
     pub use pulsedb::{
-        CollectiveId, Experience, ExperienceId, ExperienceType, InsightId, NewExperience,
-        PulseDBSubstrate, RelationId, SubstrateProvider,
+        Experience, ExperienceType, NewExperience, PulseDBSubstrate, SubstrateProvider,
     };
 }

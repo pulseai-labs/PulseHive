@@ -34,7 +34,12 @@ async fn test_store_and_retrieve_experience() {
     };
 
     let id = hive.record_experience(exp).await.unwrap();
-    let retrieved = hive.substrate().get_experience(id).await.unwrap().unwrap();
+    let retrieved = hive
+        .substrate()
+        .get_experience(pulsedb::ExperienceId::from_bytes(*id.as_bytes()))
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(
         retrieved.content,
         "Rust's ownership model prevents data races."

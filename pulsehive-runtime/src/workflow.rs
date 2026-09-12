@@ -384,7 +384,10 @@ mod tests {
         providers.insert("mock".into(), Arc::new(provider));
 
         WorkflowContext {
-            task: Task::with_collective("Test task", collective_id),
+            task: Task::with_collective(
+                "Test task",
+                crate::substrate_ids::from_db_collective_id(collective_id),
+            ),
             llm_providers: providers,
             substrate,
             approval_handler: Arc::new(pulsehive_core::approval::AutoApprove),

@@ -24,13 +24,14 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use pulsedb::{CollectiveId, SubstrateProvider};
+use pulsedb::SubstrateProvider;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::mpsc;
 
 use crate::error::Result;
 use crate::event::EventEmitter;
+use crate::ids::CollectiveId;
 
 /// Trait for domain-specific tool implementations.
 ///

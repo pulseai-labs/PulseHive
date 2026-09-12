@@ -16,11 +16,13 @@ use tracing::Instrument;
 use pulsehive_core::agent::{AgentOutcome, ExperienceExtractor, LlmAgentConfig};
 use pulsehive_core::approval::{ApprovalHandler, ApprovalResult, PendingAction};
 use pulsehive_core::event::{EventEmitter, HiveEvent};
+use pulsehive_core::ids::CollectiveId;
 use pulsehive_core::lens::Lens;
 use pulsehive_core::llm::{LlmConfig, LlmProvider, Message, ToolCall, ToolDefinition};
 use pulsehive_core::tool::{Tool, ToolContext, ToolProgress, ToolResult};
 
 use crate::hivemind::Task;
+use crate::substrate_ids;
 
 /// Default maximum iterations for the agentic loop.
 pub const DEFAULT_MAX_ITERATIONS: usize = 25;
@@ -236,7 +238,7 @@ async fn execute_tool_call(
     substrate: &Arc<dyn SubstrateProvider>,
     approval_handler: &dyn ApprovalHandler,
     event_emitter: &EventEmitter,
-    collective_id: &pulsedb::CollectiveId,
+    collective_id: &CollectiveId,
 ) -> ToolResult {
     let Some(&tool) = tool_map.get(tool_call.name.as_str()) else {
         tracing::warn!(agent_id = %agent_id, tool = %tool_call.name, "Tool not found");
@@ -303,7 +305,7 @@ async fn execute_tool_inner(
     tool: &dyn Tool,
     substrate: &Arc<dyn SubstrateProvider>,
     event_emitter: &EventEmitter,
-    collective_id: &pulsedb::CollectiveId,
+    collective_id: &CollectiveId,
 ) -> ToolResult {
     let params_str = serde_json::to_string(&params).unwrap_or_default();
     event_emitter.emit(HiveEvent::ToolCallStarted {
@@ -535,7 +537,7 @@ async fn record(
             Ok(id) => {
                 ctx.event_emitter.emit(HiveEvent::ExperienceRecorded {
                     timestamp_ms: pulsehive_core::event::now_ms(),
-                    experience_id: id,
+                    experience_id: substrate_ids::from_db_experience_id(id),
                     agent_id: ctx.agent_id.clone(),
                     content_preview,
                     experience_type,
@@ -562,7 +564,6 @@ mod tests {
     use super::*;
     use async_trait::async_trait;
     use futures_core::Stream;
-    use pulsedb::CollectiveId;
     use pulsehive_core::error::{PulseHiveError, Result};
     use pulsehive_core::llm::{LlmChunk, LlmResponse, TokenUsage};
     use std::pin::Pin;

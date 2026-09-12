@@ -11,7 +11,11 @@
 //! let influence = attractor.influence_at(&query_embedding, &experience.embedding);
 //! ```
 
-use pulsedb::{Experience, ExperienceId};
+use pulsedb::Experience;
+
+use pulsehive_core::ids::ExperienceId;
+
+use crate::substrate_ids;
 
 /// Configuration for attractor dynamics computation.
 #[derive(Debug, Clone)]
@@ -60,7 +64,7 @@ impl AttractorDynamics {
     pub fn from_experience(exp: &Experience, config: &AttractorConfig) -> Self {
         let reinforcement = 1.0 + (exp.applications() as f32 * config.reinforcement_boost);
         Self {
-            experience_id: exp.id,
+            experience_id: substrate_ids::from_db_experience_id(exp.id),
             strength: exp.importance * exp.confidence * reinforcement,
             radius: config.default_radius,
             warp_factor: config.default_warp_factor,
@@ -114,12 +118,14 @@ pub fn cosine_distance(a: &[f32], b: &[f32]) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pulsedb::{AgentId, CollectiveId, ExperienceType, Timestamp};
+    use pulsedb::{
+        AgentId, CollectiveId, ExperienceId as DbExperienceId, ExperienceType, Timestamp,
+    };
     use std::collections::BTreeMap;
 
     fn mock_experience(importance: f32, confidence: f32, applications: u32) -> Experience {
         Experience {
-            id: ExperienceId::new(),
+            id: DbExperienceId::new(),
             collective_id: CollectiveId::new(),
             content: "test".to_string(),
             experience_type: ExperienceType::Generic { category: None },

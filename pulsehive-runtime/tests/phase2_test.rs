@@ -214,6 +214,7 @@ async fn test_phase2_relationship_inference() {
         })
         .await
         .unwrap();
+    let id2 = pulsedb::ExperienceId::from_bytes(*id2.as_bytes());
 
     // Check relations were created (similarity depends on builtin embeddings)
     let related = hive.substrate().get_related(id2).await.unwrap();

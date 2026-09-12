@@ -9,4 +9,5 @@ pub mod field;
 pub mod hivemind;
 pub mod intelligence;
 pub mod perception;
+mod substrate_ids;
 pub mod workflow;

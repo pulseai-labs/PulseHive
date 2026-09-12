@@ -41,21 +41,23 @@ async fn record_network_experience(
     importance: f32,
     confidence: f32,
 ) -> pulsedb::ExperienceId {
-    hive.record_experience(pulsedb::NewExperience {
-        collective_id,
-        content: content.into(),
-        experience_type,
-        embedding: None,
-        importance,
-        confidence,
-        domain: vec!["networking".into(), "reliability".into()],
-        source_agent: pulsedb::AgentId("agent-1".into()),
-        source_task: None,
-        tags: Default::default(),
-        related_files: vec![],
-    })
-    .await
-    .unwrap()
+    let id = hive
+        .record_experience(pulsedb::NewExperience {
+            collective_id,
+            content: content.into(),
+            experience_type,
+            embedding: None,
+            importance,
+            confidence,
+            domain: vec!["networking".into(), "reliability".into()],
+            source_agent: pulsedb::AgentId("agent-1".into()),
+            source_task: None,
+            tags: Default::default(),
+            related_files: vec![],
+        })
+        .await
+        .unwrap();
+    pulsedb::ExperienceId::from_bytes(*id.as_bytes())
 }
 
 #[tokio::test]
@@ -178,6 +180,7 @@ async fn test_record_experience_with_no_detector() {
         })
         .await
         .unwrap();
+    let id = pulsedb::ExperienceId::from_bytes(*id.as_bytes());
 
     // Experience stored
     assert!(hive.substrate().get_experience(id).await.unwrap().is_some());
