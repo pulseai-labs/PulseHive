@@ -15,6 +15,7 @@ PulseHive processes agent experiences but does not own the persistent storage la
 - **PulseDB owns storage:** Vectors, graph, watch system, context assembly
 - **PulseHive owns intelligence:** Attractor dynamics, lens warping, conflict reasoning, insight synthesis
 - **Consumer owns PulseDB instance:** Substrate path provided by consumer
+- **Identifier vs storage ownership:** identifier ownership does not transfer storage ownership — PulseHive owns the typed handles (`CollectiveId`, `ExperienceId`, `InsightId`, `RelationId`) used by its public contracts; PulseDB owns persisted records and storage behavior; `pulsehive-runtime` performs lossless ID conversion only at the adapter boundary (ADR-013)
 - **Execution location, not ownership:** PulseHive does not own persistence, but it does run the database engine in-process — `HiveMindBuilder::build()` opens PulseDB at the consumer-configured substrate path inside the consumer's process and wraps it in `PulseDBSubstrate` (`pulsehive-runtime/src/hivemind.rs`)
 
 **Migration Posture:** Expand/contract via PulseDB

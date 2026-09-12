@@ -14,8 +14,8 @@ PulseHive is organized around five core primitives with strict separation from t
 **Module Boundaries:**
 - **Five primitives hard cap:** HiveMind, Agent, Tool, Lens, Experience
 - **PulseDB strict separation:** PulseHive owns intelligence layer; PulseDB owns storage
-- **Dependency direction:** PulseHive → PulseDB (never reverse)
-- **Primitive homes:** `pulsehive-core` defines the Agent and Tool interfaces and the concrete `Lens` value type; `HiveMind` and its builder are defined in `pulsehive-runtime/src/hivemind.rs`; `Experience` is defined by PulseDB and re-exported by `pulsehive-core`
+- **Dependency direction:** PulseHive → PulseDB (never reverse); the explicit `runtime`/`substrate` feature split (ADR-013) is the mechanism that restores a transport-only dependency direction, so `openai`/`anthropic` resolve neither `pulsehive-runtime` nor PulseDB
+- **Primitive homes:** `pulsehive-core` defines the Agent and Tool interfaces and the concrete `Lens` value type; the public identifiers `CollectiveId`, `ExperienceId`, `InsightId`, and `RelationId` live in `pulsehive-core`; `HiveMind` and its builder are defined in `pulsehive-runtime/src/hivemind.rs`; `Experience` and all persisted storage types remain PulseDB-owned, with `pulsehive-runtime` as the adapter boundary converting core identifiers to and from PulseDB identifier types
 - **Provider modules:** `pulsehive-anthropic`, `pulsehive-openai` implement LlmProvider trait
 - **Runtime module:** `pulsehive-runtime` implements agentic loop and workflow execution
 
