@@ -49,8 +49,8 @@ The database file was then copied here byte-for-byte as `collective.db`.
 bytes. Opening a PulseDB database can write (WAL/journal files, metadata,
 compaction on close), so the checked-in file must never be a writable target.
 Every test that reads this fixture first copies `collective.db` to a temporary
-directory and opens only the copy; the baseline test
-(`pulsehive-runtime/tests/pulsedb_legacy_fixture.rs`) additionally asserts the
+directory and opens only the copy; the migration test
+(`pulsehive-runtime/tests/pulsedb_migration.rs`) additionally asserts the
 checked-in bytes are unchanged after its run, and the work-item gate
 re-verifies the SHA-256 with `shasum -a 256` before and after.
 
