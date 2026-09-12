@@ -8,8 +8,10 @@ use std::collections::HashMap;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 
-use pulsehive_core::agent::AgentOutcome;
+use pulsehive_core::agent::{AgentKindTag, AgentOutcome};
 use pulsehive_core::event::HiveEvent;
+use pulsehive_core::prelude::CollectiveId;
+
 use pulsehive_core::tool::ToolProgress;
 
 /// Lifecycle and observability event from the PulseHive runtime.
@@ -84,7 +86,9 @@ impl PyHiveEvent {
             .iter()
             .take(3)
             .map(|(k, v)| match v {
-                PyEventValue::Str(s) if s.len() > 30 => format!("{k}='{}'...", &s[..30]),
+                PyEventValue::Str(s) if s.len() > 30 => {
+                    format!("{k}='{}'...", truncate_chars(s, 30))
+                }
                 PyEventValue::Str(s) => format!("{k}='{s}'"),
                 PyEventValue::Int(n) => format!("{k}={n}"),
                 PyEventValue::Uint(n) => format!("{k}={n}"),
@@ -385,6 +389,31 @@ mod tests {
     use super::*;
 
     #[test]
+    fn repr_never_panics_on_multibyte_fields() {
+        // Eight four-byte emoji: byte 30 falls mid-character.
+        let event = HiveEvent::AgentStarted {
+            timestamp_ms: 1,
+            agent_id: "a1".into(),
+            name: "emoji-agent".into(),
+            kind: AgentKindTag::Llm,
+            collective_id: CollectiveId::new(),
+            task_description: "😀".repeat(8),
+        };
+        let py_event = PyHiveEvent::from(event);
+        // The panic the regression guards against is the slice itself; the
+        // field ordering in the HashMap preview is arbitrary, so only the
+        // shape of the rendering is asserted.
+        let rendered = py_event.__repr__();
+        assert!(rendered.starts_with("HiveEvent(agent_started"));
+    }
+
+    #[test]
+    fn truncate_chars_floors_to_char_boundary() {
+        assert_eq!(truncate_chars("hello", 30), "hello");
+        assert_eq!(truncate_chars("😀😀😀", 5), "😀");
+    }
+
+    #[test]
     fn pyhiveevent_tool_progress_maps_event_type() {
         let event = HiveEvent::ToolProgress {
             timestamp_ms: 1,
@@ -405,4 +434,18 @@ mod tests {
             Some(PyEventValue::Str(s)) if s == "progress"
         ));
     }
+}
+
+/// Truncates to at most `max_bytes`, cutting at the nearest UTF-8
+/// character boundary so multibyte content never panics the debug
+/// renderer.
+pub(crate) fn truncate_chars(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    let mut end = max_bytes;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
 }

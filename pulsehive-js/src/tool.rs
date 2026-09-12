@@ -123,7 +123,7 @@ impl JsToolResult {
     #[cfg_attr(feature = "napi", napi(js_name = "toString"))]
     pub fn to_string_js(&self) -> String {
         let preview = if self.content.len() > 50 {
-            format!("{}...", &self.content[..50])
+            format!("{}...", crate::events::truncate_chars(&self.content, 50))
         } else {
             self.content.clone()
         };

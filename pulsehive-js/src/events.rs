@@ -5,8 +5,10 @@
 
 use std::collections::HashMap;
 
-use pulsehive_core::agent::AgentOutcome;
+use pulsehive_core::agent::{AgentKindTag, AgentOutcome};
 use pulsehive_core::event::HiveEvent;
+use pulsehive_core::prelude::CollectiveId;
+
 use pulsehive_core::tool::ToolProgress;
 
 #[cfg(feature = "napi")]
@@ -75,7 +77,9 @@ impl JsHiveEvent {
             .iter()
             .take(3)
             .map(|(k, v)| match v {
-                EventValue::Str(s) if s.len() > 30 => format!("{k}='{}'...", &s[..30]),
+                EventValue::Str(s) if s.len() > 30 => {
+                    format!("{k}='{}'...", truncate_chars(s, 30))
+                }
                 EventValue::Str(s) => format!("{k}='{s}'"),
                 EventValue::Num(n) => format!("{k}={n}"),
                 EventValue::Float(f) => format!("{k}={f}"),
@@ -354,6 +358,31 @@ mod tests {
     use super::*;
 
     #[test]
+    fn to_string_js_never_panics_on_multibyte_fields() {
+        // Eight four-byte emoji: byte 30 falls mid-character.
+        let event = HiveEvent::AgentStarted {
+            timestamp_ms: 1,
+            agent_id: "a1".into(),
+            name: "emoji-agent".into(),
+            kind: AgentKindTag::Llm,
+            collective_id: CollectiveId::new(),
+            task_description: "😀".repeat(8),
+        };
+        let js_event = JsHiveEvent::from(event);
+        // The panic the regression guards against is the slice itself; the
+        // field ordering in the HashMap preview is arbitrary, so only the
+        // shape of the rendering is asserted.
+        let rendered = js_event.to_string_js();
+        assert!(rendered.starts_with("HiveEvent(agent_started"));
+    }
+
+    #[test]
+    fn truncate_chars_floors_to_char_boundary() {
+        assert_eq!(truncate_chars("hello", 30), "hello");
+        assert_eq!(truncate_chars("😀😀😀", 5), "😀");
+    }
+
+    #[test]
     fn jshiveevent_tool_progress_maps_event_type() {
         let event = HiveEvent::ToolProgress {
             timestamp_ms: 1,
@@ -374,4 +403,18 @@ mod tests {
             Some(EventValue::Str(s)) if s == "progress"
         ));
     }
+}
+
+/// Truncates to at most `max_bytes`, cutting at the nearest UTF-8
+/// character boundary so multibyte content never panics the debug
+/// renderer.
+pub(crate) fn truncate_chars(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    let mut end = max_bytes;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
 }

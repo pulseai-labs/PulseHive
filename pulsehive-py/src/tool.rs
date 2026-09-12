@@ -125,7 +125,7 @@ impl PyToolResult {
 
     fn __repr__(&self) -> String {
         let preview = if self.content.len() > 50 {
-            format!("{}...", &self.content[..50])
+            format!("{}...", crate::events::truncate_chars(&self.content, 50))
         } else {
             self.content.clone()
         };
