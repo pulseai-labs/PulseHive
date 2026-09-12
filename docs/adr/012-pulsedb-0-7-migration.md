@@ -64,6 +64,15 @@ full embedding-pipeline fingerprinting, and custom External-mode identity enforc
 are upstream or later-scope work and are out of scope for this spine. Nothing here adds
 a migration service, a compatibility wrapper, or a new dependency.
 
+**Deploy resolves a task's collective before creating one.** `HiveMind::deploy` and
+`redeploy` previously created the `collective-{id}` synthetic namespace unconditionally
+and replaced the task's collective ID with the result, so a task naming an existing
+collective was redirected into a fresh namespace. They now keep a task's collective ID
+when that collective already exists and fall back to the synthetic namespace only for
+unknown IDs. This is the behavior the migration proof depends on — deploying onto a
+migrated 0.5.1 collective must write into that collective — and it is recorded in the
+2.1.0 changelog as the observable deploy behavior change of this upgrade.
+
 **Rationale:** ADR-004's ownership line means the only honest PulseHive posture is to
 open the substrate and propagate typed errors; duplicating upstream migration logic
 would create a second storage implementation to maintain. Recording the re-export break
