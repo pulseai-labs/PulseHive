@@ -956,7 +956,7 @@ let hive = HiveMind::builder()
 
 ### 5.2 HiveMind::deploy()
 
-The primary entry point for running agents. Accepts agent definitions and tasks, spawns agent execution on the Tokio runtime, and returns a stream of events.
+The primary entry point for running agents. Accepts agent definitions and tasks, spawns agent execution on the Tokio runtime, and returns a stream of events. Every agent runs against every task — the cartesian product `agents × tasks` — with each task's collective resolved independently (an existing collective is reused; an unknown ID gets the `collective-{id}` synthetic namespace). An empty `tasks` list deploys every agent against a single default empty task; an empty `agents` list returns an empty stream without touching the substrate.
 
 ```rust
 let researcher = AgentDefinition {

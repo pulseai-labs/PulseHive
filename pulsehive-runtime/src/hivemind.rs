@@ -130,13 +130,23 @@ impl HiveMind {
 
     /// Deploy agents to execute tasks. Returns a stream of events.
     ///
-    /// Each agent is spawned as a Tokio task and dispatched via
+    /// Every agent runs against every task — the cartesian product of
+    /// `agents × tasks` — so each task is executed by the full agent set.
+    /// Each task's collective is resolved independently (an existing
+    /// collective is reused; an unknown ID gets the synthetic
+    /// `collective-{id}` namespace). An empty `tasks` list deploys every
+    /// agent against a single default empty task.
+    ///
+    /// Each agent run is spawned as a Tokio task and dispatched via
     /// the workflow module's `dispatch_agent()` which handles all agent kinds
     /// (LLM, Sequential, Parallel, Loop).
     ///
-    /// Automatically subscribes to the PulseDB Watch system for the collective,
-    /// forwarding substrate change events as [`HiveEvent::WatchNotification`].
-    /// If Watch subscription fails, agents still execute normally (graceful degradation).
+    /// Automatically subscribes to the PulseDB Watch system — one background
+    /// watch task for the whole deployment, fanning in every resolved
+    /// collective — forwarding substrate change events as
+    /// [`HiveEvent::WatchNotification`]. If a Watch subscription fails, that
+    /// collective is skipped and agents still execute normally (graceful
+    /// degradation).
     pub async fn deploy(
         &self,
         agents: Vec<AgentDefinition>,
@@ -146,38 +156,58 @@ impl HiveMind {
             return Ok(Box::pin(stream::empty()));
         }
 
-        // Get the first task (or create a default one)
-        let mut task = tasks.into_iter().next().unwrap_or_else(|| Task::new(""));
+        // Resolve every task's collective before falling back to the
+        // historical single default task, so no task in the list is dropped.
+        let mut resolved_tasks = Vec::with_capacity(tasks.len());
+        for mut task in tasks {
+            self.resolve_collective(&mut task).await?;
+            resolved_tasks.push(task);
+        }
+        if resolved_tasks.is_empty() {
+            resolved_tasks.push(Task::new(""));
+        }
 
-        // Resolve an existing collective before falling back to Task::new's namespace.
-        self.resolve_collective(&mut task).await?;
-        let collective_id = task.collective_id;
+        // One watch collective per distinct resolved collective, first-seen
+        // order, so duplicated collectives do not duplicate notifications.
+        let mut watch_collectives: Vec<CollectiveId> = Vec::new();
+        for task in &resolved_tasks {
+            if !watch_collectives.contains(&task.collective_id) {
+                watch_collectives.push(task.collective_id);
+            }
+        }
 
         // Subscribe to Watch system for real-time substrate change notifications.
-        // Runs as a background task — failure to subscribe doesn't block deployment.
-        // Respects the shutdown flag for graceful termination.
+        // Runs as a single background task fanning in every collective —
+        // failure to subscribe doesn't block deployment, and the shutdown
+        // flag is respected for graceful termination.
         let watch_substrate = Arc::clone(&self.substrate);
         let watch_emitter = self.event_bus.clone();
         let watch_shutdown = Arc::clone(&self.shutdown);
         let watch_handle = tokio::spawn(async move {
-            match watch_substrate.watch(collective_id).await {
-                Ok(mut watch_stream) => {
-                    while !watch_shutdown.load(Ordering::Relaxed) {
-                        match watch_stream.next().await {
-                            Some(event) => {
-                                watch_emitter.emit(HiveEvent::WatchNotification {
-                                    timestamp_ms: pulsehive_core::event::now_ms(),
-                                    experience_id: event.experience_id,
-                                    collective_id: event.collective_id,
-                                    event_type: format!("{:?}", event.event_type),
-                                });
-                            }
-                            None => break,
-                        }
+            let mut watch_streams = stream::SelectAll::new();
+            for collective_id in watch_collectives {
+                match watch_substrate.watch(collective_id).await {
+                    Ok(watch_stream) => watch_streams.push(watch_stream),
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            collective_id = %collective_id,
+                            "Failed to subscribe to Watch system"
+                        );
                     }
                 }
-                Err(e) => {
-                    tracing::warn!(error = %e, "Failed to subscribe to Watch system");
+            }
+            while !watch_shutdown.load(Ordering::Relaxed) {
+                match watch_streams.next().await {
+                    Some(event) => {
+                        watch_emitter.emit(HiveEvent::WatchNotification {
+                            timestamp_ms: pulsehive_core::event::now_ms(),
+                            experience_id: event.experience_id,
+                            collective_id: event.collective_id,
+                            event_type: format!("{:?}", event.event_type),
+                        });
+                    }
+                    None => break,
                 }
             }
         });
@@ -195,7 +225,9 @@ impl HiveMind {
         let rx = self.event_bus.subscribe();
 
         for agent in agents {
-            self.spawn_agent(agent, task.clone());
+            for task in &resolved_tasks {
+                self.spawn_agent(agent.clone(), task.clone());
+            }
         }
 
         // Convert broadcast::Receiver into a Stream
@@ -970,5 +1002,186 @@ mod tests {
         // Shutdown still tears down the remaining (active) watch task.
         hive.shutdown();
         wait_for_live_watches(&live_watches, 0).await;
+    }
+
+    #[tokio::test]
+    async fn deploy_after_multi_task_deploy_keeps_only_the_active_watch() {
+        let live_watches = Arc::new(AtomicUsize::new(0));
+        let hive = HiveMind::builder()
+            .substrate(Box::new(CountingWatchSubstrate {
+                live_watches: Arc::clone(&live_watches),
+            }))
+            .build()
+            .unwrap();
+        let agent = AgentDefinition {
+            name: "noop".into(),
+            kind: AgentKind::Sequential(vec![]),
+        };
+
+        // Three tasks resolve to three distinct collectives, fanned into ONE
+        // watch task that holds three live streams.
+        let multi = hive
+            .deploy(
+                vec![agent.clone()],
+                vec![Task::new("a"), Task::new("b"), Task::new("c")],
+            )
+            .await
+            .unwrap();
+        drop(multi);
+        wait_for_live_watches(&live_watches, 3).await;
+
+        // A new deploy must cancel that whole fan-in task — not stack a
+        // fourth stream on top of it.
+        let next = hive
+            .deploy(vec![agent], vec![Task::new("d")])
+            .await
+            .unwrap();
+        drop(next);
+        wait_for_live_watches(&live_watches, 1).await;
+        hive.shutdown();
+        wait_for_live_watches(&live_watches, 0).await;
+    }
+
+    /// Scripted-LLM helper for deploy contract tests: an agent whose single
+    /// turn replies `text` through the shared `scripted` provider.
+    fn scripted_agent(name: &str) -> AgentDefinition {
+        use pulsehive_core::agent::LlmAgentConfig;
+        use pulsehive_core::lens::Lens;
+        use pulsehive_core::llm::LlmConfig;
+
+        AgentDefinition {
+            name: name.into(),
+            kind: AgentKind::Llm(Box::new(LlmAgentConfig {
+                system_prompt: "Reply with one word.".into(),
+                tools: vec![],
+                lens: Lens::default(),
+                llm_config: LlmConfig::new("scripted", "deploy-contract-test"),
+                experience_extractor: None,
+                refresh_every_n_tool_calls: None,
+            })),
+        }
+    }
+
+    /// Deploys and drains the event stream until `expected` AgentCompleted
+    /// events have been observed.
+    async fn drain_n_completions(
+        hive: &HiveMind,
+        agents: Vec<AgentDefinition>,
+        tasks: Vec<Task>,
+        expected: usize,
+    ) {
+        let mut stream = hive.deploy(agents, tasks).await.unwrap();
+        let mut completed = 0;
+        tokio::time::timeout(std::time::Duration::from_secs(60), async {
+            while let Some(event) = stream.next().await {
+                if matches!(event, HiveEvent::AgentCompleted { .. }) {
+                    completed += 1;
+                    if completed == expected {
+                        return;
+                    }
+                }
+            }
+        })
+        .await
+        .expect("drain timed out before all agents completed");
+    }
+
+    #[tokio::test]
+    async fn deploy_runs_every_agent_against_every_task() {
+        use pulsehive_core::llm::Message;
+        use pulsehive_core::testing::ScriptedProvider;
+
+        let mut provider = ScriptedProvider::new();
+        for _ in 0..6 {
+            provider = provider.then_text("done");
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let hive = HiveMind::builder()
+            .substrate_path(dir.path().join("cartesian.db"))
+            .llm_provider("scripted", provider.clone())
+            .no_relationship_detector()
+            .no_insight_synthesizer()
+            .build()
+            .unwrap();
+
+        let tasks = vec![
+            Task::new("task-a"),
+            Task::new("task-b"),
+            Task::new("task-c"),
+        ];
+        drain_n_completions(
+            &hive,
+            vec![scripted_agent("agent-one"), scripted_agent("agent-two")],
+            tasks,
+            6,
+        )
+        .await;
+
+        let requests = provider.requests();
+        assert_eq!(requests.len(), 6, "2 agents x 3 tasks = 6 agent runs");
+        let mut seen: Vec<String> = requests
+            .iter()
+            .flat_map(|request| {
+                request.messages.iter().filter_map(|message| match message {
+                    Message::User { content } => Some(content.clone()),
+                    _ => None,
+                })
+            })
+            .collect();
+        for description in ["task-a", "task-b", "task-c"] {
+            assert_eq!(
+                seen.iter().filter(|d| d.as_str() == description).count(),
+                2,
+                "each task is executed by both agents"
+            );
+        }
+        seen.sort();
+        seen.dedup();
+        assert_eq!(seen, vec!["task-a", "task-b", "task-c"], "no task outside the list was invented");
+    }
+
+    #[tokio::test]
+    async fn deploy_without_tasks_runs_every_agent_on_the_default_task() {
+        use pulsehive_core::llm::Message;
+        use pulsehive_core::testing::ScriptedProvider;
+
+        let mut provider = ScriptedProvider::new();
+        for _ in 0..2 {
+            provider = provider.then_text("done");
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let hive = HiveMind::builder()
+            .substrate_path(dir.path().join("default-task.db"))
+            .llm_provider("scripted", provider.clone())
+            .no_relationship_detector()
+            .no_insight_synthesizer()
+            .build()
+            .unwrap();
+
+        drain_n_completions(
+            &hive,
+            vec![scripted_agent("agent-one"), scripted_agent("agent-two")],
+            vec![],
+            2,
+        )
+        .await;
+
+        let requests = provider.requests();
+        assert_eq!(requests.len(), 2, "both agents ran once");
+        for request in requests {
+            let user_messages: Vec<&String> = request
+                .messages
+                .iter()
+                .filter_map(|message| match message {
+                    Message::User { content } => Some(content),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                user_messages,
+                vec![&String::new()],
+                "the default task carries an empty description"
+            );
+        }
     }
 }
