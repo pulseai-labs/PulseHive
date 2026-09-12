@@ -181,7 +181,16 @@ impl HiveMind {
                 }
             }
         });
-        *self.watch_handle.lock().unwrap() = Some(watch_handle);
+        // Cancel the previous deploy's watch task before storing the new
+        // handle: overwriting the slot without aborting would leak the old
+        // task and its EventBus sender clone for the lifetime of the hive.
+        {
+            let mut watch_slot = self.watch_handle.lock().unwrap();
+            if let Some(previous) = watch_slot.take() {
+                previous.abort();
+            }
+            *watch_slot = Some(watch_handle);
+        }
 
         let rx = self.event_bus.subscribe();
 
@@ -562,6 +571,8 @@ impl HiveMindBuilder {
 mod tests {
     use super::*;
     use futures::StreamExt;
+    use pulsehive_core::agent::AgentKind;
+    use std::sync::atomic::AtomicUsize;
 
     #[test]
     fn test_build_fails_without_substrate() {
@@ -755,5 +766,209 @@ mod tests {
         let (hive, _cid) = build_hive_with_collective().await;
         let task = Task::new("test");
         assert!(hive.redeploy(vec![], task).await.is_ok());
+    }
+
+    // ── Watch task lifecycle tests ───────────────────────────────────
+
+    /// Substrate double that counts how many watch streams are alive.
+    ///
+    /// `watch()` increments the count and the returned stream decrements it
+    /// on drop, so the count tracks exactly how many deploy watch tasks hold
+    /// a live subscription.
+    struct CountingWatchSubstrate {
+        live_watches: Arc<AtomicUsize>,
+    }
+
+    struct LiveWatchGuard(Arc<AtomicUsize>);
+
+    impl Drop for LiveWatchGuard {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    struct CountedWatchStream {
+        pending: Pin<Box<dyn Stream<Item = pulsedb::WatchEvent> + Send>>,
+        _guard: LiveWatchGuard,
+    }
+
+    impl Stream for CountedWatchStream {
+        type Item = pulsedb::WatchEvent;
+
+        fn poll_next(
+            mut self: Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Self::Item>> {
+            self.pending.as_mut().poll_next(cx)
+        }
+    }
+
+    type DbResult<T> = std::result::Result<T, pulsedb::PulseDBError>;
+
+    #[async_trait::async_trait]
+    impl pulsedb::SubstrateProvider for CountingWatchSubstrate {
+        async fn store_experience(
+            &self,
+            _exp: pulsedb::NewExperience,
+        ) -> DbResult<pulsedb::ExperienceId> {
+            Ok(pulsedb::ExperienceId::new())
+        }
+
+        async fn get_experience(
+            &self,
+            _id: pulsedb::ExperienceId,
+        ) -> DbResult<Option<pulsedb::Experience>> {
+            Ok(None)
+        }
+
+        async fn search_similar(
+            &self,
+            _collective: CollectiveId,
+            _embedding: &[f32],
+            _k: usize,
+        ) -> DbResult<Vec<(pulsedb::Experience, f32)>> {
+            Ok(vec![])
+        }
+
+        async fn get_recent(
+            &self,
+            _collective: CollectiveId,
+            _limit: usize,
+        ) -> DbResult<Vec<pulsedb::Experience>> {
+            Ok(vec![])
+        }
+
+        async fn store_relation(
+            &self,
+            _rel: pulsedb::NewExperienceRelation,
+        ) -> DbResult<pulsedb::RelationId> {
+            Ok(pulsedb::RelationId::new())
+        }
+
+        async fn get_related(
+            &self,
+            _exp_id: pulsedb::ExperienceId,
+        ) -> DbResult<Vec<(pulsedb::Experience, pulsedb::ExperienceRelation)>>
+        {
+            Ok(vec![])
+        }
+
+        async fn store_insight(
+            &self,
+            _insight: pulsedb::NewDerivedInsight,
+        ) -> DbResult<pulsedb::InsightId> {
+            Ok(pulsedb::InsightId::new())
+        }
+
+        async fn get_insights(
+            &self,
+            _collective: CollectiveId,
+            _embedding: &[f32],
+            _k: usize,
+        ) -> DbResult<Vec<(pulsedb::DerivedInsight, f32)>> {
+            Ok(vec![])
+        }
+
+        async fn get_activities(
+            &self,
+            _collective: CollectiveId,
+        ) -> DbResult<Vec<pulsedb::Activity>> {
+            Ok(vec![])
+        }
+
+        async fn get_context_candidates(
+            &self,
+            _request: pulsedb::ContextRequest,
+        ) -> DbResult<pulsedb::ContextCandidates> {
+            Ok(pulsedb::ContextCandidates {
+                similar_experiences: vec![],
+                recent_experiences: vec![],
+                insights: vec![],
+                relations: vec![],
+                active_agents: vec![],
+            })
+        }
+
+        async fn watch(
+            &self,
+            _collective: CollectiveId,
+        ) -> DbResult<Pin<Box<dyn Stream<Item = pulsedb::WatchEvent> + Send>>>
+        {
+            self.live_watches.fetch_add(1, Ordering::SeqCst);
+            let stream = CountedWatchStream {
+                pending: Box::pin(futures::stream::pending()),
+                _guard: LiveWatchGuard(Arc::clone(&self.live_watches)),
+            };
+            Ok(Box::pin(stream))
+        }
+
+        async fn create_collective(
+            &self,
+            _name: &str,
+        ) -> DbResult<CollectiveId> {
+            Ok(CollectiveId::new())
+        }
+
+        async fn get_or_create_collective(
+            &self,
+            _name: &str,
+        ) -> DbResult<CollectiveId> {
+            Ok(CollectiveId::new())
+        }
+
+        async fn list_collectives(&self) -> DbResult<Vec<pulsedb::Collective>> {
+            Ok(vec![])
+        }
+    }
+
+    /// Polls until the live watch count settles at `expected`, or fails with
+    /// the observed count after a generous timeout.
+    async fn wait_for_live_watches(live: &Arc<AtomicUsize>, expected: usize) {
+        for _ in 0..500 {
+            if live.load(Ordering::SeqCst) == expected {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!(
+            "live watch count did not settle at {expected}: {}",
+            live.load(Ordering::SeqCst)
+        );
+    }
+
+    #[tokio::test]
+    async fn repeated_deploy_keeps_only_the_active_watch() {
+        let live_watches = Arc::new(AtomicUsize::new(0));
+        let hive = HiveMind::builder()
+            .substrate(Box::new(CountingWatchSubstrate {
+                live_watches: Arc::clone(&live_watches),
+            }))
+            .build()
+            .unwrap();
+        let agent = |name: &str| AgentDefinition {
+            name: name.into(),
+            kind: AgentKind::Sequential(vec![]),
+        };
+
+        let first = hive
+            .deploy(vec![agent("first")], vec![Task::new("first")])
+            .await
+            .unwrap();
+        drop(first);
+        wait_for_live_watches(&live_watches, 1).await;
+
+        let second = hive
+            .deploy(vec![agent("second")], vec![Task::new("second")])
+            .await
+            .unwrap();
+        drop(second);
+        // The first deploy's watch task must be cancelled, not leaked: the
+        // count returns to exactly one live watch.
+        wait_for_live_watches(&live_watches, 1).await;
+        assert_eq!(live_watches.load(Ordering::SeqCst), 1);
+
+        // Shutdown still tears down the remaining (active) watch task.
+        hive.shutdown();
+        wait_for_live_watches(&live_watches, 0).await;
     }
 }
