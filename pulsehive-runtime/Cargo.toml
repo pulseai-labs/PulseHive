@@ -29,7 +29,7 @@ criterion = { workspace = true }
 dotenvy = "0.15"
 pulsehive-core = { workspace = true, features = ["testing"] }
 pulsehive-openai = { workspace = true }
-sha2 = "0.11"
+sha2 = "0.10" # 0.11 raises the MSRV floor to 1.85; the workspace pins 1.83
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 tracing-subscriber = { version = "0.3", features = ["fmt"] }

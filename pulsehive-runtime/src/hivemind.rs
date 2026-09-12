@@ -39,6 +39,11 @@ use crate::intelligence::insight::InsightSynthesizer;
 use crate::intelligence::relationship::RelationshipDetector;
 use crate::workflow::{self, WorkflowContext};
 
+/// How long a finished deployment's watch keeps draining before it ends:
+/// in-process Watch events for the final records are queued synchronously,
+/// so a quiet window of this length means they have all been observed.
+const WATCH_DRAIN_QUIESCENCE: std::time::Duration = std::time::Duration::from_millis(250);
+
 /// A task to be executed by deployed agents.
 #[derive(Debug, Clone)]
 pub struct Task {
@@ -188,6 +193,27 @@ impl HiveMind {
         // deployment's own lifecycle events.
         let rx = self.event_bus.subscribe();
 
+        // Establish every Watch subscription BEFORE spawning agents: a fast
+        // agent could otherwise record an experience before its collective's
+        // subscription exists, and PulseDB's Watch does not replay changes
+        // that predate the subscription — the notification would be lost.
+        // A failed subscription warns and skips that collective; agents
+        // still execute normally (graceful degradation).
+        let mut established_streams: Vec<Pin<Box<dyn Stream<Item = pulsedb::WatchEvent> + Send>>> =
+            Vec::new();
+        for collective_id in watch_collectives {
+            match self.substrate.watch(collective_id).await {
+                Ok(watch_stream) => established_streams.push(watch_stream),
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        collective_id = %collective_id,
+                        "Failed to subscribe to Watch system"
+                    );
+                }
+            }
+        }
+
         let mut agent_handles = Vec::with_capacity(agents.len() * resolved_tasks.len());
         for agent in agents {
             for task in &resolved_tasks {
@@ -195,14 +221,11 @@ impl HiveMind {
             }
         }
 
-        // Subscribe to Watch system for real-time substrate change notifications.
-        // Runs as a single background task fanning in every collective —
-        // failure to subscribe doesn't block deployment, and the shutdown
-        // flag is respected for graceful termination. The watch ends when
-        // every agent of THIS deployment has completed, so a finished
-        // deployment's watch is pruned by the next deploy instead of
-        // accumulating for the hive's lifetime.
-        let watch_substrate = Arc::clone(&self.substrate);
+        // The watch runs as one background task fanning in every collective,
+        // respecting the shutdown flag. It ends once every agent of THIS
+        // deployment has completed and the final writes have been observed,
+        // so a finished deployment's watch is pruned by the next deploy
+        // instead of accumulating for the hive's lifetime.
         let watch_emitter = self.event_bus.clone();
         let watch_shutdown = Arc::clone(&self.shutdown);
         let watch_handle = tokio::spawn(async move {
@@ -214,34 +237,36 @@ impl HiveMind {
                 AgentFinished,
             }
 
-            let mut watch_streams: stream::SelectAll<
-                Pin<Box<dyn Stream<Item = WatchLoop> + Send>>,
-            > = stream::SelectAll::new();
-            for collective_id in watch_collectives {
-                match watch_substrate.watch(collective_id).await {
-                    Ok(watch_stream) => {
-                        watch_streams.push(Box::pin(
-                            watch_stream.map(|event| WatchLoop::Event(Box::new(event))),
-                        ));
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            error = %e,
-                            collective_id = %collective_id,
-                            "Failed to subscribe to Watch system"
-                        );
-                    }
-                }
-            }
             let total_agents = agent_handles.len();
             let agent_runs = agent_handles
                 .into_iter()
                 .collect::<futures::stream::FuturesUnordered<_>>();
+
+            let mut watch_streams: stream::SelectAll<
+                Pin<Box<dyn Stream<Item = WatchLoop> + Send>>,
+            > = stream::SelectAll::new();
             watch_streams.push(Box::pin(agent_runs.map(|_| WatchLoop::AgentFinished)));
+            for watch_stream in established_streams {
+                watch_streams.push(Box::pin(
+                    watch_stream.map(|event| WatchLoop::Event(Box::new(event))),
+                ));
+            }
 
             let mut finished_agents = 0;
             while !watch_shutdown.load(Ordering::Relaxed) {
-                match watch_streams.next().await {
+                let next = if finished_agents == total_agents {
+                    // All agents are done. The last record's WatchNotification
+                    // can still be queued behind the JoinHandle's readiness,
+                    // so drain until the streams fall quiet instead of
+                    // breaking on the first idle poll.
+                    match tokio::time::timeout(WATCH_DRAIN_QUIESCENCE, watch_streams.next()).await {
+                        Ok(next) => next,
+                        Err(_) => break,
+                    }
+                } else {
+                    watch_streams.next().await
+                };
+                match next {
                     Some(WatchLoop::Event(event)) => {
                         watch_emitter.emit(HiveEvent::WatchNotification {
                             timestamp_ms: pulsehive_core::event::now_ms(),
@@ -252,9 +277,6 @@ impl HiveMind {
                     }
                     Some(WatchLoop::AgentFinished) => {
                         finished_agents += 1;
-                        if finished_agents == total_agents {
-                            break;
-                        }
                     }
                     None => break,
                 }
@@ -859,11 +881,12 @@ mod tests {
     ///
     /// `watch()` increments the count and the returned stream decrements it
     /// on drop, so the count tracks exactly how many deploy watch tasks hold
-    /// a live subscription. Streams stay pending forever, so the count only
-    /// drops when a watch task actually ends (its agents completed, or it was
-    /// aborted).
+    /// a live subscription. Streams stay pending forever unless
+    /// `delayed_first_event` is set, in which case every stream emits exactly
+    /// one Created WatchEvent after that delay and then stays pending.
     struct CountingWatchSubstrate {
         live_watches: Arc<AtomicUsize>,
+        delayed_first_event: Option<std::time::Duration>,
     }
 
     struct LiveWatchGuard(Arc<AtomicUsize>);
@@ -980,8 +1003,29 @@ mod tests {
             _collective: CollectiveId,
         ) -> DbResult<Pin<Box<dyn Stream<Item = pulsedb::WatchEvent> + Send>>> {
             self.live_watches.fetch_add(1, Ordering::SeqCst);
+            let pending: Pin<Box<dyn Stream<Item = pulsedb::WatchEvent> + Send>> =
+                match self.delayed_first_event {
+                    Some(delay) => {
+                        let collective = CollectiveId::new();
+                        let event = pulsedb::WatchEvent {
+                            experience_id: pulsedb::ExperienceId::new(),
+                            collective_id: collective,
+                            event_type: pulsedb::WatchEventType::Created,
+                            timestamp: pulsedb::Timestamp::now(),
+                            experience: None,
+                        };
+                        Box::pin(
+                            futures::stream::once(async move {
+                                tokio::time::sleep(delay).await;
+                                event
+                            })
+                            .chain(futures::stream::pending()),
+                        )
+                    }
+                    None => Box::pin(futures::stream::pending()),
+                };
             let stream = CountedWatchStream {
-                pending: Box::pin(futures::stream::pending()),
+                pending,
                 _guard: LiveWatchGuard(Arc::clone(&self.live_watches)),
             };
             Ok(Box::pin(stream))
@@ -1035,7 +1079,10 @@ mod tests {
 
     fn counting_hive(live_watches: Arc<AtomicUsize>) -> HiveMind {
         HiveMind::builder()
-            .substrate(Box::new(CountingWatchSubstrate { live_watches }))
+            .substrate(Box::new(CountingWatchSubstrate {
+                live_watches,
+                delayed_first_event: None,
+            }))
             .build()
             .unwrap()
     }
@@ -1053,7 +1100,10 @@ mod tests {
             provider = provider.then_hang();
         }
         let hive = HiveMind::builder()
-            .substrate(Box::new(CountingWatchSubstrate { live_watches }))
+            .substrate(Box::new(CountingWatchSubstrate {
+                live_watches,
+                delayed_first_event: None,
+            }))
             .llm_provider("scripted", provider.clone())
             .build()
             .unwrap();
@@ -1129,6 +1179,76 @@ mod tests {
         wait_for_live_watches(&live_watches, 0).await;
         wait_for_finished_handles(&hive, 1).await;
         assert!(!hive.is_shutdown(), "no shutdown was needed");
+    }
+
+    #[tokio::test]
+    async fn watch_subscriptions_precede_agent_spawn() {
+        let live_watches = Arc::new(AtomicUsize::new(0));
+        let (hive, _provider) = counting_hive_with_hanging_agents(Arc::clone(&live_watches), 1);
+
+        // deploy establishes the subscriptions synchronously before it
+        // spawns any agent: by the time deploy returns, the live watch
+        // count is already final — no fast agent can beat its collective's
+        // subscription into existence.
+        let stream = hive
+            .deploy(vec![scripted_agent("slow")], vec![Task::new("only")])
+            .await
+            .unwrap();
+        drop(stream);
+        assert_eq!(
+            live_watches.load(Ordering::SeqCst),
+            1,
+            "the subscription must exist the moment deploy returns"
+        );
+
+        hive.shutdown();
+        wait_for_live_watches(&live_watches, 0).await;
+    }
+
+    #[tokio::test]
+    async fn final_watch_events_drain_after_agents_complete() {
+        let live_watches = Arc::new(AtomicUsize::new(0));
+        let hive = HiveMind::builder()
+            .substrate(Box::new(CountingWatchSubstrate {
+                live_watches: Arc::clone(&live_watches),
+                // The stream's only event lands well after the instantly
+                // completing agent — inside the post-completion drain
+                // window, past the point where a naive implementation
+                // would already have dropped the watch.
+                delayed_first_event: Some(std::time::Duration::from_millis(120)),
+            }))
+            .build()
+            .unwrap();
+        let mut notifications = hive.event_bus.subscribe();
+        let agent = AgentDefinition {
+            name: "noop".into(),
+            kind: AgentKind::Sequential(vec![]),
+        };
+
+        let stream = hive
+            .deploy(vec![agent], vec![Task::new("drain-check")])
+            .await
+            .unwrap();
+        drop(stream);
+
+        // The agent finished long before the event fired, yet the watch
+        // forwarded it instead of dropping it at completion.
+        let saw_notification = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                match notifications.recv().await {
+                    Ok(HiveEvent::WatchNotification { .. }) => return true,
+                    Ok(_) => continue,
+                    Err(_) => return false,
+                }
+            }
+        })
+        .await
+        .expect("timed out waiting for the drained watch notification");
+        assert!(saw_notification, "the late watch event was forwarded");
+
+        // And the watch still terminates: the drain window is bounded.
+        wait_for_live_watches(&live_watches, 0).await;
+        wait_for_finished_handles(&hive, 1).await;
     }
 
     #[tokio::test]
