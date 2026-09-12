@@ -69,12 +69,16 @@ pub(crate) fn dispatch_agent(
         async move {
             let agent_id = uuid::Uuid::now_v7().to_string();
 
-            // Emit lifecycle start event
+            // Emit lifecycle start event, carrying the task identity so a
+            // consumer can attribute runs when one agent executes several
+            // tasks in a single deploy.
             ctx.event_emitter.emit(HiveEvent::AgentStarted {
                 timestamp_ms: pulsehive_core::event::now_ms(),
                 agent_id: agent_id.clone(),
                 name: agent.name.clone(),
                 kind: agent_kind_tag(&agent.kind),
+                collective_id: ctx.task.collective_id,
+                task_description: ctx.task.description.clone(),
             });
 
             let outcome = match agent.kind {
@@ -87,11 +91,13 @@ pub(crate) fn dispatch_agent(
                 } => run_loop(*agent, max_iterations, ctx).await,
             };
 
-            // Emit lifecycle completion event
+            // Emit lifecycle completion event with the same task identity.
             ctx.event_emitter.emit(HiveEvent::AgentCompleted {
                 timestamp_ms: pulsehive_core::event::now_ms(),
                 agent_id,
                 outcome: outcome.clone(),
+                collective_id: ctx.task.collective_id,
+                task_description: ctx.task.description.clone(),
             });
 
             outcome

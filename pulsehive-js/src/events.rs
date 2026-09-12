@@ -96,20 +96,34 @@ impl From<HiveEvent> for JsHiveEvent {
                 agent_id,
                 name,
                 kind,
+                collective_id,
+                task_description,
             } => {
                 fields.insert("timestampMs".into(), EventValue::Num(timestamp_ms));
                 fields.insert("agentId".into(), EventValue::Str(agent_id.clone()));
                 fields.insert("name".into(), EventValue::Str(name));
                 fields.insert("kind".into(), EventValue::Str(format!("{kind:?}")));
+                fields.insert(
+                    "collectiveId".into(),
+                    EventValue::Str(collective_id.to_string()),
+                );
+                fields.insert("taskDescription".into(), EventValue::Str(task_description));
                 ("agent_started", Some(agent_id))
             }
             HiveEvent::AgentCompleted {
                 timestamp_ms,
                 agent_id,
                 outcome,
+                collective_id,
+                task_description,
             } => {
                 fields.insert("timestampMs".into(), EventValue::Num(timestamp_ms));
                 fields.insert("agentId".into(), EventValue::Str(agent_id.clone()));
+                fields.insert(
+                    "collectiveId".into(),
+                    EventValue::Str(collective_id.to_string()),
+                );
+                fields.insert("taskDescription".into(), EventValue::Str(task_description));
                 match &outcome {
                     AgentOutcome::Complete { response } => {
                         fields.insert("outcome".into(), EventValue::Str("complete".into()));

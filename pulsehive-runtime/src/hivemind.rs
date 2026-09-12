@@ -146,9 +146,9 @@ impl HiveMind {
     /// Automatically subscribes to the PulseDB Watch system — one background
     /// watch task per deployment, fanning in every resolved collective —
     /// forwarding substrate change events as
-    /// [`HiveEvent::WatchNotification`]. Watches of earlier deployments keep
-    /// forwarding while those deployments run; completed watch tasks are
-    /// pruned on the next deploy, and shutdown/drop aborts all of them. If a
+    /// [`HiveEvent::WatchNotification`]. Each deployment's watch runs until
+    /// every agent of that deployment has completed (or shutdown/drop
+    /// aborts it); finished watch tasks are pruned on the next deploy. If a
     /// Watch subscription fails, that collective is skipped and agents still
     /// execute normally (graceful degradation).
     pub async fn deploy(
@@ -184,18 +184,42 @@ impl HiveMind {
             }
         }
 
+        // Subscribe before spawning agents so the consumer cannot miss the
+        // deployment's own lifecycle events.
+        let rx = self.event_bus.subscribe();
+
+        let mut agent_handles = Vec::with_capacity(agents.len() * resolved_tasks.len());
+        for agent in agents {
+            for task in &resolved_tasks {
+                agent_handles.push(self.spawn_agent(agent.clone(), task.clone()));
+            }
+        }
+
         // Subscribe to Watch system for real-time substrate change notifications.
         // Runs as a single background task fanning in every collective —
         // failure to subscribe doesn't block deployment, and the shutdown
-        // flag is respected for graceful termination.
+        // flag is respected for graceful termination. The watch ends when
+        // every agent of THIS deployment has completed, so a finished
+        // deployment's watch is pruned by the next deploy instead of
+        // accumulating for the hive's lifetime.
         let watch_substrate = Arc::clone(&self.substrate);
         let watch_emitter = self.event_bus.clone();
         let watch_shutdown = Arc::clone(&self.shutdown);
         let watch_handle = tokio::spawn(async move {
-            let mut watch_streams = stream::SelectAll::new();
+            #[derive(Debug)]
+            enum WatchLoop {
+                Event(pulsedb::WatchEvent),
+                AgentFinished,
+            }
+
+            let mut watch_streams: stream::SelectAll<
+                Pin<Box<dyn Stream<Item = WatchLoop> + Send>>,
+            > = stream::SelectAll::new();
             for collective_id in watch_collectives {
                 match watch_substrate.watch(collective_id).await {
-                    Ok(watch_stream) => watch_streams.push(watch_stream),
+                    Ok(watch_stream) => {
+                        watch_streams.push(Box::pin(watch_stream.map(WatchLoop::Event)));
+                    }
                     Err(e) => {
                         tracing::warn!(
                             error = %e,
@@ -205,15 +229,28 @@ impl HiveMind {
                     }
                 }
             }
+            let total_agents = agent_handles.len();
+            let agent_runs = agent_handles
+                .into_iter()
+                .collect::<futures::stream::FuturesUnordered<_>>();
+            watch_streams.push(Box::pin(agent_runs.map(|_| WatchLoop::AgentFinished)));
+
+            let mut finished_agents = 0;
             while !watch_shutdown.load(Ordering::Relaxed) {
                 match watch_streams.next().await {
-                    Some(event) => {
+                    Some(WatchLoop::Event(event)) => {
                         watch_emitter.emit(HiveEvent::WatchNotification {
                             timestamp_ms: pulsehive_core::event::now_ms(),
                             experience_id: event.experience_id,
                             collective_id: event.collective_id,
                             event_type: format!("{:?}", event.event_type),
                         });
+                    }
+                    Some(WatchLoop::AgentFinished) => {
+                        finished_agents += 1;
+                        if finished_agents == total_agents {
+                            break;
+                        }
                     }
                     None => break,
                 }
@@ -231,14 +268,6 @@ impl HiveMind {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             watch_set.retain(|handle| !handle.is_finished());
             watch_set.push(watch_handle);
-        }
-
-        let rx = self.event_bus.subscribe();
-
-        for agent in agents {
-            for task in &resolved_tasks {
-                self.spawn_agent(agent.clone(), task.clone());
-            }
         }
 
         // Convert broadcast::Receiver into a Stream
@@ -402,7 +431,9 @@ impl HiveMind {
     ///
     /// Builds a [`WorkflowContext`] from HiveMind's fields and delegates
     /// to [`workflow::dispatch_agent()`] which handles all agent kinds.
-    fn spawn_agent(&self, agent: AgentDefinition, task: Task) {
+    /// The returned handle lets a deployment's watch task observe when its
+    /// agents have finished.
+    fn spawn_agent(&self, agent: AgentDefinition, task: Task) -> tokio::task::JoinHandle<()> {
         let ctx = WorkflowContext {
             task,
             llm_providers: self.llm_providers.clone(),
@@ -414,7 +445,7 @@ impl HiveMind {
 
         tokio::spawn(async move {
             workflow::dispatch_agent(agent, &ctx).await;
-        });
+        })
     }
 }
 
@@ -824,13 +855,11 @@ mod tests {
     ///
     /// `watch()` increments the count and the returned stream decrements it
     /// on drop, so the count tracks exactly how many deploy watch tasks hold
-    /// a live subscription. The first subscription ends immediately (its
-    /// stream yields `None` right away) so pruning of finished watch tasks
-    /// is observable; later subscriptions stay pending forever.
+    /// a live subscription. Streams stay pending forever, so the count only
+    /// drops when a watch task actually ends (its agents completed, or it was
+    /// aborted).
     struct CountingWatchSubstrate {
         live_watches: Arc<AtomicUsize>,
-        subscriptions: AtomicUsize,
-        end_first_subscription: bool,
     }
 
     struct LiveWatchGuard(Arc<AtomicUsize>);
@@ -947,16 +976,8 @@ mod tests {
             _collective: CollectiveId,
         ) -> DbResult<Pin<Box<dyn Stream<Item = pulsedb::WatchEvent> + Send>>> {
             self.live_watches.fetch_add(1, Ordering::SeqCst);
-            let ends_immediately = self.end_first_subscription
-                && self.subscriptions.fetch_add(1, Ordering::SeqCst) == 0;
-            let pending: Pin<Box<dyn Stream<Item = pulsedb::WatchEvent> + Send>> =
-                if ends_immediately {
-                    Box::pin(futures::stream::empty())
-                } else {
-                    Box::pin(futures::stream::pending())
-                };
             let stream = CountedWatchStream {
-                pending,
+                pending: Box::pin(futures::stream::pending()),
                 _guard: LiveWatchGuard(Arc::clone(&self.live_watches)),
             };
             Ok(Box::pin(stream))
@@ -1008,25 +1029,38 @@ mod tests {
         panic!("no tracked watch handle was marked finished");
     }
 
-    fn counting_hive(live_watches: Arc<AtomicUsize>, end_first_subscription: bool) -> HiveMind {
+    fn counting_hive(live_watches: Arc<AtomicUsize>) -> HiveMind {
         HiveMind::builder()
-            .substrate(Box::new(CountingWatchSubstrate {
-                live_watches,
-                subscriptions: AtomicUsize::new(0),
-                end_first_subscription,
-            }))
+            .substrate(Box::new(CountingWatchSubstrate { live_watches }))
             .build()
             .unwrap()
+    }
+
+    /// Counting hive whose deployments use scripted LLM agents that hang
+    /// in-flight, so their watch tasks stay alive until shutdown/abort.
+    fn counting_hive_with_hanging_agents(
+        live_watches: Arc<AtomicUsize>,
+        hangs: usize,
+    ) -> (HiveMind, pulsehive_core::testing::ScriptedProvider) {
+        use pulsehive_core::testing::ScriptedProvider;
+
+        let mut provider = ScriptedProvider::new();
+        for _ in 0..hangs {
+            provider = provider.then_hang();
+        }
+        let hive = HiveMind::builder()
+            .substrate(Box::new(CountingWatchSubstrate { live_watches }))
+            .llm_provider("scripted", provider.clone())
+            .build()
+            .unwrap();
+        (hive, provider)
     }
 
     #[tokio::test]
     async fn repeated_deploy_retains_watch_per_deployment() {
         let live_watches = Arc::new(AtomicUsize::new(0));
-        let hive = counting_hive(Arc::clone(&live_watches), false);
-        let agent = |name: &str| AgentDefinition {
-            name: name.into(),
-            kind: AgentKind::Sequential(vec![]),
-        };
+        let (hive, _provider) = counting_hive_with_hanging_agents(Arc::clone(&live_watches), 2);
+        let agent = scripted_agent;
 
         let first = hive
             .deploy(vec![agent("first")], vec![Task::new("first")])
@@ -1040,9 +1074,9 @@ mod tests {
             .await
             .unwrap();
         drop(second);
-        // The still-running first deployment keeps its watch: a second
-        // deploy must not abort it, and no watch may be leaked beyond the
-        // two deployments' own streams.
+        // Both deployments are still running (their agents hang in-flight):
+        // the first deployment's watch must be retained, not aborted, and no
+        // watch may be leaked beyond the two deployments' own streams.
         wait_for_live_watches(&live_watches, 2).await;
         assert_eq!(live_watches.load(Ordering::SeqCst), 2);
 
@@ -1052,62 +1086,59 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn finished_watch_handles_are_pruned_on_next_deploy() {
+    async fn watch_ends_with_its_deployment_and_prunes_on_next_deploy() {
         let live_watches = Arc::new(AtomicUsize::new(0));
-        let hive = counting_hive(Arc::clone(&live_watches), true);
+        let hive = counting_hive(Arc::clone(&live_watches));
         let agent = AgentDefinition {
             name: "noop".into(),
             kind: AgentKind::Sequential(vec![]),
         };
 
-        // First deploy's watch stream ends immediately, so its task finishes.
+        // Sequential([]) agents complete immediately, so the deployment's
+        // watch must end on its own — without shutdown — once they finish.
         let first = hive
             .deploy(vec![agent.clone()], vec![Task::new("first")])
             .await
             .unwrap();
         drop(first);
         wait_for_live_watches(&live_watches, 0).await;
-        // The finished task is marked done asynchronously — wait for the
-        // runtime to record it before expecting the next deploy to prune it.
         wait_for_finished_handles(&hive, 1).await;
         {
             let tracked = hive.watch_handles.lock().unwrap().len();
             assert_eq!(
                 tracked, 1,
-                "finished handle is still tracked until the next deploy prunes it"
+                "the finished handle is still tracked until the next deploy prunes it"
             );
         }
 
-        // The next deploy prunes the finished handle instead of accumulating.
+        // The next deploy prunes the finished handle instead of accumulating;
+        // its own watch also ends with its agents.
         let second = hive
             .deploy(vec![agent], vec![Task::new("second")])
             .await
             .unwrap();
         drop(second);
-        wait_for_live_watches(&live_watches, 1).await;
         {
             let tracked = hive.watch_handles.lock().unwrap().len();
             assert_eq!(tracked, 1, "the finished handle was pruned on deploy");
         }
-
-        hive.shutdown();
         wait_for_live_watches(&live_watches, 0).await;
+        wait_for_finished_handles(&hive, 1).await;
+        assert!(!hive.is_shutdown(), "no shutdown was needed");
     }
 
     #[tokio::test]
     async fn multi_task_deploy_fans_collectives_into_one_watch() {
         let live_watches = Arc::new(AtomicUsize::new(0));
-        let hive = counting_hive(Arc::clone(&live_watches), false);
-        let agent = AgentDefinition {
-            name: "noop".into(),
-            kind: AgentKind::Sequential(vec![]),
-        };
+        // 3 hangs for the first deploy's agent runs, 1 for the second's.
+        let (hive, _provider) = counting_hive_with_hanging_agents(Arc::clone(&live_watches), 4);
+        let agent = scripted_agent;
 
         // Three tasks resolve to three distinct collectives, fanned into ONE
-        // watch task that holds three live streams.
+        // watch task that holds three live streams while its agents run.
         let multi = hive
             .deploy(
-                vec![agent.clone()],
+                vec![agent("runner")],
                 vec![Task::new("a"), Task::new("b"), Task::new("c")],
             )
             .await
@@ -1118,7 +1149,7 @@ mod tests {
         // A new deploy adds its own watch task (one more stream), never
         // cancels the fan-in, and shutdown clears everything.
         let next = hive
-            .deploy(vec![agent], vec![Task::new("d")])
+            .deploy(vec![agent("runner")], vec![Task::new("d")])
             .await
             .unwrap();
         drop(next);
@@ -1148,18 +1179,21 @@ mod tests {
     }
 
     /// Deploys and drains the event stream until `expected` AgentCompleted
-    /// events have been observed.
+    /// events have been observed, returning every event seen.
     async fn drain_n_completions(
         hive: &HiveMind,
         agents: Vec<AgentDefinition>,
         tasks: Vec<Task>,
         expected: usize,
-    ) {
+    ) -> Vec<HiveEvent> {
         let mut stream = hive.deploy(agents, tasks).await.unwrap();
         let mut completed = 0;
+        let mut seen = Vec::new();
         tokio::time::timeout(std::time::Duration::from_secs(60), async {
             while let Some(event) = stream.next().await {
-                if matches!(event, HiveEvent::AgentCompleted { .. }) {
+                let was_completion = matches!(event, HiveEvent::AgentCompleted { .. });
+                seen.push(event);
+                if was_completion {
                     completed += 1;
                     if completed == expected {
                         return;
@@ -1169,6 +1203,7 @@ mod tests {
         })
         .await
         .expect("drain timed out before all agents completed");
+        seen
     }
 
     #[tokio::test]
@@ -1227,6 +1262,78 @@ mod tests {
             vec!["task-a", "task-b", "task-c"],
             "no task outside the list was invented"
         );
+    }
+
+    #[tokio::test]
+    async fn agent_lifecycle_events_carry_task_identity() {
+        use pulsehive_core::testing::ScriptedProvider;
+
+        let mut provider = ScriptedProvider::new();
+        for _ in 0..2 {
+            provider = provider.then_text("done");
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let hive = HiveMind::builder()
+            .substrate_path(dir.path().join("attribution.db"))
+            .llm_provider("scripted", provider.clone())
+            .no_relationship_detector()
+            .no_insight_synthesizer()
+            .build()
+            .unwrap();
+
+        let events = drain_n_completions(
+            &hive,
+            vec![scripted_agent("attributing-agent")],
+            vec![Task::new("task-x"), Task::new("task-y")],
+            2,
+        )
+        .await;
+
+        // Every completion is attributable: its task description names one
+        // of the deployed tasks and its collective matches that task's
+        // resolved collective — the two runs land in two distinct
+        // collectives, identified per event.
+        let mut completions: Vec<(pulsedb::CollectiveId, String)> = events
+            .iter()
+            .filter_map(|event| match event {
+                HiveEvent::AgentCompleted {
+                    collective_id,
+                    task_description,
+                    ..
+                } => Some((*collective_id, task_description.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(completions.len(), 2, "both runs completed");
+        completions.sort_by_key(|(_, description)| description.clone());
+        assert_eq!(
+            completions
+                .iter()
+                .map(|(_, description)| description.as_str())
+                .collect::<Vec<_>>(),
+            vec!["task-x", "task-y"],
+            "each completion names its own task"
+        );
+        assert_ne!(
+            completions[0].0, completions[1].0,
+            "the two tasks ran in distinct collectives"
+        );
+
+        // Each run's AgentStarted carries the same identity as its
+        // completion.
+        for (collective_id, task_description) in &completions {
+            assert!(
+                events.iter().any(|event| matches!(
+                    event,
+                    HiveEvent::AgentStarted {
+                        collective_id: started_collective,
+                        task_description: started_task,
+                        ..
+                    } if started_collective == collective_id && started_task == task_description
+                )),
+                "no AgentStarted carries the identity of task {task_description:?}"
+            );
+        }
     }
 
     #[tokio::test]

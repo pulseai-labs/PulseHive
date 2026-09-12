@@ -106,20 +106,40 @@ impl From<HiveEvent> for PyHiveEvent {
                 agent_id,
                 name,
                 kind,
+                collective_id,
+                task_description,
             } => {
                 fields.insert("timestamp_ms".into(), PyEventValue::Int(timestamp_ms));
                 fields.insert("agent_id".into(), PyEventValue::Str(agent_id.clone()));
                 fields.insert("name".into(), PyEventValue::Str(name));
                 fields.insert("kind".into(), PyEventValue::Str(format!("{kind:?}")));
+                fields.insert(
+                    "collective_id".into(),
+                    PyEventValue::Str(collective_id.to_string()),
+                );
+                fields.insert(
+                    "task_description".into(),
+                    PyEventValue::Str(task_description),
+                );
                 ("agent_started", Some(agent_id))
             }
             HiveEvent::AgentCompleted {
                 timestamp_ms,
                 agent_id,
                 outcome,
+                collective_id,
+                task_description,
             } => {
                 fields.insert("timestamp_ms".into(), PyEventValue::Int(timestamp_ms));
                 fields.insert("agent_id".into(), PyEventValue::Str(agent_id.clone()));
+                fields.insert(
+                    "collective_id".into(),
+                    PyEventValue::Str(collective_id.to_string()),
+                );
+                fields.insert(
+                    "task_description".into(),
+                    PyEventValue::Str(task_description),
+                );
                 match &outcome {
                     AgentOutcome::Complete { response } => {
                         fields.insert("outcome".into(), PyEventValue::Str("complete".into()));

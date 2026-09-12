@@ -11,7 +11,7 @@
 
 use std::sync::Arc;
 
-use pulsedb::{ExperienceId, InsightId, RelationId};
+use pulsedb::{CollectiveId, ExperienceId, InsightId, RelationId};
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 
@@ -49,12 +49,21 @@ pub enum HiveEvent {
         agent_id: String,
         name: String,
         kind: AgentKindTag,
+        /// The collective this run operates in — identifies the task's
+        /// namespace when one agent runs several tasks in one deploy.
+        collective_id: CollectiveId,
+        /// The description of the task this run executes.
+        task_description: String,
     },
     /// An agent has completed execution.
     AgentCompleted {
         timestamp_ms: u64,
         agent_id: String,
         outcome: AgentOutcome,
+        /// The collective this run operated in.
+        collective_id: CollectiveId,
+        /// The description of the task this run executed.
+        task_description: String,
     },
 
     // ── LLM interactions ─────────────────────────────────────────────
@@ -270,6 +279,8 @@ mod tests {
             agent_id: "a1".into(),
             name: "researcher".into(),
             kind: AgentKindTag::Llm,
+            collective_id: CollectiveId::new(),
+            task_description: "analyze".into(),
         };
         let cloned = event.clone();
         let debug = format!("{:?}", cloned);
@@ -354,6 +365,8 @@ mod tests {
             agent_id: "a1".into(),
             name: "test".into(),
             kind: AgentKindTag::Llm,
+            collective_id: CollectiveId::new(),
+            task_description: "test task".into(),
         });
 
         let event = rx.recv().await.unwrap();
@@ -421,6 +434,8 @@ mod tests {
                 agent_id: "a".into(),
                 name: "n".into(),
                 kind: AgentKindTag::Llm,
+                collective_id: CollectiveId::nil(),
+                task_description: String::new(),
             },
             HiveEvent::AgentCompleted {
                 timestamp_ms: 0,
@@ -428,6 +443,8 @@ mod tests {
                 outcome: AgentOutcome::Complete {
                     response: "done".into(),
                 },
+                collective_id: CollectiveId::nil(),
+                task_description: String::new(),
             },
             HiveEvent::LlmCallStarted {
                 timestamp_ms: 0,

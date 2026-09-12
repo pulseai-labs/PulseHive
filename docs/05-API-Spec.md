@@ -820,9 +820,13 @@ include a `_ => {}` catch-all arm.
 ```rust
 #[non_exhaustive] // v2.1.0 — external exhaustive matches need a `_ => {}` arm
 pub enum HiveEvent {
-    // Agent lifecycle
-    AgentStarted { agent_id: AgentId, name: String, kind: AgentKindTag },
-    AgentCompleted { agent_id: AgentId, outcome: AgentOutcome },
+    // Agent lifecycle — both carry the run's task identity (v2.1.0):
+    // collective_id + task_description attribute a run to its task when
+    // one agent executes several tasks in a single deploy.
+    AgentStarted { agent_id: AgentId, name: String, kind: AgentKindTag,
+                   collective_id: CollectiveId, task_description: String },
+    AgentCompleted { agent_id: AgentId, outcome: AgentOutcome,
+                     collective_id: CollectiveId, task_description: String },
 
     // LLM interactions
     LlmCallStarted { agent_id: AgentId, model: String, token_count: usize },
