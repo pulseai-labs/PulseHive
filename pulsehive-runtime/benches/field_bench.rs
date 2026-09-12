@@ -28,6 +28,7 @@ fn mock_experience(idx: usize) -> Experience {
         applications: BTreeMap::from([(pulsedb::InstanceId::new(), (idx % 3) as u32)]),
         last_reinforced: Timestamp::now(),
         domain: vec![format!("domain-{}", idx % 3)],
+        tags: BTreeMap::new(),
         source_agent: AgentId("bench-agent".into()),
         source_task: None,
         related_files: vec![],

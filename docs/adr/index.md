@@ -21,6 +21,7 @@ ADRs follow numbered naming convention: `NNN-decision-title.md`
 | 009 | 2026-08-24 | Stack Choices | Accepted |
 | 010 | 2026-08-24 | Cross-Cutting Constraints | Accepted |
 | 011 | 2026-09-06 | Provider Transport Contract | Proposed |
+| 012 | 2026-09-12 | PulseDB 0.7 Migration & Embedding Identity | Accepted |
 
 ---
 

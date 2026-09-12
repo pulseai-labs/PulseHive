@@ -135,9 +135,11 @@ impl PyHiveMind {
     ///
     /// Usage::
     ///
-    ///     stream = await hive.deploy([agent], [Task("Analyze code")])
-    ///     async for event in stream:
-    ///         print(event.event_type, event.data)
+    /// ```text
+    /// stream = await hive.deploy([agent], [Task("Analyze code")])
+    /// async for event in stream:
+    ///     print(event.event_type, event.data)
+    /// ```
     ///
     /// Args:
     ///     agents: List of AgentDefinition objects

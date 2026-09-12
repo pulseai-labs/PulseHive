@@ -29,6 +29,7 @@ async fn test_store_and_retrieve_experience() {
         domain: vec!["rust".into()],
         source_agent: AgentId("agent-1".into()),
         source_task: None,
+        tags: Default::default(),
         related_files: vec![],
     };
 
@@ -60,6 +61,7 @@ async fn test_multiple_experiences_in_collective() {
             importance: 0.5,
             confidence: 0.5,
             domain: vec![],
+            tags: Default::default(),
             source_agent: AgentId("agent".into()),
             source_task: None,
             related_files: vec![],
@@ -92,6 +94,7 @@ async fn test_persistence_across_instances() {
             importance: 0.7,
             confidence: 0.8,
             domain: vec![],
+            tags: Default::default(),
             source_agent: AgentId("agent".into()),
             source_task: None,
             related_files: vec![],

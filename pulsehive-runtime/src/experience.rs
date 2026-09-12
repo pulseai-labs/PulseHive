@@ -30,25 +30,12 @@ impl ExperienceExtractor for DefaultExperienceExtractor {
         outcome: &AgentOutcome,
         context: &ExtractionContext,
     ) -> Vec<NewExperience> {
-        let base = || NewExperience {
-            collective_id: context.collective_id,
-            content: String::new(),
-            experience_type: ExperienceType::Generic { category: None },
-            embedding: None, // Builtin computes
-            importance: 0.5,
-            confidence: 0.5,
-            domain: vec![],
-            source_agent: AgentId(context.agent_id.clone()),
-            source_task: None,
-            related_files: vec![],
-        };
-
         match outcome {
             AgentOutcome::Complete { response } => {
                 if response.is_empty() {
                     return vec![];
                 }
-                let mut exp = base();
+                let mut exp = new_experience(context);
                 exp.content = format!(
                     "Task: {}\n\nResult: {}",
                     context.task_description,
@@ -62,48 +49,10 @@ impl ExperienceExtractor for DefaultExperienceExtractor {
                 vec![exp]
             }
             AgentOutcome::Error { error } => {
-                let mut experiences = Vec::new();
-
-                // Check conversation for successful tool results before the error.
-                // This captures partial progress even when the agent ultimately fails.
-                let tool_results = extract_tool_summaries(conversation);
-                if !tool_results.is_empty() {
-                    let mut partial = base();
-                    let summaries: String = tool_results
-                        .iter()
-                        .map(|s| format!("- {s}"))
-                        .collect::<Vec<_>>()
-                        .join("\n");
-                    partial.content = format!(
-                        "Task: {}\n\nPartial progress ({} tool calls completed):\n{}\n\nFailed with: {}",
-                        context.task_description,
-                        tool_results.len(),
-                        summaries,
-                        error,
-                    );
-                    partial.experience_type = ExperienceType::Generic {
-                        category: Some("partial_completion".into()),
-                    };
-                    partial.importance = 0.6;
-                    partial.confidence = 0.6;
-                    experiences.push(partial);
-                }
-
-                let mut exp = base();
-                exp.content = format!("Task: {}\n\nError: {}", context.task_description, error);
-                exp.experience_type = ExperienceType::ErrorPattern {
-                    signature: truncate(error, 500),
-                    fix: String::new(),
-                    prevention: String::new(),
-                };
-                exp.importance = 0.5;
-                exp.confidence = 0.5;
-                experiences.push(exp);
-
-                experiences
+                extract_error_experiences(conversation, error, context)
             }
             AgentOutcome::MaxIterationsReached => {
-                let mut exp = base();
+                let mut exp = new_experience(context);
                 exp.content = format!(
                     "Task: {}\n\nAgent reached maximum iterations without completing.",
                     context.task_description
@@ -118,6 +67,64 @@ impl ExperienceExtractor for DefaultExperienceExtractor {
             }
         }
     }
+}
+
+fn new_experience(context: &ExtractionContext) -> NewExperience {
+    NewExperience {
+        collective_id: context.collective_id,
+        content: String::new(),
+        experience_type: ExperienceType::Generic { category: None },
+        embedding: None, // Builtin computes
+        importance: 0.5,
+        confidence: 0.5,
+        domain: vec![],
+        tags: Default::default(),
+        source_agent: AgentId(context.agent_id.clone()),
+        source_task: None,
+        related_files: vec![],
+    }
+}
+
+fn extract_error_experiences(
+    conversation: &[Message],
+    error: &str,
+    context: &ExtractionContext,
+) -> Vec<NewExperience> {
+    let tool_results = extract_tool_summaries(conversation);
+    let mut experiences = Vec::new();
+    if !tool_results.is_empty() {
+        let mut partial = new_experience(context);
+        let summaries = tool_results
+            .iter()
+            .map(|summary| format!("- {summary}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        partial.content = format!(
+            "Task: {}\n\nPartial progress ({} tool calls completed):\n{}\n\nFailed with: {}",
+            context.task_description,
+            tool_results.len(),
+            summaries,
+            error,
+        );
+        partial.experience_type = ExperienceType::Generic {
+            category: Some("partial_completion".into()),
+        };
+        partial.importance = 0.6;
+        partial.confidence = 0.6;
+        experiences.push(partial);
+    }
+
+    let mut exp = new_experience(context);
+    exp.content = format!("Task: {}\n\nError: {}", context.task_description, error);
+    exp.experience_type = ExperienceType::ErrorPattern {
+        signature: truncate(error, 500),
+        fix: String::new(),
+        prevention: String::new(),
+    };
+    exp.importance = 0.5;
+    exp.confidence = 0.5;
+    experiences.push(exp);
+    experiences
 }
 
 /// Extract summaries of successful tool results from the conversation.
@@ -142,13 +149,20 @@ fn extract_tool_summaries(conversation: &[Message]) -> Vec<String> {
         .collect()
 }
 
-/// Truncate a string to max_len, appending "..." if truncated.
+/// Truncate a string to at most `max_len` bytes, appending "..." if truncated.
+///
+/// The cut index is moved back to the nearest UTF-8 character boundary so a
+/// multibyte character straddling `max_len` never panics and the truncated
+/// prefix stays valid UTF-8.
 fn truncate(s: &str, max_len: usize) -> String {
     if s.len() <= max_len {
-        s.to_string()
-    } else {
-        format!("{}...", &s[..max_len])
+        return s.to_string();
     }
+    let mut end = max_len;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}...", &s[..end])
 }
 
 #[cfg(test)]
@@ -321,5 +335,81 @@ mod tests {
         assert!(experiences[0].content.contains("1 tool calls completed"));
         assert!(experiences[0].content.contains("Successfully fetched"));
         assert!(!experiences[0].content.contains("denied"));
+    }
+
+    // ── UTF-8-safe truncation tests ──────────────────────────────────
+
+    #[test]
+    fn test_truncate_multibyte_cut_floors_to_char_boundary() {
+        // "あ" is 3 bytes: an 11-byte cut lands mid-character.
+        let s = "あ".repeat(10);
+        assert_eq!(truncate(&s, 11), format!("{}...", "あ".repeat(3)));
+        // U+1F600 is 4 bytes: a 6-byte cut splits the second emoji.
+        assert_eq!(truncate("😀😀😀", 6), "😀...");
+    }
+
+    #[test]
+    fn test_truncate_exact_boundary_and_short_inputs() {
+        assert_eq!(truncate("hello", 5), "hello");
+        assert_eq!(truncate("hello", 10), "hello");
+        assert_eq!(truncate("hello", 3), "hel...");
+        // A cut exactly on a character boundary keeps that character.
+        assert_eq!(truncate("あいう", 6), format!("{}...", "あい"));
+    }
+
+    #[test]
+    fn test_truncate_never_panics_across_all_cut_points() {
+        let s = "a漢b😀cé"; // 1-, 2-, 3- and 4-byte characters
+        for cut in 0..=s.len() {
+            let out = truncate(s, cut);
+            assert!(out.ends_with("...") || out.len() == s.len());
+        }
+    }
+
+    #[tokio::test]
+    async fn test_extract_complete_multibyte_response_cuts_safely() {
+        // 15000 bytes truncated at 8192: 8192 % 3 == 2, a mid-character cut
+        // that panicked before the UTF-8-safe truncation.
+        let extractor = DefaultExperienceExtractor;
+        let outcome = AgentOutcome::Complete {
+            response: "あ".repeat(5000),
+        };
+
+        let experiences = extractor.extract(&[], &outcome, &test_context()).await;
+        let expected_tail = format!("Result: {}...", "あ".repeat(2730));
+        assert!(experiences[0].content.ends_with(&expected_tail));
+    }
+
+    #[tokio::test]
+    async fn test_extract_error_signature_multibyte_cuts_safely() {
+        // 600 bytes truncated at 500: 500 % 3 == 2, a mid-character cut.
+        let extractor = DefaultExperienceExtractor;
+        let outcome = AgentOutcome::Error {
+            error: "あ".repeat(200),
+        };
+
+        let experiences = extractor.extract(&[], &outcome, &test_context()).await;
+        assert!(matches!(
+            &experiences[0].experience_type,
+            ExperienceType::ErrorPattern { signature, .. }
+                if *signature == format!("{}...", "あ".repeat(166))
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_extract_tool_summary_multibyte_cuts_safely() {
+        // 210 bytes truncated at 200: 200 % 3 == 2, a mid-character cut.
+        let extractor = DefaultExperienceExtractor;
+        let conversation = vec![Message::tool_result("call_1", "あ".repeat(70))];
+        let outcome = AgentOutcome::Error {
+            error: "boom".into(),
+        };
+
+        let experiences = extractor
+            .extract(&conversation, &outcome, &test_context())
+            .await;
+        assert!(experiences[0]
+            .content
+            .contains(&format!("- {}...", "あ".repeat(66))));
     }
 }

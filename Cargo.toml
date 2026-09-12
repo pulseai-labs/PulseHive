@@ -12,7 +12,7 @@ resolver = "2"
 
 [workspace.package]
 edition = "2021"
-rust-version = "1.83"   # pyo3 0.29 MSRV
+rust-version = "1.89"   # pulsehive-db 0.7.0 declares this floor
 license = "AGPL-3.0-only"
 repository = "https://github.com/pulseai-labs/PulseHive"
 
@@ -44,7 +44,7 @@ futures-core = "0.3"
 futures = "0.3"
 
 # PulseDB storage substrate
-pulsehive-db = { version = "0.5", features = ["builtin-embeddings"] }
+pulsehive-db = { version = "0.7", features = ["builtin-embeddings"] }
 
 # HTTP client (for LLM provider crates)
 reqwest = { version = "0.13", features = ["json", "stream"] }

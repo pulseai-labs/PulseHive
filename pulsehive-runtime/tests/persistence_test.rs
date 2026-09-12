@@ -32,6 +32,7 @@ async fn test_experiences_persist_across_hivemind_instances() {
             importance: 0.8,
             confidence: 0.9,
             domain: vec!["auth".into(), "security".into()],
+            tags: Default::default(),
             source_agent: AgentId("agent-phase1".into()),
             source_task: None,
             related_files: vec![],

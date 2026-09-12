@@ -10,6 +10,7 @@ use pyo3::types::PyDict;
 
 use pulsehive_core::agent::AgentOutcome;
 use pulsehive_core::event::HiveEvent;
+
 use pulsehive_core::tool::ToolProgress;
 
 /// Lifecycle and observability event from the PulseHive runtime.
@@ -84,7 +85,9 @@ impl PyHiveEvent {
             .iter()
             .take(3)
             .map(|(k, v)| match v {
-                PyEventValue::Str(s) if s.len() > 30 => format!("{k}='{}'...", &s[..30]),
+                PyEventValue::Str(s) if s.len() > 30 => {
+                    format!("{k}='{}'...", truncate_chars(s, 30))
+                }
                 PyEventValue::Str(s) => format!("{k}='{s}'"),
                 PyEventValue::Int(n) => format!("{k}={n}"),
                 PyEventValue::Uint(n) => format!("{k}={n}"),
@@ -106,20 +109,40 @@ impl From<HiveEvent> for PyHiveEvent {
                 agent_id,
                 name,
                 kind,
+                collective_id,
+                task_description,
             } => {
                 fields.insert("timestamp_ms".into(), PyEventValue::Int(timestamp_ms));
                 fields.insert("agent_id".into(), PyEventValue::Str(agent_id.clone()));
                 fields.insert("name".into(), PyEventValue::Str(name));
                 fields.insert("kind".into(), PyEventValue::Str(format!("{kind:?}")));
+                fields.insert(
+                    "collective_id".into(),
+                    PyEventValue::Str(collective_id.to_string()),
+                );
+                fields.insert(
+                    "task_description".into(),
+                    PyEventValue::Str(task_description),
+                );
                 ("agent_started", Some(agent_id))
             }
             HiveEvent::AgentCompleted {
                 timestamp_ms,
                 agent_id,
                 outcome,
+                collective_id,
+                task_description,
             } => {
                 fields.insert("timestamp_ms".into(), PyEventValue::Int(timestamp_ms));
                 fields.insert("agent_id".into(), PyEventValue::Str(agent_id.clone()));
+                fields.insert(
+                    "collective_id".into(),
+                    PyEventValue::Str(collective_id.to_string()),
+                );
+                fields.insert(
+                    "task_description".into(),
+                    PyEventValue::Str(task_description),
+                );
                 match &outcome {
                     AgentOutcome::Complete { response } => {
                         fields.insert("outcome".into(), PyEventValue::Str("complete".into()));
@@ -360,9 +383,50 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     Ok(())
 }
 
+/// Truncates to at most `max_bytes`, cutting at the nearest UTF-8
+/// character boundary so multibyte content never panics the debug
+/// renderer.
+pub(crate) fn truncate_chars(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    let mut end = max_bytes;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pulsehive_core::agent::AgentKindTag;
+    use pulsehive_core::prelude::CollectiveId;
+
+    #[test]
+    fn repr_never_panics_on_multibyte_fields() {
+        // Eight four-byte emoji: byte 30 falls mid-character.
+        let event = HiveEvent::AgentStarted {
+            timestamp_ms: 1,
+            agent_id: "a1".into(),
+            name: "emoji-agent".into(),
+            kind: AgentKindTag::Llm,
+            collective_id: CollectiveId::new(),
+            task_description: "😀".repeat(8),
+        };
+        let py_event = PyHiveEvent::from(event);
+        // The panic the regression guards against is the slice itself; the
+        // field ordering in the HashMap preview is arbitrary, so only the
+        // shape of the rendering is asserted.
+        let rendered = py_event.__repr__();
+        assert!(rendered.starts_with("HiveEvent(agent_started"));
+    }
+
+    #[test]
+    fn truncate_chars_floors_to_char_boundary() {
+        assert_eq!(truncate_chars("hello", 30), "hello");
+        assert_eq!(truncate_chars("😀😀😀", 5), "😀");
+    }
 
     #[test]
     fn pyhiveevent_tool_progress_maps_event_type() {

@@ -208,6 +208,25 @@ pub trait EmbeddingProvider: Send + Sync {
 }
 ```
 
+**Embedding identity and PulseDB 0.7.** The trait itself is unchanged by the PulseDB
+0.5.1 → 0.7.0 upgrade. Which mode a collective runs in determines who protects
+embedding identity:
+
+- **Builtin stores** (no `EmbeddingProvider` set): PulseDB stamps and checks provider
+  identity. PulseDB 0.7 adopts a legacy unstamped builtin-MiniLM collective once,
+  normalizing it to the bundled `builtin-onnx/onnx-<sha256>` identity. Reopening with
+  the same bundled model succeeds; a different managed identity fails with a typed
+  `PulseDBError` that surfaces as `PulseHiveError::Substrate`.
+- **Custom providers** (External mode): PulseHive precomputes vectors through this
+  trait and stores them in PulseDB External mode. PulseDB cannot verify that
+  caller-provided vectors share a model, so changing the provider, model, tokenizer,
+  pipeline, or dimensions for an existing path requires an explicit **re-embed into a
+  new substrate path**. Silently mixing vectors from different embedding semantics in
+  one collective is unsupported.
+
+See [ADR-012](adr/012-pulsedb-0-7-migration.md) and the deployment runbook
+(`09-Deployment.md` §7.1) for the upgrade and rollback procedure.
+
 ### 2.6 SubstrateProvider (owned by PulseDB)
 
 Defined in the `pulsehive-db` crate, re-exported by PulseHive. This is the boundary between PulseHive and storage.
@@ -450,6 +469,10 @@ impl HiveMindBuilder {
     pub fn approval_handler(self, handler: Box<dyn ApprovalHandler>) -> Self;
 
     /// Set a custom embedding provider (Phase 2+).
+    /// When set, PulseHive computes embeddings via the provider and stores them
+    /// in PulseDB External mode (caller-controlled identity — see §2.5: changing
+    /// embedding semantics requires a re-embed into a new substrate path).
+    /// When not set, the builtin store runs under PulseDB's provider-identity protection.
     pub fn embedding_provider(self, provider: Box<dyn EmbeddingProvider>) -> Self;
 
     /// Configure the RelationshipDetector.
@@ -797,9 +820,13 @@ include a `_ => {}` catch-all arm.
 ```rust
 #[non_exhaustive] // v2.1.0 — external exhaustive matches need a `_ => {}` arm
 pub enum HiveEvent {
-    // Agent lifecycle
-    AgentStarted { agent_id: AgentId, name: String, kind: AgentKindTag },
-    AgentCompleted { agent_id: AgentId, outcome: AgentOutcome },
+    // Agent lifecycle — both carry the run's task identity (v2.1.0):
+    // collective_id + task_description attribute a run to its task when
+    // one agent executes several tasks in a single deploy.
+    AgentStarted { agent_id: AgentId, name: String, kind: AgentKindTag,
+                   collective_id: CollectiveId, task_description: String },
+    AgentCompleted { agent_id: AgentId, outcome: AgentOutcome,
+                     collective_id: CollectiveId, task_description: String },
 
     // LLM interactions
     LlmCallStarted { agent_id: AgentId, model: String, token_count: usize },
@@ -933,7 +960,7 @@ let hive = HiveMind::builder()
 
 ### 5.2 HiveMind::deploy()
 
-The primary entry point for running agents. Accepts agent definitions and tasks, spawns agent execution on the Tokio runtime, and returns a stream of events.
+The primary entry point for running agents. Accepts agent definitions and tasks, spawns agent execution on the Tokio runtime, and returns a stream of events. Every agent runs against every task — the cartesian product `agents × tasks` — with each task's collective resolved independently (an existing collective is reused; an unknown ID gets the `collective-{id}` synthetic namespace). An empty `tasks` list deploys every agent against a single default empty task; an empty `agents` list returns an empty stream without touching the substrate.
 
 ```rust
 let researcher = AgentDefinition {
