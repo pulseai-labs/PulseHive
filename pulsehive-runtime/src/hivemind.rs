@@ -39,10 +39,13 @@ use crate::intelligence::insight::InsightSynthesizer;
 use crate::intelligence::relationship::RelationshipDetector;
 use crate::workflow::{self, WorkflowContext};
 
-/// How long a finished deployment's watch keeps draining before it ends:
-/// in-process Watch events for the final records are queued synchronously,
-/// so a quiet window of this length means they have all been observed.
-const WATCH_DRAIN_QUIESCENCE: std::time::Duration = std::time::Duration::from_millis(250);
+/// Absolute window a finished deployment's watch keeps draining before it
+/// ends, measured from the moment the last agent completed: in-process
+/// Watch events for the final records are queued synchronously, so they
+/// have all been observed by the time it expires. The deadline is set once
+/// and never extended, so a collective that keeps receiving writes cannot
+/// hold a finished deployment's watch open.
+const WATCH_DRAIN_WINDOW: std::time::Duration = std::time::Duration::from_millis(250);
 
 /// A task to be executed by deployed agents.
 #[derive(Debug, Clone)]
@@ -253,15 +256,26 @@ impl HiveMind {
             }
 
             let mut finished_agents = 0;
+            let mut drain_deadline: Option<tokio::time::Instant> = None;
             while !watch_shutdown.load(Ordering::Relaxed) {
                 let next = if finished_agents == total_agents {
                     // All agents are done. The last record's WatchNotification
                     // can still be queued behind the JoinHandle's readiness,
-                    // so drain until the streams fall quiet instead of
-                    // breaking on the first idle poll.
-                    match tokio::time::timeout(WATCH_DRAIN_QUIESCENCE, watch_streams.next()).await {
-                        Ok(next) => next,
-                        Err(_) => break,
+                    // so keep forwarding — but only until the one absolute
+                    // deadline set when the final agent completed; it is
+                    // never extended, so continuously busy collectives
+                    // cannot keep the watch alive.
+                    let deadline = drain_deadline
+                        .get_or_insert_with(tokio::time::Instant::now)
+                        .checked_add(WATCH_DRAIN_WINDOW);
+                    match deadline {
+                        Some(deadline) => {
+                            match tokio::time::timeout_at(deadline, watch_streams.next()).await {
+                                Ok(next) => next,
+                                Err(_) => break,
+                            }
+                        }
+                        None => break,
                     }
                 } else {
                     watch_streams.next().await
@@ -881,12 +895,24 @@ mod tests {
     ///
     /// `watch()` increments the count and the returned stream decrements it
     /// on drop, so the count tracks exactly how many deploy watch tasks hold
-    /// a live subscription. Streams stay pending forever unless
-    /// `delayed_first_event` is set, in which case every stream emits exactly
-    /// one Created WatchEvent after that delay and then stays pending.
+    /// a live subscription. Streams stay pending forever unless a mode is
+    /// set: `delayed_first_event` emits exactly one Created WatchEvent after
+    /// that delay; `repeating_events` emits a Created WatchEvent after every
+    /// interval, forever.
     struct CountingWatchSubstrate {
         live_watches: Arc<AtomicUsize>,
         delayed_first_event: Option<std::time::Duration>,
+        repeating_events: Option<std::time::Duration>,
+    }
+
+    fn synthetic_watch_event() -> pulsedb::WatchEvent {
+        pulsedb::WatchEvent {
+            experience_id: pulsedb::ExperienceId::new(),
+            collective_id: CollectiveId::new(),
+            event_type: pulsedb::WatchEventType::Created,
+            timestamp: pulsedb::Timestamp::now(),
+            experience: None,
+        }
     }
 
     struct LiveWatchGuard(Arc<AtomicUsize>);
@@ -1004,25 +1030,22 @@ mod tests {
         ) -> DbResult<Pin<Box<dyn Stream<Item = pulsedb::WatchEvent> + Send>>> {
             self.live_watches.fetch_add(1, Ordering::SeqCst);
             let pending: Pin<Box<dyn Stream<Item = pulsedb::WatchEvent> + Send>> =
-                match self.delayed_first_event {
-                    Some(delay) => {
-                        let collective = CollectiveId::new();
-                        let event = pulsedb::WatchEvent {
-                            experience_id: pulsedb::ExperienceId::new(),
-                            collective_id: collective,
-                            event_type: pulsedb::WatchEventType::Created,
-                            timestamp: pulsedb::Timestamp::now(),
-                            experience: None,
-                        };
-                        Box::pin(
-                            futures::stream::once(async move {
-                                tokio::time::sleep(delay).await;
-                                event
-                            })
-                            .chain(futures::stream::pending()),
-                        )
-                    }
-                    None => Box::pin(futures::stream::pending()),
+                if let Some(delay) = self.delayed_first_event {
+                    let event = synthetic_watch_event();
+                    Box::pin(
+                        futures::stream::once(async move {
+                            tokio::time::sleep(delay).await;
+                            event
+                        })
+                        .chain(futures::stream::pending()),
+                    )
+                } else if let Some(interval) = self.repeating_events {
+                    Box::pin(futures::stream::unfold((), move |()| async move {
+                        tokio::time::sleep(interval).await;
+                        Some((synthetic_watch_event(), ()))
+                    }))
+                } else {
+                    Box::pin(futures::stream::pending())
                 };
             let stream = CountedWatchStream {
                 pending,
@@ -1082,6 +1105,7 @@ mod tests {
             .substrate(Box::new(CountingWatchSubstrate {
                 live_watches,
                 delayed_first_event: None,
+                repeating_events: None,
             }))
             .build()
             .unwrap()
@@ -1103,6 +1127,7 @@ mod tests {
             .substrate(Box::new(CountingWatchSubstrate {
                 live_watches,
                 delayed_first_event: None,
+                repeating_events: None,
             }))
             .llm_provider("scripted", provider.clone())
             .build()
@@ -1216,6 +1241,7 @@ mod tests {
                 // window, past the point where a naive implementation
                 // would already have dropped the watch.
                 delayed_first_event: Some(std::time::Duration::from_millis(120)),
+                repeating_events: None,
             }))
             .build()
             .unwrap();
@@ -1249,6 +1275,54 @@ mod tests {
         // And the watch still terminates: the drain window is bounded.
         wait_for_live_watches(&live_watches, 0).await;
         wait_for_finished_handles(&hive, 1).await;
+    }
+
+    #[tokio::test]
+    async fn busy_collective_cannot_extend_the_drain_window() {
+        let live_watches = Arc::new(AtomicUsize::new(0));
+        let hive = HiveMind::builder()
+            .substrate(Box::new(CountingWatchSubstrate {
+                live_watches: Arc::clone(&live_watches),
+                delayed_first_event: None,
+                // An event every 80ms — faster than the 250ms drain window —
+                // forever: under a per-event-resetting timeout the watch
+                // would never fall quiet and never end.
+                repeating_events: Some(std::time::Duration::from_millis(80)),
+            }))
+            .build()
+            .unwrap();
+        let mut notifications = hive.event_bus.subscribe();
+        let agent = AgentDefinition {
+            name: "noop".into(),
+            kind: AgentKind::Sequential(vec![]),
+        };
+
+        let stream = hive
+            .deploy(vec![agent], vec![Task::new("busy-collective")])
+            .await
+            .unwrap();
+        drop(stream);
+
+        // Events keep arriving after the agent completed, and are still
+        // forwarded during the drain window...
+        let saw_notification = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                match notifications.recv().await {
+                    Ok(HiveEvent::WatchNotification { .. }) => return true,
+                    Ok(_) => continue,
+                    Err(_) => return false,
+                }
+            }
+        })
+        .await
+        .expect("timed out waiting for a drained watch notification");
+        assert!(saw_notification, "events during the drain window forwarded");
+
+        // ...but the watch ends anyway: the deadline is absolute, so a
+        // continuously busy collective cannot hold it open.
+        wait_for_finished_handles(&hive, 1).await;
+        wait_for_live_watches(&live_watches, 0).await;
+        assert!(!hive.is_shutdown(), "termination needed no shutdown");
     }
 
     #[tokio::test]
