@@ -17,6 +17,7 @@ use pulsehive_core::llm::{LlmConfig, Message};
 use pulsehive_core::testing::ScriptedProvider;
 use pulsehive_runtime::hivemind::{HiveMind, Task};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 const FIXTURE_DIR: &str = "tests/fixtures/pulsedb-0.5.1-pulsehive-2.0.2";
 
@@ -27,7 +28,8 @@ fn fixture_path(name: &str) -> std::path::PathBuf {
 }
 
 /// Loads `manifest.json` and asserts it carries exactly the provenance the
-/// oracle claims.
+/// oracle claims, including that the checked-in `collective.db` bytes hash
+/// to the manifest's `sha256` pin.
 fn load_manifest_and_check_provenance() -> Value {
     let manifest: Value = serde_json::from_str(
         &std::fs::read_to_string(fixture_path("manifest.json")).expect("manifest.json readable"),
@@ -41,7 +43,31 @@ fn load_manifest_and_check_provenance() -> Value {
     );
     assert_eq!(manifest["pulsehive_version"], "2.0.2", "PulseHive version");
     assert_eq!(manifest["pulsehive_db_version"], "0.5.1", "PulseDB version");
+    assert_fixture_matches_sha256_pin(&manifest);
     manifest
+}
+
+/// Enforces the manifest's `sha256` pin against the actual `collective.db`
+/// bytes. A regenerated or edited fixture fails here with both digests
+/// instead of silently invalidating the migration oracle the tests assert
+/// against; regenerate `manifest.json` alongside the fixture (see the
+/// fixture directory's README) when the oracle is deliberately replaced.
+fn assert_fixture_matches_sha256_pin(manifest: &Value) {
+    let pinned = manifest["sha256"]
+        .as_str()
+        .expect("manifest.json pins a sha256")
+        .to_ascii_lowercase();
+    let bytes = std::fs::read(fixture_path("collective.db")).expect("collective.db readable");
+    let actual: String = Sha256::digest(&bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+
+    assert_eq!(
+        pinned, actual,
+        "collective.db does not match the manifest sha256 pin {pinned} (actual {actual}); \
+         the legacy oracle bytes changed without updating manifest.json"
+    );
 }
 
 /// Copies the checked-in database to a fresh temporary directory. The
