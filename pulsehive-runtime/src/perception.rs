@@ -3,11 +3,14 @@
 //! Implements the Perceive phase: query substrate → re-rank through lens → format as
 //! intrinsic knowledge. Each agent sees the same substrate differently based on its lens.
 
-use pulsedb::{Activity, CollectiveId, Experience, SubstrateProvider, Timestamp};
+use pulsedb::{Activity, Experience, SubstrateProvider, Timestamp};
 use pulsehive_core::error::Result;
+use pulsehive_core::ids::CollectiveId;
 use pulsehive_core::lens::{ExperienceTypeTag, Lens, RecencyCurve};
 use pulsehive_core::llm::Message;
 use tracing::Instrument;
+
+use crate::substrate_ids;
 
 // ── Query Phase (#24) ────────────────────────────────────────────────
 
@@ -21,16 +24,17 @@ pub async fn query_substrate(
     collective_id: CollectiveId,
 ) -> Result<(Vec<Experience>, Vec<Activity>)> {
     let fetch_limit = lens.attention_budget * 2; // Over-fetch for re-ranking headroom
+    let db_collective_id = substrate_ids::to_db_collective_id(collective_id);
 
     let experiences = if !lens.purpose_embedding.is_empty() {
         // Semantic search using the lens purpose embedding
         let results = substrate
-            .search_similar(collective_id, &lens.purpose_embedding, fetch_limit)
+            .search_similar(db_collective_id, &lens.purpose_embedding, fetch_limit)
             .await?;
         results.into_iter().map(|(exp, _sim)| exp).collect()
     } else {
         // Fallback: get recent experiences
-        substrate.get_recent(collective_id, fetch_limit).await?
+        substrate.get_recent(db_collective_id, fetch_limit).await?
     };
 
     // Post-filter by domain if lens has domain focus
@@ -51,7 +55,7 @@ pub async fn query_substrate(
 
     // Fetch active agents for awareness
     let activities = substrate
-        .get_activities(collective_id)
+        .get_activities(db_collective_id)
         .await
         .unwrap_or_default();
 
@@ -294,7 +298,7 @@ mod tests {
         let age_ms = (age_hours * 3600.0 * 1000.0) as i64;
         Experience {
             id: ExperienceId::new(),
-            collective_id: CollectiveId::new(),
+            collective_id: pulsedb::CollectiveId::new(),
             content: content.into(),
             experience_type: exp_type,
             embedding: vec![],
@@ -483,7 +487,7 @@ mod tests {
     fn test_format_with_activities() {
         let activities = vec![Activity {
             agent_id: "researcher".into(),
-            collective_id: CollectiveId::new(),
+            collective_id: pulsedb::CollectiveId::new(),
             current_task: Some("analyzing codebase".into()),
             context_summary: None,
             started_at: Timestamp::now(),

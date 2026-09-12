@@ -20,6 +20,7 @@
 
 use std::sync::Arc;
 
+use crate::ids::CollectiveId;
 use crate::lens::Lens;
 use crate::llm::LlmConfig;
 use crate::tool::Tool;
@@ -96,7 +97,7 @@ pub struct ExtractionContext {
     /// ID of the agent whose conversation is being extracted.
     pub agent_id: String,
     /// Collective where extracted experiences will be stored.
-    pub collective_id: pulsedb::CollectiveId,
+    pub collective_id: CollectiveId,
     /// Description of the task the agent was working on.
     pub task_description: String,
 }

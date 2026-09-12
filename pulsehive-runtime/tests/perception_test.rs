@@ -61,7 +61,7 @@ impl LlmProvider for EchoContextLlm {
 
 // ── Helpers ──────────────────────────────────────────────────────────
 
-async fn build_hive(provider: EchoContextLlm) -> (HiveMind, pulsedb::CollectiveId) {
+async fn build_hive(provider: EchoContextLlm) -> (HiveMind, pulsehive_core::ids::CollectiveId) {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("test.db");
     Box::leak(Box::new(dir));
@@ -78,7 +78,10 @@ async fn build_hive(provider: EchoContextLlm) -> (HiveMind, pulsedb::CollectiveI
         .await
         .unwrap();
 
-    (hive, cid)
+    (
+        hive,
+        pulsehive_core::ids::CollectiveId::from_bytes(*cid.as_bytes()),
+    )
 }
 
 async fn collect_events(

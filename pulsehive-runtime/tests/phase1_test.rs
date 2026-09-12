@@ -97,7 +97,7 @@ fn scripted_llm() -> ScriptedLlm {
     ])
 }
 
-async fn seed_substrate(hive: &HiveMind) -> pulsedb::CollectiveId {
+async fn seed_substrate(hive: &HiveMind) -> pulsehive_core::ids::CollectiveId {
     let collective_id = hive
         .substrate()
         .get_or_create_collective("project")
@@ -121,7 +121,7 @@ async fn seed_substrate(hive: &HiveMind) -> pulsedb::CollectiveId {
     })
     .await
     .unwrap();
-    collective_id
+    pulsehive_core::ids::CollectiveId::from_bytes(*collective_id.as_bytes())
 }
 
 fn phase1_agent() -> AgentDefinition {
