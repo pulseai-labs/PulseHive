@@ -268,7 +268,7 @@ The intended learning path for a new PulseHive developer:
 
 ```toml
 [dependencies]
-pulsehive = "0.1"
+pulsehive = { version = "0.1", features = ["runtime"] }
 tokio = { version = "1", features = ["full"] }
 ```
 

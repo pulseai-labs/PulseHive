@@ -13,7 +13,7 @@ name = "pulsehive_py"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-pulsehive-core = { workspace = true }
+pulsehive-core = { workspace = true, features = ["substrate"] }
 pulsehive-runtime = { workspace = true }
 pulsehive-openai = { workspace = true }
 pulsehive-anthropic = { workspace = true }

@@ -12,15 +12,19 @@ documentation = "https://docs.rs/pulsehive"
 keywords = ["ai", "agent", "llm", "multi-agent", "consciousness"]
 categories = ["science", "asynchronous"]
 
+[package.metadata.docs.rs]
+all-features = true
+
 [features]
 default = []
 openai = ["dep:pulsehive-openai"]
 anthropic = ["dep:pulsehive-anthropic"]
-testing = ["pulsehive-core/testing"]
+runtime = ["dep:pulsehive-runtime", "pulsehive-core/substrate"]
+testing = ["runtime", "pulsehive-core/testing"]
 
 [dependencies]
 pulsehive-core = { workspace = true }
-pulsehive-runtime = { workspace = true }
+pulsehive-runtime = { workspace = true, optional = true }
 pulsehive-openai = { workspace = true, optional = true }
 pulsehive-anthropic = { workspace = true, optional = true }
 
@@ -34,3 +38,7 @@ tokio = { workspace = true }
 [[test]]
 name = "scripted_agent_turn"
 required-features = ["testing"]
+
+[[test]]
+name = "transport_only"
+required-features = ["openai", "anthropic"]

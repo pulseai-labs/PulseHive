@@ -10,7 +10,7 @@ This is the **meta-crate** — it re-exports [`pulsehive-core`](https://crates.i
 
 ```toml
 [dependencies]
-pulsehive = { version = "1.0", features = ["openai"] }
+pulsehive = { version = "1.0", features = ["openai", "runtime"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 ```
 

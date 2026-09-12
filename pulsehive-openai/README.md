@@ -18,7 +18,7 @@ Works with any OpenAI-compatible API — not just OpenAI:
 
 ```toml
 [dependencies]
-pulsehive = { version = "1.0", features = ["openai"] }
+pulsehive = { version = "1.0", features = ["openai", "runtime"] }
 ```
 
 ```rust
