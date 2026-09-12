@@ -82,8 +82,10 @@ pub struct HiveMind {
     pub(crate) embedding_provider: Option<Arc<dyn EmbeddingProvider>>,
     /// Shutdown signal for background tasks (Watch system).
     shutdown: Arc<AtomicBool>,
-    /// Handle to the Watch background task for graceful cancellation.
-    watch_handle: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// Handles to the per-deployment Watch background tasks, pruned of
+    /// completed entries on each deploy and aborted together on
+    /// shutdown/drop.
+    watch_handles: std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
 }
 
 impl std::fmt::Debug for HiveMind {
@@ -142,11 +144,13 @@ impl HiveMind {
     /// (LLM, Sequential, Parallel, Loop).
     ///
     /// Automatically subscribes to the PulseDB Watch system — one background
-    /// watch task for the whole deployment, fanning in every resolved
-    /// collective — forwarding substrate change events as
-    /// [`HiveEvent::WatchNotification`]. If a Watch subscription fails, that
-    /// collective is skipped and agents still execute normally (graceful
-    /// degradation).
+    /// watch task per deployment, fanning in every resolved collective —
+    /// forwarding substrate change events as
+    /// [`HiveEvent::WatchNotification`]. Watches of earlier deployments keep
+    /// forwarding while those deployments run; completed watch tasks are
+    /// pruned on the next deploy, and shutdown/drop aborts all of them. If a
+    /// Watch subscription fails, that collective is skipped and agents still
+    /// execute normally (graceful degradation).
     pub async fn deploy(
         &self,
         agents: Vec<AgentDefinition>,
@@ -211,15 +215,18 @@ impl HiveMind {
                 }
             }
         });
-        // Cancel the previous deploy's watch task before storing the new
-        // handle: overwriting the slot without aborting would leak the old
-        // task and its EventBus sender clone for the lifetime of the hive.
+        // Retain the watch tasks of still-running deployments — each keeps
+        // forwarding its collectives' WatchNotifications — while pruning
+        // handles whose task already finished, so the set cannot grow
+        // without bound across repeated deploys. A poisoned lock (a panic
+        // elsewhere held it) must not block deployment: recover the guard.
         {
-            let mut watch_slot = self.watch_handle.lock().unwrap();
-            if let Some(previous) = watch_slot.take() {
-                previous.abort();
-            }
-            *watch_slot = Some(watch_handle);
+            let mut watch_set = self
+                .watch_handles
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            watch_set.retain(|handle| !handle.is_finished());
+            watch_set.push(watch_handle);
         }
 
         let rx = self.event_bus.subscribe();
@@ -342,13 +349,20 @@ impl HiveMind {
 
     /// Signal shutdown to all background tasks (Watch system).
     ///
-    /// Sets the shutdown flag, causing the Watch background task to stop
-    /// after processing its current event. This is non-blocking.
+    /// Sets the shutdown flag, causing the Watch background tasks to stop
+    /// after processing their current event. This is non-blocking.
     pub fn shutdown(&self) {
         self.shutdown.store(true, Ordering::Relaxed);
-        // Abort the Watch background task so it drops its EventBus sender clone,
-        // allowing the broadcast channel to close and BroadcastStream to terminate.
-        if let Some(handle) = self.watch_handle.lock().unwrap().take() {
+        // Abort the Watch background tasks so they drop their EventBus sender
+        // clones, allowing the broadcast channel to close and BroadcastStream
+        // to terminate. Recover from a poisoned lock: shutdown must run even
+        // while another thread is unwinding a panic.
+        for handle in self
+            .watch_handles
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .drain(..)
+        {
             handle.abort();
         }
         tracing::info!("HiveMind shutdown signaled");
@@ -403,7 +417,7 @@ impl HiveMind {
 impl Drop for HiveMind {
     fn drop(&mut self) {
         self.shutdown.store(true, Ordering::Relaxed);
-        if let Some(handle) = self.watch_handle.get_mut().unwrap().take() {
+        for handle in self.watch_handles.get_mut().unwrap().drain(..) {
             handle.abort();
         }
     }
@@ -594,7 +608,7 @@ impl HiveMindBuilder {
             insight_synthesizer,
             embedding_provider: self.embedding_provider,
             shutdown: Arc::new(AtomicBool::new(false)),
-            watch_handle: std::sync::Mutex::new(None),
+            watch_handles: std::sync::Mutex::new(Vec::new()),
         })
     }
 }
@@ -806,9 +820,13 @@ mod tests {
     ///
     /// `watch()` increments the count and the returned stream decrements it
     /// on drop, so the count tracks exactly how many deploy watch tasks hold
-    /// a live subscription.
+    /// a live subscription. The first subscription ends immediately (its
+    /// stream yields `None` right away) so pruning of finished watch tasks
+    /// is observable; later subscriptions stay pending forever.
     struct CountingWatchSubstrate {
         live_watches: Arc<AtomicUsize>,
+        subscriptions: AtomicUsize,
+        end_first_subscription: bool,
     }
 
     struct LiveWatchGuard(Arc<AtomicUsize>);
@@ -927,8 +945,16 @@ mod tests {
         ) -> DbResult<Pin<Box<dyn Stream<Item = pulsedb::WatchEvent> + Send>>>
         {
             self.live_watches.fetch_add(1, Ordering::SeqCst);
+            let ends_immediately = self.end_first_subscription
+                && self.subscriptions.fetch_add(1, Ordering::SeqCst) == 0;
+            let pending: Pin<Box<dyn Stream<Item = pulsedb::WatchEvent> + Send>> =
+                if ends_immediately {
+                    Box::pin(futures::stream::empty())
+                } else {
+                    Box::pin(futures::stream::pending())
+                };
             let stream = CountedWatchStream {
-                pending: Box::pin(futures::stream::pending()),
+                pending,
                 _guard: LiveWatchGuard(Arc::clone(&self.live_watches)),
             };
             Ok(Box::pin(stream))
@@ -968,15 +994,42 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn repeated_deploy_keeps_only_the_active_watch() {
-        let live_watches = Arc::new(AtomicUsize::new(0));
-        let hive = HiveMind::builder()
+    /// Polls until `expected` tracked watch handles are marked finished.
+    async fn wait_for_finished_handles(hive: &HiveMind, expected: usize) {
+        for _ in 0..500 {
+            let finished = hive
+                .watch_handles
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|handle| handle.is_finished())
+                .count();
+            if finished == expected {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("no tracked watch handle was marked finished");
+    }
+
+    fn counting_hive(
+        live_watches: Arc<AtomicUsize>,
+        end_first_subscription: bool,
+    ) -> HiveMind {
+        HiveMind::builder()
             .substrate(Box::new(CountingWatchSubstrate {
-                live_watches: Arc::clone(&live_watches),
+                live_watches,
+                subscriptions: AtomicUsize::new(0),
+                end_first_subscription,
             }))
             .build()
-            .unwrap();
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn repeated_deploy_retains_watch_per_deployment() {
+        let live_watches = Arc::new(AtomicUsize::new(0));
+        let hive = counting_hive(Arc::clone(&live_watches), false);
         let agent = |name: &str| AgentDefinition {
             name: name.into(),
             kind: AgentKind::Sequential(vec![]),
@@ -994,25 +1047,64 @@ mod tests {
             .await
             .unwrap();
         drop(second);
-        // The first deploy's watch task must be cancelled, not leaked: the
-        // count returns to exactly one live watch.
-        wait_for_live_watches(&live_watches, 1).await;
-        assert_eq!(live_watches.load(Ordering::SeqCst), 1);
+        // The still-running first deployment keeps its watch: a second
+        // deploy must not abort it, and no watch may be leaked beyond the
+        // two deployments' own streams.
+        wait_for_live_watches(&live_watches, 2).await;
+        assert_eq!(live_watches.load(Ordering::SeqCst), 2);
 
-        // Shutdown still tears down the remaining (active) watch task.
+        // Shutdown tears down every retained watch task.
         hive.shutdown();
         wait_for_live_watches(&live_watches, 0).await;
     }
 
     #[tokio::test]
-    async fn deploy_after_multi_task_deploy_keeps_only_the_active_watch() {
+    async fn finished_watch_handles_are_pruned_on_next_deploy() {
         let live_watches = Arc::new(AtomicUsize::new(0));
-        let hive = HiveMind::builder()
-            .substrate(Box::new(CountingWatchSubstrate {
-                live_watches: Arc::clone(&live_watches),
-            }))
-            .build()
+        let hive = counting_hive(Arc::clone(&live_watches), true);
+        let agent = AgentDefinition {
+            name: "noop".into(),
+            kind: AgentKind::Sequential(vec![]),
+        };
+
+        // First deploy's watch stream ends immediately, so its task finishes.
+        let first = hive
+            .deploy(vec![agent.clone()], vec![Task::new("first")])
+            .await
             .unwrap();
+        drop(first);
+        wait_for_live_watches(&live_watches, 0).await;
+        // The finished task is marked done asynchronously — wait for the
+        // runtime to record it before expecting the next deploy to prune it.
+        wait_for_finished_handles(&hive, 1).await;
+        {
+            let tracked = hive.watch_handles.lock().unwrap().len();
+            assert_eq!(
+                tracked, 1,
+                "finished handle is still tracked until the next deploy prunes it"
+            );
+        }
+
+        // The next deploy prunes the finished handle instead of accumulating.
+        let second = hive
+            .deploy(vec![agent], vec![Task::new("second")])
+            .await
+            .unwrap();
+        drop(second);
+        wait_for_live_watches(&live_watches, 1).await;
+        {
+            let tracked = hive.watch_handles.lock().unwrap().len();
+            assert_eq!(tracked, 1, "the finished handle was pruned on deploy");
+        }
+
+        hive.shutdown();
+        wait_for_live_watches(&live_watches, 0).await;
+    }
+
+    #[tokio::test]
+    async fn multi_task_deploy_fans_collectives_into_one_watch() {
+        let live_watches = Arc::new(AtomicUsize::new(0));
+        let hive = counting_hive(Arc::clone(&live_watches), false);
         let agent = AgentDefinition {
             name: "noop".into(),
             kind: AgentKind::Sequential(vec![]),
@@ -1030,14 +1122,14 @@ mod tests {
         drop(multi);
         wait_for_live_watches(&live_watches, 3).await;
 
-        // A new deploy must cancel that whole fan-in task — not stack a
-        // fourth stream on top of it.
+        // A new deploy adds its own watch task (one more stream), never
+        // cancels the fan-in, and shutdown clears everything.
         let next = hive
             .deploy(vec![agent], vec![Task::new("d")])
             .await
             .unwrap();
         drop(next);
-        wait_for_live_watches(&live_watches, 1).await;
+        wait_for_live_watches(&live_watches, 4).await;
         hive.shutdown();
         wait_for_live_watches(&live_watches, 0).await;
     }
