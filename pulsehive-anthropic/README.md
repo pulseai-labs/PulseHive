@@ -14,7 +14,7 @@ Supports the full Claude model family via the Messages API with native tool use 
 
 ```toml
 [dependencies]
-pulsehive = { version = "1.0", features = ["anthropic"] }
+pulsehive = { version = "1.0", features = ["anthropic", "runtime"] }
 ```
 
 ```rust

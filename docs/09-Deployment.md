@@ -35,23 +35,28 @@ Each crate has its own `Cargo.toml` with an independent version number, though i
 
 ## 3. Cargo Feature Flags
 
-The meta-crate exposes compile-time feature flags so products only pull in the LLM providers they need:
+The meta-crate exposes compile-time feature flags so products only pull in the LLM providers they need — and only pull in the runtime when they ask for it:
 
 ```toml
-# Product's Cargo.toml
+# Product's Cargo.toml — full SDK (HiveMind, agents, PulseDB substrate)
 [dependencies]
-pulsehive = { version = "0.1", features = ["anthropic"] }
+pulsehive = { version = "0.1", features = ["anthropic", "runtime"] }
 
 # Or for OpenAI-compatible providers (GLM, vLLM, Ollama, LM Studio)
-pulsehive = { version = "0.1", features = ["openai"] }
+pulsehive = { version = "0.1", features = ["openai", "runtime"] }
 
 # Both providers
-pulsehive = { version = "0.1", features = ["anthropic", "openai"] }
+pulsehive = { version = "0.1", features = ["anthropic", "openai", "runtime"] }
+
+# Provider construction without the runtime — neither pulsehive-runtime nor pulsehive-db resolves
+pulsehive = { version = "0.1", features = ["openai"] } # transport-only
 ```
 
 **Feature flag design principles:**
 
-- **No default features.** Products opt in explicitly. A bare `pulsehive = "0.1"` gives you core traits and runtime but no LLM provider.
+- **No default features.** Products opt in explicitly. A bare `pulsehive = "0.1"` gives you core traits and types only — no runtime and no LLM provider.
+- **Runtime is an explicit opt-in.** `runtime` pulls in `pulsehive-runtime` and enables `pulsehive-core/substrate` (the PulseDB storage surface). Provider features alone resolve neither — that is the transport-only footprint.
+- **`testing` implies `runtime`.** The scripted-provider testkit drives a real agent turn, so `testing` enables `runtime` plus `pulsehive-core/testing`.
 - **Additive only.** Features never remove functionality. Enabling `anthropic` adds the `AnthropicProvider`; it does not disable anything.
 - **No feature interactions.** Enabling both `anthropic` and `openai` is the same as enabling each independently. No conditional compilation gates that depend on feature combinations.
 
@@ -59,8 +64,11 @@ The meta-crate's `Cargo.toml` feature section:
 
 ```toml
 [features]
+default = []
 anthropic = ["dep:pulsehive-anthropic"]
 openai = ["dep:pulsehive-openai"]
+runtime = ["dep:pulsehive-runtime", "pulsehive-core/substrate"]
+testing = ["runtime", "pulsehive-core/testing"]
 ```
 
 ---
