@@ -168,7 +168,11 @@ impl HiveMind {
             resolved_tasks.push(task);
         }
         if resolved_tasks.is_empty() {
-            resolved_tasks.push(Task::new(""));
+            // The default task goes through the same resolution as listed
+            // tasks: its collective must exist before agents record into it.
+            let mut default_task = Task::new("");
+            self.resolve_collective(&mut default_task).await?;
+            resolved_tasks.push(default_task);
         }
 
         // One watch collective per distinct resolved collective, first-seen
@@ -1250,6 +1254,24 @@ mod tests {
             2,
         )
         .await;
+
+        // The default task's collective was resolved and created before the
+        // agents ran, so both runs' experiences actually persist (record
+        // failures are only logged by the loop and would otherwise be
+        // invisible behind a successful AgentCompleted).
+        let collectives = hive.substrate().list_collectives().await.unwrap();
+        assert_eq!(collectives.len(), 1, "the default task's collective exists");
+        let recent = hive
+            .substrate()
+            .get_recent(collectives[0].id, 10)
+            .await
+            .unwrap();
+        assert_eq!(
+            recent.len(),
+            2,
+            "both agents recorded an experience into the resolved collective"
+        );
+        assert!(recent.iter().all(|exp| exp.content.contains("done")));
 
         let requests = provider.requests();
         assert_eq!(requests.len(), 2, "both agents ran once");
