@@ -208,6 +208,25 @@ pub trait EmbeddingProvider: Send + Sync {
 }
 ```
 
+**Embedding identity and PulseDB 0.7.** The trait itself is unchanged by the PulseDB
+0.5.1 → 0.7.0 upgrade. Which mode a collective runs in determines who protects
+embedding identity:
+
+- **Builtin stores** (no `EmbeddingProvider` set): PulseDB stamps and checks provider
+  identity. PulseDB 0.7 adopts a legacy unstamped builtin-MiniLM collective once,
+  normalizing it to the bundled `builtin-onnx/onnx-<sha256>` identity. Reopening with
+  the same bundled model succeeds; a different managed identity fails with a typed
+  `PulseDBError` that surfaces as `PulseHiveError::Substrate`.
+- **Custom providers** (External mode): PulseHive precomputes vectors through this
+  trait and stores them in PulseDB External mode. PulseDB cannot verify that
+  caller-provided vectors share a model, so changing the provider, model, tokenizer,
+  pipeline, or dimensions for an existing path requires an explicit **re-embed into a
+  new substrate path**. Silently mixing vectors from different embedding semantics in
+  one collective is unsupported.
+
+See [ADR-012](adr/012-pulsedb-0-7-migration.md) and the deployment runbook
+(`09-Deployment.md` §7.1) for the upgrade and rollback procedure.
+
 ### 2.6 SubstrateProvider (owned by PulseDB)
 
 Defined in the `pulsehive-db` crate, re-exported by PulseHive. This is the boundary between PulseHive and storage.
@@ -450,6 +469,10 @@ impl HiveMindBuilder {
     pub fn approval_handler(self, handler: Box<dyn ApprovalHandler>) -> Self;
 
     /// Set a custom embedding provider (Phase 2+).
+    /// When set, PulseHive computes embeddings via the provider and stores them
+    /// in PulseDB External mode (caller-controlled identity — see §2.5: changing
+    /// embedding semantics requires a re-embed into a new substrate path).
+    /// When not set, the builtin store runs under PulseDB's provider-identity protection.
     pub fn embedding_provider(self, provider: Box<dyn EmbeddingProvider>) -> Self;
 
     /// Configure the RelationshipDetector.

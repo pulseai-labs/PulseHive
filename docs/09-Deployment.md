@@ -219,6 +219,48 @@ pulsehive-db = "0.1"  # Accept any 0.1.x patch
 - Test PulseHive against the latest PulseDB before every release.
 - Since both codebases are maintained by the same developer, coordinate breaking changes across both repos before publishing either.
 
+### 7.1 Upgrading a collective to PulseDB 0.7 (runbook)
+
+Moving an existing collective from PulseDB 0.5.1 to 0.7.0 migrates the on-disk storage
+(redb format and bincode→postcard values in 0.6, schema v3→v4 plus provider identity in
+0.7). PulseDB owns and performs the migration; PulseHive opens the substrate and
+propagates failures. The boundary and ownership contract is [ADR-012](adr/012-pulsedb-0-7-migration.md).
+
+**Bounded procedure:**
+
+1. **Stop every writer.** All processes holding the collective open must exit before the
+   migration; a partially observed migration is not a supported state.
+2. **Preserve the database and free-space headroom.** Back up the collective's substrate
+   path (file copy, not just the sidecars) and confirm the volume has room for the
+   migrated files plus both backup sidecars.
+3. **Perform one writable open through the normal `HiveMindBuilder`.** Build exactly as in
+   normal operation (`substrate_path` + `HiveMindBuilder::build()`). The first open under
+   the upgraded crates performs the migration. A **read-only open cannot perform the
+   migration** — do not pre-open the path read-only to "check" it.
+4. **Validate the collective.** Confirm experiences are queryable and search returns
+   prior results before returning the collective to service.
+5. **Retain both sidecars.** Keep `.pre-substrate.bak` (pristine pre-0.6 image) and
+   `.pre-v4.bak` (schema-v3 backup) until the upgraded collective has been validated.
+   Do not delete them as part of the upgrade.
+
+**Typed failure propagation:** if the migration cannot proceed, `PulseDB::open` fails and
+`HiveMindBuilder::build()` returns `PulseHiveError::Substrate(pulsedb::PulseDBError)`
+unchanged — including the typed provider-identity mismatch when a builtin collective is
+reopened with a different managed model. Match on the error; do not retry with different
+flags or attempt to repair the files in place.
+
+**Rollback (full return to 0.5.1):** stop every writer, **restore the pristine
+`.pre-substrate.bak`** over the substrate path, then downgrade the coordinated PulseHive
+crates together. `.pre-v4.bak` is the schema-v3 backup made later in the chain and is
+**not** the full 0.5 rollback image. Never downgrade only the crates against migrated
+bytes — 0.5 crates cannot read 0.7 files.
+
+**External-mode collectives:** a collective created with a custom `EmbeddingProvider`
+(stored in External mode) is migrated by PulseDB like any other, but PulseDB cannot
+verify that caller-provided vectors share a model. Changing the provider, model,
+tokenizer, pipeline, or dimensions requires an explicit re-embed into a new substrate
+path; see the API specification.
+
 ---
 
 ## 8. CI/CD Pipeline
