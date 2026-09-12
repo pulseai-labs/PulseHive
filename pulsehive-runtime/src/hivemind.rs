@@ -208,7 +208,9 @@ impl HiveMind {
         let watch_handle = tokio::spawn(async move {
             #[derive(Debug)]
             enum WatchLoop {
-                Event(pulsedb::WatchEvent),
+                // Boxed: WatchEvent carries an enriched Option<Experience>
+                // and dwarfs the unit variant.
+                Event(Box<pulsedb::WatchEvent>),
                 AgentFinished,
             }
 
@@ -218,7 +220,9 @@ impl HiveMind {
             for collective_id in watch_collectives {
                 match watch_substrate.watch(collective_id).await {
                     Ok(watch_stream) => {
-                        watch_streams.push(Box::pin(watch_stream.map(WatchLoop::Event)));
+                        watch_streams.push(Box::pin(
+                            watch_stream.map(|event| WatchLoop::Event(Box::new(event))),
+                        ));
                     }
                     Err(e) => {
                         tracing::warn!(
