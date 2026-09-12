@@ -37,6 +37,8 @@ docs/specs/
 .env
 .env.local
 *.db
+# Checked-in legacy fixture oracle (r1.s4.w2): these exact bytes are versioned
+!pulsehive-runtime/tests/fixtures/pulsedb-0.5.1-pulsehive-2.0.2/collective.db
 
 # IDE
 .idea/
