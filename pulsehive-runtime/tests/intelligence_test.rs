@@ -6,13 +6,31 @@
 
 use pulsehive_runtime::hivemind::HiveMind;
 
-/// Helper: create a HiveMind with builtin embeddings.
-fn build_hive() -> HiveMind {
+/// Helper: create a HiveMind whose relationship detector relates every
+/// non-self pair, so relation assertions depend only on the recorded
+/// experience types — not on where builtin embedding similarity lands.
+fn build_hive_with_always_on_detector() -> HiveMind {
+    use pulsehive_runtime::intelligence::relationship::{
+        RelationshipDetector, RelationshipDetectorConfig,
+    };
+
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("test.db");
     Box::leak(Box::new(dir));
 
-    HiveMind::builder().substrate_path(&path).build().unwrap()
+    // Cosine similarity is bounded by [-1.0, 1.0], so a threshold of -1.0
+    // admits every pair the detector sees.
+    let detector = RelationshipDetector::new(RelationshipDetectorConfig {
+        auto_threshold: -1.0,
+        suggest_threshold: -1.0,
+        use_llm_classification: false,
+    });
+
+    HiveMind::builder()
+        .substrate_path(&path)
+        .relationship_detector(detector)
+        .build()
+        .unwrap()
 }
 
 async fn record_network_experience(
@@ -42,7 +60,7 @@ async fn record_network_experience(
 
 #[tokio::test]
 async fn test_record_experience_stores_and_infers_relations() {
-    let hive = build_hive();
+    let hive = build_hive_with_always_on_detector();
     let cid = hive
         .substrate()
         .get_or_create_collective("intelligence-test")
@@ -92,10 +110,36 @@ async fn test_record_experience_stores_and_infers_relations() {
         assert!(hive.substrate().get_experience(id).await.unwrap().is_some());
     }
 
-    let related = hive.substrate().get_related(id3).await.unwrap();
-    println!(
-        "Relations found for exp3: {} (builtin embedding similarity depends on content overlap)",
-        related.len()
+    // Recording through record_experience inferred and stored relations:
+    // id2 (ErrorPattern) -> id1 (Difficulty) is RelatedTo, and the Solution
+    // id3 supports the Difficulty id1 and is RelatedTo the ErrorPattern id2.
+    let related_to_solution = hive.substrate().get_related(id3).await.unwrap();
+    assert_eq!(
+        related_to_solution.len(),
+        2,
+        "the solution relates to both earlier experiences: {related_to_solution:?}"
+    );
+    for (experience, relation) in &related_to_solution {
+        let expected = match experience.id {
+            id if id == id1 => pulsedb::RelationType::Supports,
+            id if id == id2 => pulsedb::RelationType::RelatedTo,
+            other => panic!("unexpected related experience {other:?}"),
+        };
+        assert_eq!(relation.relation_type, expected);
+        assert_eq!(relation.source_id, id3, "relations are stored from id3");
+        assert_eq!(relation.target_id, experience.id);
+    }
+
+    // Both relations point at id1's side too (get_related is bidirectional).
+    let related_to_difficulty = hive.substrate().get_related(id1).await.unwrap();
+    assert_eq!(related_to_difficulty.len(), 2);
+    assert!(
+        related_to_difficulty
+            .iter()
+            .any(|(_, relation)| relation.relation_type == pulsedb::RelationType::Supports)
+            && related_to_difficulty
+                .iter()
+                .any(|(_, relation)| relation.relation_type == pulsedb::RelationType::RelatedTo)
     );
 }
 
