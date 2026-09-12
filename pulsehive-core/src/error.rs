@@ -1,7 +1,8 @@
 //! Error types for PulseHive SDK.
 //!
 //! [`PulseHiveError`] is the top-level error returned by all PulseHive public APIs.
-//! It wraps [`pulsedb::PulseDBError`] for seamless substrate error propagation.
+//! With the `substrate` feature it wraps `pulsedb::PulseDBError` for seamless
+//! substrate error propagation.
 
 use thiserror::Error;
 
@@ -15,7 +16,6 @@ use thiserror::Error;
 /// fn describe(err: pulsehive_core::error::PulseHiveError) -> &'static str {
 ///     use pulsehive_core::error::PulseHiveError as E;
 ///     match err {
-///         E::Substrate(_) => "substrate",
 ///         E::Llm(_) => "llm",
 ///         E::LlmTransport(_) => "llm transport",
 ///         E::Tool(_) => "tool",
@@ -32,6 +32,7 @@ pub enum PulseHiveError {
     /// Error from the PulseDB storage substrate.
     ///
     /// Automatically converted from [`pulsedb::PulseDBError`] via the `?` operator.
+    #[cfg(feature = "substrate")]
     #[error("Substrate error: {0}")]
     Substrate(#[from] pulsedb::PulseDBError),
 
@@ -110,6 +111,7 @@ pub type Result<T> = std::result::Result<T, PulseHiveError>;
 mod tests {
     use super::*;
 
+    #[cfg(feature = "substrate")]
     #[test]
     fn test_pulsedb_error_converts_via_from() {
         let db_err = pulsedb::PulseDBError::config("test failure");
@@ -118,6 +120,7 @@ mod tests {
         assert!(hive_err.to_string().contains("test failure"));
     }
 
+    #[cfg(feature = "substrate")]
     #[test]
     fn test_question_mark_propagation() {
         fn inner() -> Result<()> {

@@ -21,9 +21,11 @@
 //! }
 //! ```
 
+#[cfg(any(test, feature = "substrate"))]
 use std::sync::Arc;
 
 use async_trait::async_trait;
+#[cfg(feature = "substrate")]
 use pulsedb::SubstrateProvider;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -84,6 +86,7 @@ pub struct ToolContext {
     /// Collective (namespace) the agent belongs to.
     pub collective_id: CollectiveId,
     /// Shared substrate for reading/writing experiences during tool execution.
+    #[cfg(feature = "substrate")]
     pub substrate: Arc<dyn SubstrateProvider>,
     /// Event emitter for tools that need to emit custom events.
     pub event_emitter: EventEmitter,
@@ -287,8 +290,10 @@ mod tests {
 
     // Mock streaming tool that ignores its context and pushes a fixed
     // Progress(0.5) → PartialResult → Progress(1.0) sequence over the channel.
+    #[cfg(feature = "substrate")]
     struct MockStreamingTool;
 
+    #[cfg(feature = "substrate")]
     #[async_trait]
     impl Tool for MockStreamingTool {
         fn name(&self) -> &str {
@@ -308,6 +313,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "substrate")]
     #[async_trait]
     impl StreamingTool for MockStreamingTool {
         async fn execute_streaming(
@@ -340,6 +346,7 @@ mod tests {
 
     /// Builds a minimal `ToolContext`. The substrate/emitter are never touched by
     /// the mock tool; a temp `Config::default()` PulseDB avoids the ONNX path.
+    #[cfg(feature = "substrate")]
     fn test_context() -> ToolContext {
         let dir = tempfile::tempdir().unwrap();
         let db =
@@ -354,6 +361,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "substrate")]
     #[tokio::test]
     async fn streaming_tool_progress_channel_order() {
         let ctx = test_context();

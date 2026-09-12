@@ -69,6 +69,7 @@ pub mod prelude {
     pub use crate::ids::{CollectiveId, ExperienceId, InsightId, RelationId};
 
     // ── PulseDB re-exports ───────────────────────────────────────────
+    #[cfg(feature = "substrate")]
     pub use pulsedb::{
         Experience, ExperienceType, NewExperience, PulseDBSubstrate, SubstrateProvider,
     };
