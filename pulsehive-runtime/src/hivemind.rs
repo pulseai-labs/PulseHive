@@ -898,8 +898,7 @@ mod tests {
         async fn get_related(
             &self,
             _exp_id: pulsedb::ExperienceId,
-        ) -> DbResult<Vec<(pulsedb::Experience, pulsedb::ExperienceRelation)>>
-        {
+        ) -> DbResult<Vec<(pulsedb::Experience, pulsedb::ExperienceRelation)>> {
             Ok(vec![])
         }
 
@@ -942,8 +941,7 @@ mod tests {
         async fn watch(
             &self,
             _collective: CollectiveId,
-        ) -> DbResult<Pin<Box<dyn Stream<Item = pulsedb::WatchEvent> + Send>>>
-        {
+        ) -> DbResult<Pin<Box<dyn Stream<Item = pulsedb::WatchEvent> + Send>>> {
             self.live_watches.fetch_add(1, Ordering::SeqCst);
             let ends_immediately = self.end_first_subscription
                 && self.subscriptions.fetch_add(1, Ordering::SeqCst) == 0;
@@ -960,17 +958,11 @@ mod tests {
             Ok(Box::pin(stream))
         }
 
-        async fn create_collective(
-            &self,
-            _name: &str,
-        ) -> DbResult<CollectiveId> {
+        async fn create_collective(&self, _name: &str) -> DbResult<CollectiveId> {
             Ok(CollectiveId::new())
         }
 
-        async fn get_or_create_collective(
-            &self,
-            _name: &str,
-        ) -> DbResult<CollectiveId> {
+        async fn get_or_create_collective(&self, _name: &str) -> DbResult<CollectiveId> {
             Ok(CollectiveId::new())
         }
 
@@ -1012,10 +1004,7 @@ mod tests {
         panic!("no tracked watch handle was marked finished");
     }
 
-    fn counting_hive(
-        live_watches: Arc<AtomicUsize>,
-        end_first_subscription: bool,
-    ) -> HiveMind {
+    fn counting_hive(live_watches: Arc<AtomicUsize>, end_first_subscription: bool) -> HiveMind {
         HiveMind::builder()
             .substrate(Box::new(CountingWatchSubstrate {
                 live_watches,
@@ -1229,7 +1218,11 @@ mod tests {
         }
         seen.sort();
         seen.dedup();
-        assert_eq!(seen, vec!["task-a", "task-b", "task-c"], "no task outside the list was invented");
+        assert_eq!(
+            seen,
+            vec!["task-a", "task-b", "task-c"],
+            "no task outside the list was invented"
+        );
     }
 
     #[tokio::test]

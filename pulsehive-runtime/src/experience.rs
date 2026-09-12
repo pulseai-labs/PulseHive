@@ -401,11 +401,15 @@ mod tests {
         // 210 bytes truncated at 200: 200 % 3 == 2, a mid-character cut.
         let extractor = DefaultExperienceExtractor;
         let conversation = vec![Message::tool_result("call_1", "あ".repeat(70))];
-        let outcome = AgentOutcome::Error { error: "boom".into() };
+        let outcome = AgentOutcome::Error {
+            error: "boom".into(),
+        };
 
         let experiences = extractor
             .extract(&conversation, &outcome, &test_context())
             .await;
-        assert!(experiences[0].content.contains(&format!("- {}...", "あ".repeat(66))));
+        assert!(experiences[0]
+            .content
+            .contains(&format!("- {}...", "あ".repeat(66))));
     }
 }
