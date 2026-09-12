@@ -14,7 +14,7 @@ categories = ["science", "asynchronous"]
 
 [dependencies]
 async-trait = { workspace = true }
-pulsehive-core = { workspace = true }
+pulsehive-core = { workspace = true, features = ["substrate"] }
 pulsehive-db = { workspace = true }
 tokio = { workspace = true, features = ["time"] }
 tracing = { workspace = true }

@@ -12,11 +12,15 @@ documentation = "https://docs.rs/pulsehive-core"
 keywords = ["ai", "agent", "llm", "traits", "sdk"]
 categories = ["science", "asynchronous"]
 
+[package.metadata.docs.rs]
+all-features = true
+
 [features]
 testing = []
+substrate = ["dep:pulsehive-db"]
 
 [dependencies]
-pulsehive-db = { workspace = true }
+pulsehive-db = { workspace = true, optional = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 async-trait = { workspace = true }
@@ -28,6 +32,7 @@ futures-core = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
+pulsehive-db = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 tempfile = { workspace = true }
 

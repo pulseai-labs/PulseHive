@@ -113,6 +113,7 @@ pub trait ExperienceExtractor: Send + Sync {
     ///
     /// Called after the agentic loop completes. Returns experiences to be
     /// stored in the substrate for future perception by other agents.
+    #[cfg(feature = "substrate")]
     async fn extract(
         &self,
         conversation: &[crate::llm::Message],

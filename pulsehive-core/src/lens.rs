@@ -52,6 +52,7 @@ impl ExperienceTypeTag {
     }
 
     /// Maps a PulseDB `ExperienceType` to its compact tag for lens weighting.
+    #[cfg(feature = "substrate")]
     pub fn from_experience_type(et: &pulsedb::ExperienceType) -> Self {
         match et {
             pulsedb::ExperienceType::Difficulty { .. } => Self::Difficulty,
