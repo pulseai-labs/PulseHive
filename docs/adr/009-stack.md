@@ -14,8 +14,8 @@ PulseHive is a Rust library with specific technology choices that enable its des
 **Core Stack:**
 - **Language:** Rust (edition 2021)
 - **Runtime:** Tokio async runtime
-- **Key frameworks:** pulsehive-db 0.5, serde, tokio
-- **Storage:** PulseDB (HNSW vector search, knowledge graph, watch system)
+- **Key frameworks:** pulsehive-db 0.7, serde, tokio
+- **Storage:** PulseDB (HNSW vector search, knowledge graph, watch system); ADR-012 governs migration and embedding identity
 - **Build tooling:** Cargo, workspace structure
 - **Test tooling:** cargo test (including doc-tests), cargo doc (documentation checks)
 

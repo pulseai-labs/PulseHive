@@ -108,6 +108,26 @@ impl HiveMind {
         self.substrate.as_ref()
     }
 
+    /// Resolve a task's existing collective or create its synthetic namespace.
+    async fn resolve_collective(&self, task: &mut Task) -> Result<()> {
+        let exists = self
+            .substrate
+            .list_collectives()
+            .await?
+            .iter()
+            .any(|collective| collective.id == task.collective_id);
+        if exists {
+            return Ok(());
+        }
+
+        let collective_name = format!("collective-{}", task.collective_id);
+        task.collective_id = self
+            .substrate
+            .get_or_create_collective(&collective_name)
+            .await?;
+        Ok(())
+    }
+
     /// Deploy agents to execute tasks. Returns a stream of events.
     ///
     /// Each agent is spawned as a Tokio task and dispatched via
@@ -129,13 +149,9 @@ impl HiveMind {
         // Get the first task (or create a default one)
         let mut task = tasks.into_iter().next().unwrap_or_else(|| Task::new(""));
 
-        // Ensure the collective exists in the substrate
-        let collective_name = format!("collective-{}", task.collective_id);
-        let collective_id = self
-            .substrate
-            .get_or_create_collective(&collective_name)
-            .await?;
-        task.collective_id = collective_id;
+        // Resolve an existing collective before falling back to Task::new's namespace.
+        self.resolve_collective(&mut task).await?;
+        let collective_id = task.collective_id;
 
         // Subscribe to Watch system for real-time substrate change notifications.
         // Runs as a background task — failure to subscribe doesn't block deployment.
@@ -313,14 +329,8 @@ impl HiveMind {
             return Ok(());
         }
 
-        // Ensure the collective exists
         let mut task = task;
-        let collective_name = format!("collective-{}", task.collective_id);
-        let collective_id = self
-            .substrate
-            .get_or_create_collective(&collective_name)
-            .await?;
-        task.collective_id = collective_id;
+        self.resolve_collective(&mut task).await?;
 
         for agent in agents {
             self.spawn_agent(agent, task.clone());
@@ -593,6 +603,46 @@ mod tests {
         assert_eq!(task.collective_id, cid);
     }
 
+    #[tokio::test]
+    async fn task_with_collective_reuses_existing_collective() {
+        let dir = tempfile::tempdir().unwrap();
+        let hive = HiveMind::builder()
+            .substrate_path(dir.path().join("existing.db"))
+            .build()
+            .unwrap();
+        let existing_id = hive
+            .substrate()
+            .get_or_create_collective("differently-named-existing")
+            .await
+            .unwrap();
+        let mut task = Task::with_collective("reuse it", existing_id);
+
+        hive.resolve_collective(&mut task).await.unwrap();
+
+        let collectives = hive.substrate().list_collectives().await.unwrap();
+        assert_eq!(task.collective_id, existing_id);
+        assert_eq!(collectives.len(), 1, "must not create a duplicate");
+        assert_eq!(collectives[0].name, "differently-named-existing");
+    }
+
+    #[tokio::test]
+    async fn task_new_creates_collective() {
+        let dir = tempfile::tempdir().unwrap();
+        let hive = HiveMind::builder()
+            .substrate_path(dir.path().join("new.db"))
+            .build()
+            .unwrap();
+        let mut task = Task::new("create it");
+        let synthetic_name = format!("collective-{}", task.collective_id);
+
+        hive.resolve_collective(&mut task).await.unwrap();
+
+        let collectives = hive.substrate().list_collectives().await.unwrap();
+        assert_eq!(collectives.len(), 1);
+        assert_eq!(collectives[0].name, synthetic_name);
+        assert_eq!(task.collective_id, collectives[0].id);
+    }
+
     /// Helper: create a HiveMind with Builtin embeddings and a collective for testing.
     async fn build_hive_with_collective() -> (HiveMind, CollectiveId) {
         let dir = tempfile::tempdir().unwrap();
@@ -615,19 +665,19 @@ mod tests {
         let (hive, cid) = build_hive_with_collective().await;
         let mut rx = hive.event_bus.subscribe();
 
-        let dummy_embedding: Vec<f32> = (0..384).map(|i| (i as f32 * 0.01).sin()).collect();
         let exp = pulsedb::NewExperience {
             collective_id: cid,
             content: "Learned that Rust's ownership model prevents data races.".into(),
             experience_type: pulsedb::ExperienceType::Generic {
                 category: Some("rust".into()),
             },
-            embedding: Some(dummy_embedding),
+            embedding: None,
             importance: 0.8,
             confidence: 0.9,
             domain: vec!["rust".into(), "concurrency".into()],
             source_agent: pulsedb::AgentId("test-agent".into()),
             source_task: None,
+            tags: Default::default(),
             related_files: vec![],
         };
 
@@ -652,19 +702,17 @@ mod tests {
     async fn test_record_experience_retrievable() {
         let (hive, cid) = build_hive_with_collective().await;
 
-        // Provide a pre-computed embedding to avoid requiring PulseDB's builtin
-        // ONNX model, which may not be cached on CI runners.
-        let dummy_embedding: Vec<f32> = (0..384).map(|i| (i as f32 * 0.01).sin()).collect();
         let exp = pulsedb::NewExperience {
             collective_id: cid,
             content: "Test experience for retrieval.".into(),
             experience_type: pulsedb::ExperienceType::Generic { category: None },
-            embedding: Some(dummy_embedding),
+            embedding: None,
             importance: 0.5,
             confidence: 0.5,
             domain: vec![],
             source_agent: pulsedb::AgentId("agent-1".into()),
             source_task: None,
+            tags: Default::default(),
             related_files: vec![],
         };
 

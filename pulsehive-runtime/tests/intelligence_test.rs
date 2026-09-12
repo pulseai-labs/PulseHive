@@ -15,102 +15,84 @@ fn build_hive() -> HiveMind {
     HiveMind::builder().substrate_path(&path).build().unwrap()
 }
 
+async fn record_network_experience(
+    hive: &HiveMind,
+    collective_id: pulsedb::CollectiveId,
+    content: &str,
+    experience_type: pulsedb::ExperienceType,
+    importance: f32,
+    confidence: f32,
+) -> pulsedb::ExperienceId {
+    hive.record_experience(pulsedb::NewExperience {
+        collective_id,
+        content: content.into(),
+        experience_type,
+        embedding: None,
+        importance,
+        confidence,
+        domain: vec!["networking".into(), "reliability".into()],
+        source_agent: pulsedb::AgentId("agent-1".into()),
+        source_task: None,
+        tags: Default::default(),
+        related_files: vec![],
+    })
+    .await
+    .unwrap()
+}
+
 #[tokio::test]
 async fn test_record_experience_stores_and_infers_relations() {
     let hive = build_hive();
-
     let cid = hive
         .substrate()
         .get_or_create_collective("intelligence-test")
         .await
         .unwrap();
 
-    // Record 3 related experiences about network timeouts
-    let id1 = hive
-        .record_experience(pulsedb::NewExperience {
-            collective_id: cid,
-            content: "Network timeouts occur when the API gateway is under heavy load.".into(),
-            experience_type: pulsedb::ExperienceType::Difficulty {
-                description: "Network timeouts under heavy load".into(),
-                severity: pulsedb::Severity::High,
-            },
-            embedding: None,
-            importance: 0.8,
-            confidence: 0.9,
-            domain: vec!["networking".into(), "reliability".into()],
-            source_agent: pulsedb::AgentId("agent-1".into()),
-            source_task: None,
-            related_files: vec![],
-        })
-        .await
-        .unwrap();
+    let id1 = record_network_experience(
+        &hive,
+        cid,
+        "Network timeouts occur when the API gateway is under heavy load.",
+        pulsedb::ExperienceType::Difficulty {
+            description: "Network timeouts under heavy load".into(),
+            severity: pulsedb::Severity::High,
+        },
+        0.8,
+        0.9,
+    )
+    .await;
+    let id2 = record_network_experience(
+        &hive,
+        cid,
+        "Network timeout errors in the API gateway during peak traffic periods.",
+        pulsedb::ExperienceType::ErrorPattern {
+            signature: "gateway_timeout".into(),
+            fix: "retry with backoff".into(),
+            prevention: "rate limiting".into(),
+        },
+        0.7,
+        0.8,
+    )
+    .await;
+    let id3 = record_network_experience(
+        &hive,
+        cid,
+        "Add exponential backoff with jitter to handle network timeouts gracefully.",
+        pulsedb::ExperienceType::Solution {
+            problem_ref: None,
+            approach: "exponential backoff with jitter".into(),
+            worked: true,
+        },
+        0.9,
+        0.95,
+    )
+    .await;
 
-    let id2 = hive
-        .record_experience(pulsedb::NewExperience {
-            collective_id: cid,
-            content: "Network timeout errors in the API gateway during peak traffic periods."
-                .into(),
-            experience_type: pulsedb::ExperienceType::ErrorPattern {
-                signature: "gateway_timeout".into(),
-                fix: "retry with backoff".into(),
-                prevention: "rate limiting".into(),
-            },
-            embedding: None,
-            importance: 0.7,
-            confidence: 0.8,
-            domain: vec!["networking".into(), "reliability".into()],
-            source_agent: pulsedb::AgentId("agent-1".into()),
-            source_task: None,
-            related_files: vec![],
-        })
-        .await
-        .unwrap();
+    for id in [id1, id2, id3] {
+        assert!(hive.substrate().get_experience(id).await.unwrap().is_some());
+    }
 
-    let id3 = hive
-        .record_experience(pulsedb::NewExperience {
-            collective_id: cid,
-            content: "Add exponential backoff with jitter to handle network timeouts gracefully."
-                .into(),
-            experience_type: pulsedb::ExperienceType::Solution {
-                problem_ref: None,
-                approach: "exponential backoff with jitter".into(),
-                worked: true,
-            },
-            embedding: None,
-            importance: 0.9,
-            confidence: 0.95,
-            domain: vec!["networking".into(), "reliability".into()],
-            source_agent: pulsedb::AgentId("agent-1".into()),
-            source_task: None,
-            related_files: vec![],
-        })
-        .await
-        .unwrap();
-
-    // Verify all 3 stored
-    assert!(hive
-        .substrate()
-        .get_experience(id1)
-        .await
-        .unwrap()
-        .is_some());
-    assert!(hive
-        .substrate()
-        .get_experience(id2)
-        .await
-        .unwrap()
-        .is_some());
-    assert!(hive
-        .substrate()
-        .get_experience(id3)
-        .await
-        .unwrap()
-        .is_some());
-
-    // Check if relations were created (depends on embedding similarity)
-    // At minimum, the pipeline should not panic
     let related = hive.substrate().get_related(id3).await.unwrap();
-    // Log relation count for visibility
     println!(
         "Relations found for exp3: {} (builtin embedding similarity depends on content overlap)",
         related.len()
@@ -147,6 +129,7 @@ async fn test_record_experience_with_no_detector() {
             domain: vec![],
             source_agent: pulsedb::AgentId("agent-1".into()),
             source_task: None,
+            tags: Default::default(),
             related_files: vec![],
         })
         .await

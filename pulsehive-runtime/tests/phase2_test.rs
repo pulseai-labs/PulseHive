@@ -188,6 +188,7 @@ async fn test_phase2_relationship_inference() {
             domain: vec!["networking".into()],
             source_agent: pulsedb::AgentId("agent-1".into()),
             source_task: None,
+            tags: Default::default(),
             related_files: vec![],
         })
         .await
@@ -208,6 +209,7 @@ async fn test_phase2_relationship_inference() {
             domain: vec!["networking".into()],
             source_agent: pulsedb::AgentId("agent-1".into()),
             source_task: None,
+            tags: Default::default(),
             related_files: vec![],
         })
         .await
@@ -252,6 +254,7 @@ fn test_phase2_context_optimizer_72h_decay() {
         applications: std::collections::BTreeMap::new(),
         last_reinforced: pulsedb::Timestamp(now.0 - age_ms),
         domain: vec![],
+        tags: Default::default(),
         related_files: vec![],
         source_agent: pulsedb::AgentId("test".into()),
         source_task: None,

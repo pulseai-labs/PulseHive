@@ -82,14 +82,8 @@ impl Tool for SearchTool {
 
 // ── Full Phase 1 Test ────────────────────────────────────────────────
 
-#[tokio::test]
-async fn test_phase1_full_pipeline() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("phase1.db");
-
-    // FR-001: Build HiveMind
-    let provider = ScriptedLlm::new(vec![
-        // Call 1: Agent calls search tool
+fn scripted_llm() -> ScriptedLlm {
+    ScriptedLlm::new(vec![
         LlmResponse::new(
             None,
             vec![ToolCall {
@@ -99,25 +93,18 @@ async fn test_phase1_full_pipeline() {
             }],
             TokenUsage::default(),
         ),
-        // Call 2: Agent responds with final answer
         LlmResponse::text("Found great Rust patterns in the codebase."),
-    ]);
+    ])
+}
 
-    let hive = HiveMind::builder()
-        .substrate_path(&path)
-        .llm_provider("test", provider)
-        .build()
-        .unwrap();
-
-    // FR-002: Seed substrate with prior experience
-    let cid = hive
+async fn seed_substrate(hive: &HiveMind) -> pulsedb::CollectiveId {
+    let collective_id = hive
         .substrate()
         .get_or_create_collective("project")
         .await
         .unwrap();
-
-    let seed_exp = NewExperience {
-        collective_id: cid,
+    hive.record_experience(NewExperience {
+        collective_id,
         content: "The project uses async/await extensively for concurrent operations.".into(),
         experience_type: ExperienceType::TechInsight {
             technology: "rust".into(),
@@ -127,14 +114,18 @@ async fn test_phase1_full_pipeline() {
         importance: 0.8,
         confidence: 0.9,
         domain: vec!["rust".into(), "async".into()],
+        tags: Default::default(),
         source_agent: AgentId("seed-agent".into()),
         source_task: None,
         related_files: vec![],
-    };
-    hive.record_experience(seed_exp).await.unwrap();
+    })
+    .await
+    .unwrap();
+    collective_id
+}
 
-    // FR-003 + FR-005: Deploy agent with tool and lens
-    let agent = AgentDefinition {
+fn phase1_agent() -> AgentDefinition {
+    AgentDefinition {
         name: "code-reviewer".into(),
         kind: AgentKind::Llm(Box::new(LlmAgentConfig {
             system_prompt: "You are a code reviewer.".into(),
@@ -144,21 +135,21 @@ async fn test_phase1_full_pipeline() {
             experience_extractor: None,
             refresh_every_n_tool_calls: None,
         })),
-    };
+    }
+}
 
-    let task = Task::with_collective("Review the async patterns", cid);
-    let mut stream = hive.deploy(vec![agent], vec![task]).await.unwrap();
-
-    // FR-014: Collect events
+async fn collect_until_recorded(
+    mut stream: Pin<Box<dyn Stream<Item = HiveEvent> + Send>>,
+) -> Vec<HiveEvent> {
     let mut events = vec![];
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     loop {
         tokio::select! {
             event = stream.next() => {
                 match event {
-                    Some(e) => {
-                        let done = matches!(&e, HiveEvent::ExperienceRecorded { .. });
-                        events.push(e);
+                    Some(event) => {
+                        let done = matches!(&event, HiveEvent::ExperienceRecorded { .. });
+                        events.push(event);
                         if done { break; }
                     }
                     None => break,
@@ -167,39 +158,57 @@ async fn test_phase1_full_pipeline() {
             _ = tokio::time::sleep_until(deadline) => break,
         }
     }
+    events
+}
 
-    // Verify event sequence covers all FRs
+fn assert_phase1_events(events: &[HiveEvent]) {
     assert!(
         events
             .iter()
-            .any(|e| matches!(e, HiveEvent::AgentStarted { .. })),
+            .any(|event| matches!(event, HiveEvent::AgentStarted { .. })),
         "FR-003: AgentStarted missing"
     );
     assert!(
         events
             .iter()
-            .any(|e| matches!(e, HiveEvent::LlmCallStarted { .. })),
+            .any(|event| matches!(event, HiveEvent::LlmCallStarted { .. })),
         "FR-004: LlmCallStarted missing"
     );
     assert!(
         events.iter().any(
-            |e| matches!(e, HiveEvent::ToolCallStarted { tool_name, .. } if tool_name == "search")
+            |event| matches!(event, HiveEvent::ToolCallStarted { tool_name, .. } if tool_name == "search")
         ),
         "FR-006: ToolCallStarted missing"
     );
     assert!(
         events
             .iter()
-            .any(|e| matches!(e, HiveEvent::ToolCallCompleted { .. })),
+            .any(|event| matches!(event, HiveEvent::ToolCallCompleted { .. })),
         "FR-006: ToolCallCompleted missing"
     );
     assert!(
         events
             .iter()
-            .any(|e| matches!(e, HiveEvent::ExperienceRecorded { .. })),
+            .any(|event| matches!(event, HiveEvent::ExperienceRecorded { .. })),
         "FR-011: ExperienceRecorded missing"
     );
+}
 
+#[tokio::test]
+async fn test_phase1_full_pipeline() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("phase1.db");
+    let hive = HiveMind::builder()
+        .substrate_path(&path)
+        .llm_provider("test", scripted_llm())
+        .build()
+        .unwrap();
+    let collective_id = seed_substrate(&hive).await;
+    let task = Task::with_collective("Review the async patterns", collective_id);
+    let stream = hive.deploy(vec![phase1_agent()], vec![task]).await.unwrap();
+
+    let events = collect_until_recorded(stream).await;
+    assert_phase1_events(&events);
     println!(
         "Phase 1 integration test passed! {} events collected.",
         events.len()

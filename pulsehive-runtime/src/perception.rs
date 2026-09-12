@@ -301,6 +301,7 @@ mod tests {
             importance,
             confidence: 0.8,
             domain: domain.into_iter().map(String::from).collect(),
+            tags: Default::default(),
             related_files: vec![],
             source_agent: AgentId("test".into()),
             source_task: None,

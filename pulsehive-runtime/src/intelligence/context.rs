@@ -186,6 +186,7 @@ mod tests {
             applications: BTreeMap::from([(pulsedb::InstanceId::new(), applications)]),
             last_reinforced: Timestamp(now_ms - age_ms),
             domain: vec![],
+            tags: BTreeMap::new(),
             related_files: vec![],
             source_agent: pulsedb::AgentId("test".into()),
             source_task: None,
