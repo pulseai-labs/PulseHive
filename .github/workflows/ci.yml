@@ -183,3 +183,20 @@ jobs:
 
       - name: Run audit
         run: cargo audit
+
+  transport-only:
+    name: Transport-only footprint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: "v2-rust"
+
+      - name: Transport-only consumer gate
+        run: bash scripts/check-transport-only.sh
