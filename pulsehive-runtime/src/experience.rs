@@ -7,6 +7,8 @@
 use async_trait::async_trait;
 
 use pulsedb::{AgentId, ExperienceType, NewExperience, Severity};
+
+use crate::substrate_ids;
 use pulsehive_core::agent::{AgentOutcome, ExperienceExtractor, ExtractionContext};
 use pulsehive_core::llm::Message;
 
@@ -71,7 +73,7 @@ impl ExperienceExtractor for DefaultExperienceExtractor {
 
 fn new_experience(context: &ExtractionContext) -> NewExperience {
     NewExperience {
-        collective_id: context.collective_id,
+        collective_id: substrate_ids::to_db_collective_id(context.collective_id),
         content: String::new(),
         experience_type: ExperienceType::Generic { category: None },
         embedding: None, // Builtin computes
@@ -168,7 +170,7 @@ fn truncate(s: &str, max_len: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pulsedb::CollectiveId;
+    use pulsehive_core::ids::CollectiveId;
 
     fn test_context() -> ExtractionContext {
         ExtractionContext {
@@ -248,7 +250,10 @@ mod tests {
         };
 
         let experiences = extractor.extract(&[], &outcome, &ctx).await;
-        assert_eq!(experiences[0].collective_id, ctx.collective_id);
+        assert_eq!(
+            experiences[0].collective_id,
+            substrate_ids::to_db_collective_id(ctx.collective_id)
+        );
         assert_eq!(experiences[0].source_agent.0, "agent-1");
         assert!(experiences[0].embedding.is_none()); // Builtin computes
     }

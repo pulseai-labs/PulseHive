@@ -146,11 +146,13 @@ Other agents immediately perceive the new experiences via PulseDB's Watch system
 
 ```toml
 [dependencies]
-pulsehive = { version = "2.0", features = ["openai"] }
+pulsehive = { version = "2.0", features = ["openai", "runtime"] }
 # or
-pulsehive = { version = "2.0", features = ["anthropic"] }
+pulsehive = { version = "2.0", features = ["anthropic", "runtime"] }
 # or both
-pulsehive = { version = "2.0", features = ["openai", "anthropic"] }
+pulsehive = { version = "2.0", features = ["openai", "anthropic", "runtime"] }
+# providers only — no HiveMind runtime, no PulseDB substrate:
+pulsehive = { version = "2.0", features = ["openai"] } # transport-only
 ```
 
 ## Documentation

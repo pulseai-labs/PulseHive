@@ -272,7 +272,10 @@ async fn legacy_collective_migrates_and_agent_perceives_it() {
         .build()
         .expect("HiveMind migrates the fixture copy");
     let collective_id = manifest_collective_id(&manifest);
-    let task = Task::with_collective("Use the migrated knowledge", collective_id);
+    let task = Task::with_collective(
+        "Use the migrated knowledge",
+        pulsehive_core::ids::CollectiveId::from_bytes(*collective_id.as_bytes()),
+    );
 
     let mut stream = hive
         .deploy(vec![scripted_agent()], vec![task])

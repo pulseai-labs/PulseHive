@@ -11,12 +11,12 @@
 
 use std::sync::Arc;
 
-use pulsedb::{CollectiveId, ExperienceId, InsightId, RelationId};
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 
 use crate::agent::{AgentKindTag, AgentOutcome};
 use crate::export::EventExporter;
+use crate::ids::{CollectiveId, ExperienceId, InsightId, RelationId};
 
 /// Returns the current time as epoch milliseconds.
 ///
@@ -174,7 +174,7 @@ pub enum HiveEvent {
     WatchNotification {
         timestamp_ms: u64,
         experience_id: ExperienceId,
-        collective_id: pulsedb::CollectiveId,
+        collective_id: CollectiveId,
         /// The type of change: "Created", "Updated", "Archived", or "Deleted".
         event_type: String,
     },
@@ -518,7 +518,7 @@ mod tests {
             HiveEvent::WatchNotification {
                 timestamp_ms: 0,
                 experience_id: ExperienceId::new(),
-                collective_id: pulsedb::CollectiveId::new(),
+                collective_id: CollectiveId::new(),
                 event_type: "Created".into(),
             },
             HiveEvent::ToolProgress {

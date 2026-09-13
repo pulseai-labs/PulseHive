@@ -101,7 +101,11 @@ async fn test_record_experience_with_embedding_provider() {
     let id = hive.record_experience(exp).await.unwrap();
 
     // Verify the experience was stored (embedding computed by provider)
-    let stored = hive.substrate().get_experience(id).await.unwrap();
+    let stored = hive
+        .substrate()
+        .get_experience(pulsedb::ExperienceId::from_bytes(*id.as_bytes()))
+        .await
+        .unwrap();
     assert!(stored.is_some(), "Experience should be stored");
     let stored = stored.unwrap();
     assert!(
@@ -187,7 +191,11 @@ async fn test_record_experience_without_provider_uses_builtin() {
     };
 
     let id = hive.record_experience(exp).await.unwrap();
-    let stored = hive.substrate().get_experience(id).await.unwrap();
+    let stored = hive
+        .substrate()
+        .get_experience(pulsedb::ExperienceId::from_bytes(*id.as_bytes()))
+        .await
+        .unwrap();
     assert!(stored.is_some());
     let stored = stored.unwrap();
     assert!(

@@ -10,7 +10,7 @@ This is the **meta-crate** — it re-exports [`pulsehive-core`](https://crates.i
 
 ```toml
 [dependencies]
-pulsehive = { version = "1.0", features = ["openai"] }
+pulsehive = { version = "1.0", features = ["openai", "runtime"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 ```
 
@@ -51,6 +51,8 @@ async fn main() -> Result<()> {
 |------|---------|------------|
 | `openai` | OpenAI, Azure, Ollama, vLLM, Groq, Together | [`pulsehive-openai`](https://crates.io/crates/pulsehive-openai) |
 | `anthropic` | Claude Opus, Sonnet, Haiku | [`pulsehive-anthropic`](https://crates.io/crates/pulsehive-anthropic) |
+| `runtime` | `HiveMind`, the agentic loop, and the PulseDB substrate surface | [`pulsehive-runtime`](https://crates.io/crates/pulsehive-runtime) + `pulsehive-core/substrate` |
+| `testing` | Scripted-provider testkit (implies `runtime`) | `pulsehive-core/testing` |
 
 ## Core Primitives
 

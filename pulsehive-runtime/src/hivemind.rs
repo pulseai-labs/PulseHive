@@ -22,9 +22,7 @@ use std::sync::Arc;
 
 use futures::stream;
 use futures::{Stream, StreamExt};
-use pulsedb::{
-    CollectiveId, Config, ExperienceId, NewExperience, PulseDB, PulseDBSubstrate, SubstrateProvider,
-};
+use pulsedb::{Config, NewExperience, PulseDB, PulseDBSubstrate, SubstrateProvider};
 use tokio::sync::broadcast;
 
 use pulsehive_core::agent::AgentDefinition;
@@ -33,10 +31,12 @@ use pulsehive_core::embedding::EmbeddingProvider;
 use pulsehive_core::error::{PulseHiveError, Result};
 use pulsehive_core::event::{EventBus, HiveEvent};
 use pulsehive_core::export::EventExporter;
+use pulsehive_core::ids::{CollectiveId, ExperienceId};
 use pulsehive_core::llm::LlmProvider;
 
 use crate::intelligence::insight::InsightSynthesizer;
 use crate::intelligence::relationship::RelationshipDetector;
+use crate::substrate_ids;
 use crate::workflow::{self, WorkflowContext};
 
 /// Absolute window a finished deployment's watch keeps draining before it
@@ -66,6 +66,18 @@ impl Task {
     }
 
     /// Creates a task within an existing collective.
+    ///
+    /// To target a collective previously seeded through
+    /// [`HiveMind::record_experience`] — where the [`NewExperience`] carries a
+    /// `pulsedb::CollectiveId` — convert the database ID to this core-owned
+    /// type through the public `as_bytes()`/`from_bytes()` seam both ID
+    /// families expose:
+    /// `Task::with_collective(desc, CollectiveId::from_bytes(*db_id.as_bytes()))`.
+    ///
+    /// If no collective with that exact ID exists in the substrate, deploy
+    /// falls back to creating a synthetic `collective-{id}` namespace and
+    /// **overwrites** the task's `collective_id` with the new collective's ID —
+    /// the task does not run in the collective the caller named.
     pub fn with_collective(description: impl Into<String>, collective_id: CollectiveId) -> Self {
         Self {
             description: description.into(),
@@ -120,21 +132,23 @@ impl HiveMind {
 
     /// Resolve a task's existing collective or create its synthetic namespace.
     async fn resolve_collective(&self, task: &mut Task) -> Result<()> {
+        let db_collective_id = substrate_ids::to_db_collective_id(task.collective_id);
         let exists = self
             .substrate
             .list_collectives()
             .await?
             .iter()
-            .any(|collective| collective.id == task.collective_id);
+            .any(|collective| collective.id == db_collective_id);
         if exists {
             return Ok(());
         }
 
         let collective_name = format!("collective-{}", task.collective_id);
-        task.collective_id = self
-            .substrate
-            .get_or_create_collective(&collective_name)
-            .await?;
+        task.collective_id = substrate_ids::from_db_collective_id(
+            self.substrate
+                .get_or_create_collective(&collective_name)
+                .await?,
+        );
         Ok(())
     }
 
@@ -205,7 +219,11 @@ impl HiveMind {
         let mut established_streams: Vec<Pin<Box<dyn Stream<Item = pulsedb::WatchEvent> + Send>>> =
             Vec::new();
         for collective_id in watch_collectives {
-            match self.substrate.watch(collective_id).await {
+            match self
+                .substrate
+                .watch(substrate_ids::to_db_collective_id(collective_id))
+                .await
+            {
                 Ok(watch_stream) => established_streams.push(watch_stream),
                 Err(e) => {
                     tracing::warn!(
@@ -284,8 +302,12 @@ impl HiveMind {
                     Some(WatchLoop::Event(event)) => {
                         watch_emitter.emit(HiveEvent::WatchNotification {
                             timestamp_ms: pulsehive_core::event::now_ms(),
-                            experience_id: event.experience_id,
-                            collective_id: event.collective_id,
+                            experience_id: substrate_ids::from_db_experience_id(
+                                event.experience_id,
+                            ),
+                            collective_id: substrate_ids::from_db_collective_id(
+                                event.collective_id,
+                            ),
                             event_type: format!("{:?}", event.event_type),
                         });
                     }
@@ -319,6 +341,14 @@ impl HiveMind {
     /// Stores the experience via PulseDB, emits an `ExperienceRecorded` event,
     /// runs the RelationshipDetector to infer relations, and triggers the
     /// InsightSynthesizer if a cluster exceeds the density threshold.
+    ///
+    /// `experience.collective_id` is a `pulsedb::CollectiveId`. To later
+    /// target the collective this seeds from a [`Task`], convert it to the
+    /// core-owned [`CollectiveId`] through the public `as_bytes()`/`from_bytes()`
+    /// seam both ID families expose:
+    /// `Task::with_collective(desc, CollectiveId::from_bytes(*db_id.as_bytes()))`.
+    /// A task whose ID matches no existing collective gets a fresh synthetic
+    /// `collective-{id}` namespace instead — see [`Task::with_collective`].
     pub async fn record_experience(&self, experience: NewExperience) -> Result<ExperienceId> {
         let agent_id = experience.source_agent.0.clone();
         let collective_id = experience.collective_id;
@@ -346,7 +376,7 @@ impl HiveMind {
         let id = self.substrate.store_experience(experience).await?;
         self.event_bus.emit(HiveEvent::ExperienceRecorded {
             timestamp_ms: pulsehive_core::event::now_ms(),
-            experience_id: id,
+            experience_id: substrate_ids::from_db_experience_id(id),
             agent_id: agent_id.clone(),
             content_preview,
             experience_type: experience_type_str,
@@ -365,7 +395,7 @@ impl HiveMind {
                         Ok(relation_id) => {
                             self.event_bus.emit(HiveEvent::RelationshipInferred {
                                 timestamp_ms: pulsehive_core::event::now_ms(),
-                                relation_id,
+                                relation_id: substrate_ids::from_db_relation_id(relation_id),
                                 agent_id: agent_id.clone(),
                             });
                         }
@@ -402,7 +432,7 @@ impl HiveMind {
                                     synthesizer.mark_synthesized(collective_id);
                                     self.event_bus.emit(HiveEvent::InsightGenerated {
                                         timestamp_ms: pulsehive_core::event::now_ms(),
-                                        insight_id,
+                                        insight_id: substrate_ids::from_db_insight_id(insight_id),
                                         source_count,
                                         agent_id: agent_id.clone(),
                                     });
@@ -417,7 +447,7 @@ impl HiveMind {
             }
         }
 
-        Ok(id)
+        Ok(substrate_ids::from_db_experience_id(id))
     }
 
     /// Signal shutdown to all background tasks (Watch system).
@@ -747,12 +777,18 @@ mod tests {
             .get_or_create_collective("differently-named-existing")
             .await
             .unwrap();
-        let mut task = Task::with_collective("reuse it", existing_id);
+        let mut task = Task::with_collective(
+            "reuse it",
+            substrate_ids::from_db_collective_id(existing_id),
+        );
 
         hive.resolve_collective(&mut task).await.unwrap();
 
         let collectives = hive.substrate().list_collectives().await.unwrap();
-        assert_eq!(task.collective_id, existing_id);
+        assert_eq!(
+            task.collective_id,
+            substrate_ids::from_db_collective_id(existing_id)
+        );
         assert_eq!(collectives.len(), 1, "must not create a duplicate");
         assert_eq!(collectives[0].name, "differently-named-existing");
     }
@@ -772,11 +808,14 @@ mod tests {
         let collectives = hive.substrate().list_collectives().await.unwrap();
         assert_eq!(collectives.len(), 1);
         assert_eq!(collectives[0].name, synthetic_name);
-        assert_eq!(task.collective_id, collectives[0].id);
+        assert_eq!(
+            task.collective_id,
+            substrate_ids::from_db_collective_id(collectives[0].id)
+        );
     }
 
     /// Helper: create a HiveMind with Builtin embeddings and a collective for testing.
-    async fn build_hive_with_collective() -> (HiveMind, CollectiveId) {
+    async fn build_hive_with_collective() -> (HiveMind, pulsedb::CollectiveId) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.db");
         // Leak tempdir so it lives long enough
@@ -851,7 +890,11 @@ mod tests {
         let id = hive.record_experience(exp).await.unwrap();
 
         // Verify retrievable
-        let retrieved = hive.substrate.get_experience(id).await.unwrap();
+        let retrieved = hive
+            .substrate
+            .get_experience(substrate_ids::to_db_experience_id(id))
+            .await
+            .unwrap();
         assert!(retrieved.is_some());
         let retrieved = retrieved.unwrap();
         assert_eq!(retrieved.content, "Test experience for retrieval.");
@@ -908,7 +951,7 @@ mod tests {
     fn synthetic_watch_event() -> pulsedb::WatchEvent {
         pulsedb::WatchEvent {
             experience_id: pulsedb::ExperienceId::new(),
-            collective_id: CollectiveId::new(),
+            collective_id: pulsedb::CollectiveId::new(),
             event_type: pulsedb::WatchEventType::Created,
             timestamp: pulsedb::Timestamp::now(),
             experience: None,
@@ -959,7 +1002,7 @@ mod tests {
 
         async fn search_similar(
             &self,
-            _collective: CollectiveId,
+            _collective: pulsedb::CollectiveId,
             _embedding: &[f32],
             _k: usize,
         ) -> DbResult<Vec<(pulsedb::Experience, f32)>> {
@@ -968,7 +1011,7 @@ mod tests {
 
         async fn get_recent(
             &self,
-            _collective: CollectiveId,
+            _collective: pulsedb::CollectiveId,
             _limit: usize,
         ) -> DbResult<Vec<pulsedb::Experience>> {
             Ok(vec![])
@@ -997,7 +1040,7 @@ mod tests {
 
         async fn get_insights(
             &self,
-            _collective: CollectiveId,
+            _collective: pulsedb::CollectiveId,
             _embedding: &[f32],
             _k: usize,
         ) -> DbResult<Vec<(pulsedb::DerivedInsight, f32)>> {
@@ -1006,7 +1049,7 @@ mod tests {
 
         async fn get_activities(
             &self,
-            _collective: CollectiveId,
+            _collective: pulsedb::CollectiveId,
         ) -> DbResult<Vec<pulsedb::Activity>> {
             Ok(vec![])
         }
@@ -1026,7 +1069,7 @@ mod tests {
 
         async fn watch(
             &self,
-            _collective: CollectiveId,
+            _collective: pulsedb::CollectiveId,
         ) -> DbResult<Pin<Box<dyn Stream<Item = pulsedb::WatchEvent> + Send>>> {
             self.live_watches.fetch_add(1, Ordering::SeqCst);
             let pending: Pin<Box<dyn Stream<Item = pulsedb::WatchEvent> + Send>> =
@@ -1054,12 +1097,12 @@ mod tests {
             Ok(Box::pin(stream))
         }
 
-        async fn create_collective(&self, _name: &str) -> DbResult<CollectiveId> {
-            Ok(CollectiveId::new())
+        async fn create_collective(&self, _name: &str) -> DbResult<pulsedb::CollectiveId> {
+            Ok(pulsedb::CollectiveId::new())
         }
 
-        async fn get_or_create_collective(&self, _name: &str) -> DbResult<CollectiveId> {
-            Ok(CollectiveId::new())
+        async fn get_or_create_collective(&self, _name: &str) -> DbResult<pulsedb::CollectiveId> {
+            Ok(pulsedb::CollectiveId::new())
         }
 
         async fn list_collectives(&self) -> DbResult<Vec<pulsedb::Collective>> {
@@ -1491,7 +1534,7 @@ mod tests {
         // of the deployed tasks and its collective matches that task's
         // resolved collective — the two runs land in two distinct
         // collectives, identified per event.
-        let mut completions: Vec<(pulsedb::CollectiveId, String)> = events
+        let mut completions: Vec<(CollectiveId, String)> = events
             .iter()
             .filter_map(|event| match event {
                 HiveEvent::AgentCompleted {

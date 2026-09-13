@@ -20,6 +20,7 @@
 
 use std::sync::Arc;
 
+use crate::ids::CollectiveId;
 use crate::lens::Lens;
 use crate::llm::LlmConfig;
 use crate::tool::Tool;
@@ -96,7 +97,13 @@ pub struct ExtractionContext {
     /// ID of the agent whose conversation is being extracted.
     pub agent_id: String,
     /// Collective where extracted experiences will be stored.
-    pub collective_id: pulsedb::CollectiveId,
+    ///
+    /// This is the core-owned [`CollectiveId`], not `pulsedb::CollectiveId` —
+    /// the two families share no type identity. Both expose public
+    /// `as_bytes()`/`from_bytes()`, so an implementor producing
+    /// `pulsedb::NewExperience` values converts losslessly with
+    /// `pulsedb::CollectiveId::from_bytes(*context.collective_id.as_bytes())`.
+    pub collective_id: CollectiveId,
     /// Description of the task the agent was working on.
     pub task_description: String,
 }
@@ -106,12 +113,26 @@ pub struct ExtractionContext {
 /// The default implementation (provided by the framework) uses simple rules
 /// to create experiences from the agent's outcome. Products can override
 /// this to implement custom extraction logic (e.g., LLM-based summarization).
+///
+/// Without the `substrate` feature this trait intentionally has zero methods:
+/// the one-literal-shape rule keeps [`LlmAgentConfig::experience_extractor`]
+/// (and every other API naming this trait) identical across feature sets, so
+/// `impl ExperienceExtractor for T {}` compiles substrate-free. Note that
+/// Cargo feature unification means such an impl gains a required `extract`
+/// method — whose signature mentions `pulsedb` types — when another
+/// dependency in the build enables `substrate`.
 #[async_trait::async_trait]
 pub trait ExperienceExtractor: Send + Sync {
     /// Extract experiences from a completed agent conversation.
     ///
     /// Called after the agentic loop completes. Returns experiences to be
     /// stored in the substrate for future perception by other agents.
+    ///
+    /// `context.collective_id` is the core-owned [`CollectiveId`]; convert it
+    /// to the `pulsedb` ID `NewExperience` expects through the public byte
+    /// seam both families expose:
+    /// `pulsedb::CollectiveId::from_bytes(*context.collective_id.as_bytes())`.
+    #[cfg(feature = "substrate")]
     async fn extract(
         &self,
         conversation: &[crate::llm::Message],
