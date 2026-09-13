@@ -58,7 +58,7 @@ pulsehive = { version = "0.1", features = ["openai"] } # transport-only
 - **Runtime is an explicit opt-in.** `runtime` pulls in `pulsehive-runtime` and enables `pulsehive-core/substrate` (the PulseDB storage surface). Provider features alone resolve neither — that is the transport-only footprint.
 - **`testing` implies `runtime`.** The scripted-provider testkit drives a real agent turn, so `testing` enables `runtime` plus `pulsehive-core/testing`.
 - **Additive only.** Features never remove functionality. Enabling `anthropic` adds the `AnthropicProvider`; it does not disable anything.
-- **No feature interactions.** Enabling both `anthropic` and `openai` is the same as enabling each independently. No conditional compilation gates that depend on feature combinations.
+- **Providers are orthogonal.** Enabling both `anthropic` and `openai` is the same as enabling each independently — no conditional compilation gates that depend on provider combinations. The sole feature implication is `testing` → `runtime`, documented above.
 
 The meta-crate's `Cargo.toml` feature section:
 
