@@ -1,6 +1,7 @@
 # Rust build artifacts
 /target/
 pulsehive-py/target/
+tests/fixtures/**/target/
 Cargo.lock
 
 # Python artifacts
