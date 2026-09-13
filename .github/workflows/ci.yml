@@ -221,12 +221,17 @@ jobs:
         with:
           prefix-key: "v2-rust"
 
+      # The gate must run BEFORE the proof test: `cargo test` resolves the
+      # whole workspace and writes the root Cargo.lock, whose seed branch the
+      # gate would then copy into the fixture — making it count a
+      # workspace-pinned graph (~167 packages) instead of its own clean
+      # resolve (~129 on macOS, under the 132 baseline).
+      - name: Transport-only consumer gate
+        run: bash scripts/check-transport-only.sh
+
       # transport_only is a required-features target (openai,anthropic), so the
       # workspace-wide Test step in the check job — which enables only the
       # testing features — never compiles it. Run it explicitly here with both
       # provider features on.
       - name: Transport-only proof test
         run: cargo test -p pulsehive --features openai,anthropic --test transport_only
-
-      - name: Transport-only consumer gate
-        run: bash scripts/check-transport-only.sh
