@@ -186,9 +186,34 @@ jobs:
 
   transport-only:
     name: Transport-only footprint
-    runs-on: ubuntu-latest
+    # Pinned to macOS: the gate's `cargo tree -e normal,build` package count is
+    # host-platform-dependent — on Linux, reqwest's default TLS stack adds host
+    # build-time tooling (aws-lc-sys with bindgen, plus ring), pushing the count
+    # to ~164 against the 132 baseline. macOS resolves ~129, under the gate.
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@v7
+
+      # Xcode 26 relocated clang_rt.osx, breaking rustc's default linking
+      # (`ld: library 'clang_rt.osx' not found`). Pin to a pre-26 Xcode.
+      # CRITICAL: the runner sets DEVELOPER_DIR, which OVERRIDES `xcode-select -s`
+      # for tool resolution — so exporting DEVELOPER_DIR (not just xcode-select)
+      # is what actually switches the compiler. Fail loudly if no 16.x is present
+      # instead of silently link-breaking on Xcode 26.
+      - name: Use a pre-26 Xcode (avoid Xcode 26 clang_rt.osx linker break)
+        run: |
+          sel=""
+          for v in 16.4 16.3 16.2 16.1 16.0 15.4 15.2; do
+            if [ -d "/Applications/Xcode_$v.app" ]; then sel="/Applications/Xcode_$v.app/Contents/Developer"; break; fi
+          done
+          if [ -z "$sel" ]; then
+            echo "::error::No pre-26 Xcode found on this runner. Installed Xcodes:"
+            ls -d /Applications/Xcode_*.app 2>/dev/null || true
+            exit 1
+          fi
+          sudo xcode-select -s "$sel"
+          echo "DEVELOPER_DIR=$sel" >> "$GITHUB_ENV"
+          echo "Using Xcode: $sel"
 
       - uses: dtolnay/rust-toolchain@stable
 
