@@ -66,6 +66,18 @@ impl Task {
     }
 
     /// Creates a task within an existing collective.
+    ///
+    /// To target a collective previously seeded through
+    /// [`HiveMind::record_experience`] — where the [`NewExperience`] carries a
+    /// `pulsedb::CollectiveId` — convert the database ID to this core-owned
+    /// type through the public `as_bytes()`/`from_bytes()` seam both ID
+    /// families expose:
+    /// `Task::with_collective(desc, CollectiveId::from_bytes(*db_id.as_bytes()))`.
+    ///
+    /// If no collective with that exact ID exists in the substrate, deploy
+    /// falls back to creating a synthetic `collective-{id}` namespace and
+    /// **overwrites** the task's `collective_id` with the new collective's ID —
+    /// the task does not run in the collective the caller named.
     pub fn with_collective(description: impl Into<String>, collective_id: CollectiveId) -> Self {
         Self {
             description: description.into(),
@@ -329,6 +341,14 @@ impl HiveMind {
     /// Stores the experience via PulseDB, emits an `ExperienceRecorded` event,
     /// runs the RelationshipDetector to infer relations, and triggers the
     /// InsightSynthesizer if a cluster exceeds the density threshold.
+    ///
+    /// `experience.collective_id` is a `pulsedb::CollectiveId`. To later
+    /// target the collective this seeds from a [`Task`], convert it to the
+    /// core-owned [`CollectiveId`] through the public `as_bytes()`/`from_bytes()`
+    /// seam both ID families expose:
+    /// `Task::with_collective(desc, CollectiveId::from_bytes(*db_id.as_bytes()))`.
+    /// A task whose ID matches no existing collective gets a fresh synthetic
+    /// `collective-{id}` namespace instead — see [`Task::with_collective`].
     pub async fn record_experience(&self, experience: NewExperience) -> Result<ExperienceId> {
         let agent_id = experience.source_agent.0.clone();
         let collective_id = experience.collective_id;
