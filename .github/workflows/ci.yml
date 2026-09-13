@@ -191,12 +191,17 @@ jobs:
       - uses: actions/checkout@v7
 
       - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
 
       - uses: Swatinem/rust-cache@v2
         with:
           prefix-key: "v2-rust"
+
+      # transport_only is a required-features target (openai,anthropic), so the
+      # workspace-wide Test step in the check job — which enables only the
+      # testing features — never compiles it. Run it explicitly here with both
+      # provider features on.
+      - name: Transport-only proof test
+        run: cargo test -p pulsehive --features openai,anthropic --test transport_only
 
       - name: Transport-only consumer gate
         run: bash scripts/check-transport-only.sh
