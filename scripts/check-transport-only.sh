@@ -32,7 +32,7 @@ fi
 feature_args=()
 [[ -n "$feature_list" ]] && feature_args=(--features "$feature_list")
 
-tree="$(cargo tree --manifest-path "$FIXTURE/Cargo.toml" -e normal,build --prefix none --format '{p}' ${feature_args[@]+"${feature_args[@]}"})"
+tree="$(cargo tree --manifest-path "$FIXTURE/Cargo.toml" --color never -e normal,build --prefix none --format '{p}' ${feature_args[@]+"${feature_args[@]}"})"
 pkgs="$(printf '%s\n' "$tree" | sed 's/ (\*)$//' | sort -u)"
 
 bad="$(printf '%s\n' "$pkgs" | grep -E '^(pulsehive-runtime|pulsehive-db) ' || true)"
