@@ -151,15 +151,22 @@ async fn drain_or_die(
 }
 
 /// Parses `--auto-stop-ms <n>`: the non-interactive cancel trigger. Without
-/// it, pressing Enter cancels the task's token.
+/// it, pressing Enter cancels the task's token. A trailing `--auto-stop-ms`
+/// with no value is an error — never a silent fallback to interactive mode.
 fn parse_auto_stop_ms() -> Option<u64> {
+    parse_auto_stop_ms_from(std::env::args().skip(1))
+}
+
+fn parse_auto_stop_ms_from(mut args: impl Iterator<Item = String>) -> Option<u64> {
     let mut auto_stop_ms = None;
-    let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         if arg == "--auto-stop-ms" {
-            auto_stop_ms = args
-                .next()
-                .map(|v| v.parse().expect("--auto-stop-ms takes a millisecond count"));
+            auto_stop_ms = Some(
+                args.next()
+                    .expect("--auto-stop-ms requires a millisecond value")
+                    .parse()
+                    .expect("--auto-stop-ms takes a millisecond count"),
+            );
         }
     }
     auto_stop_ms
@@ -308,4 +315,48 @@ async fn main() {
     // Force exit: PulseDB's ONNX runtime holds background threads that prevent a
     // clean Tokio runtime shutdown (same known issue as the other examples).
     std::process::exit(0);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_auto_stop_ms_from;
+
+    fn args(parts: &[&str]) -> std::vec::IntoIter<String> {
+        parts
+            .iter()
+            .map(|s| s.to_string())
+            .collect::<Vec<_>>()
+            .into_iter()
+    }
+
+    #[test]
+    fn absent_flag_is_none() {
+        assert_eq!(parse_auto_stop_ms_from(args(&[])), None);
+    }
+
+    #[test]
+    fn flag_with_value_parses() {
+        assert_eq!(
+            parse_auto_stop_ms_from(args(&["--auto-stop-ms", "300"])),
+            Some(300)
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "--auto-stop-ms requires a millisecond value")]
+    fn trailing_flag_without_value_errors() {
+        let _ = parse_auto_stop_ms_from(args(&["--auto-stop-ms"]));
+    }
+
+    #[test]
+    #[should_panic(expected = "--auto-stop-ms requires a millisecond value")]
+    fn trailing_flag_after_other_args_errors() {
+        let _ = parse_auto_stop_ms_from(args(&["--verbose", "--auto-stop-ms"]));
+    }
+
+    #[test]
+    #[should_panic(expected = "--auto-stop-ms takes a millisecond count")]
+    fn non_numeric_value_errors() {
+        let _ = parse_auto_stop_ms_from(args(&["--auto-stop-ms", "soon"]));
+    }
 }
