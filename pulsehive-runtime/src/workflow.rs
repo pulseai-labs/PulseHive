@@ -46,8 +46,10 @@ pub(crate) struct WorkflowContext {
     pub event_emitter: EventBus,
     /// Optional embedding provider for computing embeddings before storage.
     pub embedding_provider: Option<Arc<dyn pulsehive_core::embedding::EmbeddingProvider>>,
-    /// This run's cancellation token (ADR-014). Nothing observes it yet —
-    /// w2–w4 add the checks; it only flows to children and tool contexts.
+    /// This run's cancellation token (ADR-014). The workflow executors check
+    /// it — Sequential before each child, Loop at each iteration top, and the
+    /// agentic loop before each LLM and tool call — and it flows to children
+    /// and tool contexts as child tokens.
     pub cancel: CancellationToken,
 }
 
@@ -129,6 +131,12 @@ pub(crate) fn dispatch_agent(
 ///
 /// Returns the last child's outcome. Stops early on error or `MaxIterationsReached`.
 /// Empty children list returns `Complete` with empty response.
+///
+/// Cancellation (ADR-014): a cancelled run token — checked before each child is
+/// dispatched — ends the sequence as `Cancelled` carrying the last completed
+/// child's response (A16). A child returning `Cancelled` does the same. A child
+/// returning `PartialComplete` counts as progress (D3): its `responses`, joined
+/// by newline, become the last response and the sequence continues.
 async fn run_sequential(children: Vec<AgentDefinition>, ctx: &WorkflowContext) -> AgentOutcome {
     tracing::info!(child_count = children.len(), "Sequential workflow started");
 
@@ -140,17 +148,33 @@ async fn run_sequential(children: Vec<AgentDefinition>, ctx: &WorkflowContext) -
 
     let mut last_response = String::new();
     for (i, child) in children.into_iter().enumerate() {
+        if ctx.cancel.is_cancelled() {
+            tracing::info!(child_index = i, "Sequential: cancelled before child");
+            return AgentOutcome::Cancelled {
+                partial_response: last_response,
+            };
+        }
         tracing::info!(child_index = i, child_name = %child.name, "Sequential: running child");
         let outcome = dispatch_agent(child, &ctx.for_child()).await;
-        match &outcome {
+        match outcome {
             AgentOutcome::Complete { response } => {
-                last_response = response.clone();
+                last_response = response;
             }
-            // Error and MaxIterationsReached stay terminal, and Cancelled /
-            // PartialComplete / any future variant pass through unchanged as
-            // terminal outcomes (w3 replaces this with D3 semantics).
-            _ => {
-                return outcome;
+            // D3: partial results are progress — the child's responses become
+            // the sequence's last response and the next child runs.
+            AgentOutcome::PartialComplete { responses, .. } => {
+                last_response = responses.join("\n");
+            }
+            // A16: the composite reports its own accumulated response, not the
+            // cancelled child's internal partial.
+            AgentOutcome::Cancelled { .. } => {
+                return AgentOutcome::Cancelled {
+                    partial_response: last_response,
+                };
+            }
+            // Error, MaxIterationsReached and any future variant stay terminal.
+            other => {
+                return other;
             }
         }
     }
@@ -165,8 +189,17 @@ async fn run_sequential(children: Vec<AgentDefinition>, ctx: &WorkflowContext) -
 /// experiences as they're written. Each child gets a cloned `WorkflowContext`
 /// (cheap: just Arc reference count bumps).
 ///
-/// Returns combined responses on success. If any child errors, reports all
-/// errors but still waits for all children to complete (no early cancellation).
+/// Cooperative drain (ADR-014 D5/A3): every spawned child is joined to
+/// completion — a child task is never aborted, even when the run token fires
+/// or a sibling fails. A child returning `Cancelled` makes the composite
+/// `Cancelled` carrying the completed children's responses joined by newline
+/// (A16); a `PartialComplete` child flattens its `responses` and `errors`
+/// into the parent's (A17). Each non-`Complete` child contributes a named
+/// error — `<agent>: <error>`, `<agent>: max iterations reached`,
+/// `<agent>: task failed: <reason>` for a join failure — so every child's
+/// failure stays attributable (#45). Some responses plus some errors returns
+/// `PartialComplete`; no responses returns `Error` with the errors joined by
+/// `"; "`; no errors returns `Complete` as before.
 async fn run_parallel(children: Vec<AgentDefinition>, ctx: &WorkflowContext) -> AgentOutcome {
     tracing::info!(child_count = children.len(), "Parallel workflow started");
 
@@ -180,35 +213,70 @@ async fn run_parallel(children: Vec<AgentDefinition>, ctx: &WorkflowContext) -> 
     tracing::info!(child_count, "Parallel: spawning children");
 
     let mut join_set = tokio::task::JoinSet::new();
+    // Task id → child name, so a join failure still names its child. Only the
+    // id is kept from each AbortHandle — nothing ever aborts a child task.
+    let mut names: HashMap<tokio::task::Id, String> = HashMap::new();
     for child in children {
+        let name = child.name.clone();
         let child_ctx = ctx.for_child();
-        join_set.spawn(async move { dispatch_agent(child, &child_ctx).await });
+        let handle = join_set.spawn(async move { dispatch_agent(child, &child_ctx).await });
+        names.insert(handle.id(), name);
     }
 
     let mut responses = Vec::new();
     let mut errors = Vec::new();
-    while let Some(result) = join_set.join_next().await {
-        match result {
-            Ok(AgentOutcome::Complete { response }) => {
+    let mut cancelled = false;
+    while let Some(result) = join_set.join_next_with_id().await {
+        let (id, outcome) = match result {
+            Ok(joined) => joined,
+            Err(join_err) => {
+                let name = names.remove(&join_err.id()).unwrap_or_default();
+                errors.push(format!("{name}: task failed: {join_err}"));
+                continue;
+            }
+        };
+        let name = names.remove(&id).unwrap_or_default();
+        match outcome {
+            AgentOutcome::Complete { response } => {
                 responses.push(response);
             }
-            Ok(outcome) => {
-                errors.push(format!("{outcome:?}"));
+            AgentOutcome::PartialComplete {
+                responses: child_responses,
+                errors: child_errors,
+            } => {
+                responses.extend(child_responses);
+                errors.extend(child_errors);
             }
-            Err(join_err) => {
-                errors.push(format!("Task panic: {join_err}"));
+            AgentOutcome::Cancelled { .. } => {
+                cancelled = true;
+            }
+            AgentOutcome::Error { error } => {
+                errors.push(format!("{name}: {error}"));
+            }
+            AgentOutcome::MaxIterationsReached => {
+                errors.push(format!("{name}: max iterations reached"));
+            }
+            other => {
+                errors.push(format!("{name}: {other:?}"));
             }
         }
     }
 
-    if !errors.is_empty() {
+    if cancelled {
+        return AgentOutcome::Cancelled {
+            partial_response: responses.join("\n"),
+        };
+    }
+    if errors.is_empty() {
+        AgentOutcome::Complete {
+            response: responses.join("\n"),
+        }
+    } else if responses.is_empty() {
         AgentOutcome::Error {
             error: errors.join("; "),
         }
     } else {
-        AgentOutcome::Complete {
-            response: responses.join("\n"),
-        }
+        AgentOutcome::PartialComplete { responses, errors }
     }
 }
 
@@ -226,6 +294,14 @@ const LOOP_DONE_SIGNAL: &str = "[LOOP_DONE]";
 ///
 /// Each iteration perceives cumulative experiences from all prior iterations
 /// via the shared substrate.
+///
+/// Cancellation (ADR-014): the run token is checked at the top of each
+/// iteration, beside the `[LOOP_DONE]` check — a cancelled token ends the loop
+/// as `Cancelled` carrying the last completed iteration's response (A16). A
+/// child returning `Cancelled` does the same. A child returning
+/// `PartialComplete` counts as progress (D3): its `responses`, joined by
+/// newline, are the iteration's response — including for the `[LOOP_DONE]`
+/// check. `Error` keeps returning immediately.
 async fn run_loop(
     child: AgentDefinition,
     max_iterations: usize,
@@ -241,7 +317,14 @@ async fn run_loop(
     }
 
     let mut last_outcome = AgentOutcome::MaxIterationsReached;
+    let mut last_response = String::new();
     for i in 0..max_iterations {
+        if ctx.cancel.is_cancelled() {
+            tracing::info!(iteration = i + 1, "Loop: cancelled at iteration top");
+            return AgentOutcome::Cancelled {
+                partial_response: last_response,
+            };
+        }
         tracing::info!(
             iteration = i + 1,
             max = max_iterations,
@@ -249,18 +332,43 @@ async fn run_loop(
         );
         let outcome = dispatch_agent(child.clone(), &ctx.for_child()).await;
 
-        match &outcome {
-            AgentOutcome::Complete { response } if response.contains(LOOP_DONE_SIGNAL) => {
-                tracing::info!(iteration = i + 1, "Loop: completion signal received");
-                last_outcome = outcome;
-                break;
+        match outcome {
+            AgentOutcome::Complete { response } => {
+                let done = response.contains(LOOP_DONE_SIGNAL);
+                last_response = response.clone();
+                last_outcome = AgentOutcome::Complete { response };
+                if done {
+                    tracing::info!(iteration = i + 1, "Loop: completion signal received");
+                    break;
+                }
+            }
+            // D3: partial results are progress — the joined responses are the
+            // iteration's response, and the loop's outcome keeps the child's
+            // errors visible.
+            AgentOutcome::PartialComplete { responses, errors } => {
+                let joined = responses.join("\n");
+                let done = joined.contains(LOOP_DONE_SIGNAL);
+                last_response = joined;
+                last_outcome = AgentOutcome::PartialComplete { responses, errors };
+                if done {
+                    tracing::info!(iteration = i + 1, "Loop: completion signal received");
+                    break;
+                }
             }
             AgentOutcome::Error { .. } => {
                 tracing::warn!(iteration = i + 1, "Loop: child errored, stopping");
                 return outcome;
             }
-            _ => {
-                last_outcome = outcome;
+            AgentOutcome::Cancelled { .. } => {
+                tracing::info!(iteration = i + 1, "Loop: child cancelled, stopping");
+                return AgentOutcome::Cancelled {
+                    partial_response: last_response,
+                };
+            }
+            // MaxIterationsReached and any future variant keep today's
+            // behavior: recorded and looped through to the cap.
+            other => {
+                last_outcome = other;
             }
         }
     }
@@ -632,10 +740,15 @@ mod tests {
         };
 
         let outcome = dispatch_agent(agent, &ctx).await;
-        assert!(
-            matches!(&outcome, AgentOutcome::Error { .. }),
-            "Parallel with one error should return Error, got: {outcome:?}"
-        );
+        // #45: the survivor's response is kept and the failure names its child.
+        match &outcome {
+            AgentOutcome::PartialComplete { responses, errors } => {
+                assert_eq!(responses, &["I succeeded".to_string()]);
+                assert_eq!(errors.len(), 1);
+                assert!(errors[0].starts_with("will-error: "));
+            }
+            other => panic!("Parallel with one error should return PartialComplete, got: {other:?}"),
+        }
     }
 
     #[tokio::test]
