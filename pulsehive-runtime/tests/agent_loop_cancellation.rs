@@ -766,3 +766,97 @@ async fn empty_tool_call_content_preserves_partial_response() {
         other => panic!("expected AgentOutcome::Cancelled, got {other:?}"),
     }
 }
+
+/// A tool that cancels the run token inside its own body — the probe for
+/// "cancelled during the final iteration's last tool call".
+struct CancellingTool {
+    tool_name: &'static str,
+    token: CancellationToken,
+}
+
+#[async_trait]
+impl Tool for CancellingTool {
+    fn name(&self) -> &str {
+        self.tool_name
+    }
+
+    fn description(&self) -> &str {
+        "Cancels the run token mid-execution"
+    }
+
+    fn parameters(&self) -> Value {
+        json!({"type": "object"})
+    }
+
+    async fn execute(&self, _params: Value, _ctx: &ToolContext) -> Result<ToolResult> {
+        self.token.cancel();
+        Ok(ToolResult::text(format!(
+            "{} cancelled the run",
+            self.tool_name
+        )))
+    }
+}
+
+/// r1.s2 review (max-iterations boundary): cancellation landing during the
+/// last tool call of the final iteration must still return `Cancelled`
+/// with the turn's partial response — not `MaxIterationsReached`. Drives
+/// `run_agentic_loop` directly so `max_iterations = 1` puts the only tool
+/// call on the final iteration (the same path `LoopContext` exposes).
+#[tokio::test]
+async fn cancel_during_final_tool_returns_cancelled_not_max_iterations() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db = pulsedb::PulseDB::open(dir.path().join("cap.db"), pulsedb::Config::default())
+        .expect("open temp substrate");
+    let substrate: Arc<dyn pulsedb::SubstrateProvider> =
+        Arc::new(pulsedb::PulseDBSubstrate::from_db(db));
+
+    let token = CancellationToken::new();
+    // One iteration: the provider answers with text plus a tool call; the
+    // tool cancels the run token while executing; the loop then reaches
+    // the iteration cap.
+    let provider = ScriptedProvider::new().then_response(LlmResponse::new(
+        Some("turn draft".to_string()),
+        vec![ToolCall {
+            id: "call_1".into(),
+            name: "selfcancel".into(),
+            arguments: json!({}),
+        }],
+        TokenUsage::default(),
+    ));
+
+    let config = LlmAgentConfig {
+        system_prompt: "Work the task.".into(),
+        tools: vec![Arc::new(CancellingTool {
+            tool_name: "selfcancel",
+            token: token.clone(),
+        })],
+        lens: Lens::default(),
+        llm_config: LlmConfig::new("scripted", "test-model"),
+        experience_extractor: None,
+        refresh_every_n_tool_calls: None,
+    };
+    let task = Task::new("cancel during the final tool");
+    let outcome = pulsehive_runtime::agentic_loop::run_agentic_loop(
+        config,
+        pulsehive_runtime::agentic_loop::LoopContext {
+            agent_id: "cap-agent".into(),
+            task: &task,
+            provider: Arc::new(provider),
+            substrate,
+            approval_handler: &pulsehive_core::approval::AutoApprove,
+            event_emitter: pulsehive_core::event::EventEmitter::default(),
+            max_iterations: 1,
+            embedding_provider: None,
+            cancel: token,
+        },
+    )
+    .await;
+
+    match outcome {
+        AgentOutcome::Cancelled { partial_response } => assert_eq!(
+            partial_response, "turn draft",
+            "the cancelled run should carry the turn's partial response"
+        ),
+        other => panic!("expected AgentOutcome::Cancelled, got {other:?}"),
+    }
+}

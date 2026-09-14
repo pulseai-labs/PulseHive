@@ -343,6 +343,15 @@ async fn think_act_loop(
         }
     }
 
+    // Cancellation checkpoint at the iteration cap (ADR-014): a token that
+    // fired during the final iteration's last tool call — or its mid-task
+    // refresh — ends the run as `Cancelled` with the turn's partial
+    // response, never `MaxIterationsReached`.
+    if ctx.cancel.is_cancelled() {
+        tracing::info!(agent_id = %agent_id, "Run cancelled at iteration cap");
+        return AgentOutcome::Cancelled { partial_response };
+    }
+
     tracing::warn!(agent_id = %agent_id, max = ctx.max_iterations, "Max iterations reached");
     AgentOutcome::MaxIterationsReached
 }
