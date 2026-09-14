@@ -694,3 +694,75 @@ async fn pre_cancelled_definition_token_cancels_call_synchronously() {
         "call token was still live when the provider inspected it"
     );
 }
+
+/// r1.s2 review (partial_response correctness): a later tool-call response
+/// carrying `content: Some("")` — the shape providers emit for a tool-only
+/// turn — must not erase the last real assistant text; the cancelled run
+/// still reports it.
+#[tokio::test]
+async fn empty_tool_call_content_preserves_partial_response() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let b_started = Arc::new(Notify::new());
+    let b_release = Arc::new(Notify::new());
+
+    // Turn: text + instant tool call, then an empty-content tool call the
+    // test cancels behind.
+    let provider = ScriptedProvider::new()
+        .then_response(LlmResponse::new(
+            Some("real draft".to_string()),
+            vec![ToolCall {
+                id: "call_a".into(),
+                name: "tool_a".into(),
+                arguments: json!({}),
+            }],
+            TokenUsage::default(),
+        ))
+        .then_response(LlmResponse::new(
+            Some(String::new()),
+            vec![ToolCall {
+                id: "call_b".into(),
+                name: "tool_b".into(),
+                arguments: json!({}),
+            }],
+            TokenUsage::default(),
+        ));
+    let hive = scripted_hive(&dir, provider);
+    let agent = scripted_agent(
+        vec![
+            Arc::new(SpyTool {
+                tool_name: "tool_a",
+                executed: Arc::new(AtomicBool::new(false)),
+            }),
+            Arc::new(GateTool {
+                tool_name: "tool_b",
+                started: b_started.clone(),
+                release: b_release.clone(),
+            }),
+        ],
+        LlmConfig::new("scripted", "test-model"),
+    );
+
+    let token = CancellationToken::new();
+    let task = Task::new("empty content turn").with_cancel(token.clone());
+    let stream = hive
+        .deploy(vec![agent], vec![task])
+        .await
+        .expect("deploy agents");
+
+    // Cancel while tool B is in flight — after the empty-content response
+    // was folded into partial_response.
+    tokio::time::timeout(BOUND, b_started.notified())
+        .await
+        .expect("tool B never started");
+    token.cancel();
+    b_release.notify_one();
+
+    let events = drain_until_completed(stream).await;
+    match completed_outcome(&events) {
+        AgentOutcome::Cancelled { partial_response } => assert_eq!(
+            partial_response, "real draft",
+            "an empty tool-call response must not erase the last assistant text"
+        ),
+        other => panic!("expected AgentOutcome::Cancelled, got {other:?}"),
+    }
+}

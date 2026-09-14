@@ -262,9 +262,13 @@ async fn think_act_loop(
         };
 
         // Track the latest assistant text — a later `Cancelled` carries it as
-        // `partial_response`.
+        // `partial_response`. A `Some("")` (providers emit empty content
+        // beside tool calls) is not text: it must not erase the last real
+        // partial.
         if let Some(text) = response.content.clone() {
-            partial_response = text;
+            if !text.is_empty() {
+                partial_response = text;
+            }
         }
 
         // ── ACT: handle response ─────────────────────────────────────
