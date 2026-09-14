@@ -1020,3 +1020,196 @@ async fn cancelled_run_skips_experience_recording() {
         "extractor not invoked for an uncancelled run"
     );
 }
+
+/// A substrate whose first perception query answers empty and whose later
+/// `get_recent` calls pend forever — the probe for "a mid-task refresh
+/// must not start once the run token has fired": reaching the second
+/// `get_recent` would hang the run inside `perceive` before
+/// `AgentCompleted`.
+struct RefreshHungSubstrate {
+    queries: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait]
+impl pulsedb::SubstrateProvider for RefreshHungSubstrate {
+    async fn store_experience(
+        &self,
+        _exp: pulsedb::NewExperience,
+    ) -> std::result::Result<pulsedb::ExperienceId, pulsedb::PulseDBError> {
+        Ok(pulsedb::ExperienceId::new())
+    }
+
+    async fn get_experience(
+        &self,
+        _id: pulsedb::ExperienceId,
+    ) -> std::result::Result<Option<pulsedb::Experience>, pulsedb::PulseDBError> {
+        Ok(None)
+    }
+
+    async fn search_similar(
+        &self,
+        _collective: pulsedb::CollectiveId,
+        _embedding: &[f32],
+        _k: usize,
+    ) -> std::result::Result<Vec<(pulsedb::Experience, f32)>, pulsedb::PulseDBError> {
+        Ok(vec![])
+    }
+
+    async fn get_recent(
+        &self,
+        _collective: pulsedb::CollectiveId,
+        _limit: usize,
+    ) -> std::result::Result<Vec<pulsedb::Experience>, pulsedb::PulseDBError> {
+        if self.queries.fetch_add(1, Ordering::SeqCst) >= 1 {
+            std::future::pending::<()>().await;
+        }
+        Ok(vec![])
+    }
+
+    async fn store_relation(
+        &self,
+        _rel: pulsedb::NewExperienceRelation,
+    ) -> std::result::Result<pulsedb::RelationId, pulsedb::PulseDBError> {
+        Ok(pulsedb::RelationId::new())
+    }
+
+    async fn get_related(
+        &self,
+        _exp_id: pulsedb::ExperienceId,
+    ) -> std::result::Result<
+        Vec<(pulsedb::Experience, pulsedb::ExperienceRelation)>,
+        pulsedb::PulseDBError,
+    > {
+        Ok(vec![])
+    }
+
+    async fn store_insight(
+        &self,
+        _insight: pulsedb::NewDerivedInsight,
+    ) -> std::result::Result<pulsedb::InsightId, pulsedb::PulseDBError> {
+        Ok(pulsedb::InsightId::new())
+    }
+
+    async fn get_insights(
+        &self,
+        _collective: pulsedb::CollectiveId,
+        _embedding: &[f32],
+        _k: usize,
+    ) -> std::result::Result<Vec<(pulsedb::DerivedInsight, f32)>, pulsedb::PulseDBError> {
+        Ok(vec![])
+    }
+
+    async fn get_activities(
+        &self,
+        _collective: pulsedb::CollectiveId,
+    ) -> std::result::Result<Vec<pulsedb::Activity>, pulsedb::PulseDBError> {
+        Ok(vec![])
+    }
+
+    async fn get_context_candidates(
+        &self,
+        _request: pulsedb::ContextRequest,
+    ) -> std::result::Result<pulsedb::ContextCandidates, pulsedb::PulseDBError> {
+        Ok(pulsedb::ContextCandidates {
+            similar_experiences: vec![],
+            recent_experiences: vec![],
+            insights: vec![],
+            relations: vec![],
+            active_agents: vec![],
+        })
+    }
+
+    async fn watch(
+        &self,
+        _collective: pulsedb::CollectiveId,
+    ) -> std::result::Result<
+        Pin<Box<dyn Stream<Item = pulsedb::WatchEvent> + Send>>,
+        pulsedb::PulseDBError,
+    > {
+        Ok(Box::pin(futures::stream::empty()))
+    }
+
+    async fn create_collective(
+        &self,
+        _name: &str,
+    ) -> std::result::Result<pulsedb::CollectiveId, pulsedb::PulseDBError> {
+        Ok(pulsedb::CollectiveId::new())
+    }
+
+    async fn get_or_create_collective(
+        &self,
+        _name: &str,
+    ) -> std::result::Result<pulsedb::CollectiveId, pulsedb::PulseDBError> {
+        Ok(pulsedb::CollectiveId::new())
+    }
+
+    async fn list_collectives(
+        &self,
+    ) -> std::result::Result<Vec<pulsedb::Collective>, pulsedb::PulseDBError> {
+        Ok(vec![])
+    }
+}
+
+/// r1.s2 review (mid-task refresh race): when cancellation lands during
+/// the tool that reaches `refresh_every_n_tool_calls`, the loop must end
+/// the turn as `Cancelled` before starting `perceive` — a slow or hung
+/// custom substrate must not delay `AgentCompleted` past the end of the
+/// run. The hung substrate makes the regression deterministic: reaching
+/// the second `get_recent` hangs the run instead of returning `Cancelled`.
+#[tokio::test]
+async fn cancel_during_tool_skips_pending_refresh() {
+    let substrate: Arc<dyn pulsedb::SubstrateProvider> = Arc::new(RefreshHungSubstrate {
+        queries: std::sync::atomic::AtomicUsize::new(0),
+    });
+
+    let token = CancellationToken::new();
+    let provider = ScriptedProvider::new().then_response(LlmResponse::new(
+        Some("turn draft".to_string()),
+        vec![ToolCall {
+            id: "call_1".into(),
+            name: "selfcancel".into(),
+            arguments: json!({}),
+        }],
+        TokenUsage::default(),
+    ));
+
+    let config = LlmAgentConfig {
+        system_prompt: "Work the task.".into(),
+        tools: vec![Arc::new(CancellingTool {
+            tool_name: "selfcancel",
+            token: token.clone(),
+        })],
+        lens: Lens::default(),
+        llm_config: LlmConfig::new("scripted", "test-model"),
+        experience_extractor: None,
+        refresh_every_n_tool_calls: Some(1),
+    };
+    let task = Task::new("cancel before the mid-task refresh");
+    let outcome = tokio::time::timeout(
+        BOUND,
+        pulsehive_runtime::agentic_loop::run_agentic_loop(
+            config,
+            pulsehive_runtime::agentic_loop::LoopContext {
+                agent_id: "refresh-agent".into(),
+                task: &task,
+                provider: Arc::new(provider),
+                substrate,
+                approval_handler: &pulsehive_core::approval::AutoApprove,
+                event_emitter: pulsehive_core::event::EventEmitter::default(),
+                max_iterations: 8,
+                embedding_provider: None,
+                cancel: token,
+            },
+        ),
+    )
+    .await
+    .expect("run hung inside the pending refresh");
+
+    match outcome {
+        AgentOutcome::Cancelled { partial_response } => assert_eq!(
+            partial_response, "turn draft",
+            "the cancelled run should carry the turn's partial response"
+        ),
+        other => panic!("expected AgentOutcome::Cancelled, got {other:?}"),
+    }
+}

@@ -339,6 +339,17 @@ async fn think_act_loop(
         // ── MID-TASK REFRESH: re-perceive substrate if threshold reached ──
         if let Some(interval) = refresh_every {
             if tool_calls_since_refresh >= interval {
+                // Cancellation checkpoint before the refresh (ADR-014): a
+                // token that fired while the last tool was running must not
+                // start a `perceive` that a slow or hung custom substrate
+                // could hold open past the end of the run.
+                if ctx.cancel.is_cancelled() {
+                    tracing::info!(
+                        agent_id = %agent_id,
+                        "Run cancelled before mid-task refresh"
+                    );
+                    return AgentOutcome::Cancelled { partial_response };
+                }
                 tracing::info!(
                     agent_id = %agent_id,
                     tool_calls = tool_calls_since_refresh,

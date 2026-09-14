@@ -1098,6 +1098,7 @@ token.cancel(); // e.g. from a Ctrl-C handler or a UI stop button
 while let Some(event) = stream.next().await {
     if let HiveEvent::AgentCompleted { outcome, .. } = event {
         // outcome == AgentOutcome::Cancelled { partial_response }
+        break; // the stream stays open while the HiveMind lives — break on the terminal event
     }
 }
 ```
