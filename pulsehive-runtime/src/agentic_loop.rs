@@ -18,10 +18,13 @@
 //! the same outcome. Cancellation is cooperative: a tool already executing is
 //! always awaited, never force-aborted.
 
+use std::any::Any;
 use std::collections::HashMap;
+use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use futures::FutureExt;
 use pulsedb::SubstrateProvider;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -36,7 +39,7 @@ use pulsehive_core::lens::Lens;
 use pulsehive_core::llm::{
     LlmConfig, LlmErrorKind, LlmProvider, Message, ToolCall, ToolDefinition,
 };
-use pulsehive_core::tool::{Tool, ToolContext, ToolProgress, ToolResult};
+use pulsehive_core::tool::{StreamingTool, Tool, ToolContext, ToolProgress, ToolResult};
 
 use crate::hivemind::Task;
 use crate::substrate_ids;
@@ -403,6 +406,19 @@ async fn execute_tool_call(
     .await
 }
 
+/// Renders a caught panic payload as a message: the `&'static str` /
+/// `String` payloads every `panic!` form produces, or a placeholder for
+/// anything else.
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = payload.downcast_ref::<&'static str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "non-string panic payload".to_string()
+    }
+}
+
 /// Execute a tool and emit events.
 #[allow(clippy::too_many_arguments)]
 async fn execute_tool_inner(
@@ -450,80 +466,162 @@ async fn execute_tool_inner(
     // the `HiveEvent` stream; non-streaming tools take the existing path verbatim.
     let exec_result = match tool.as_streaming() {
         Some(streaming) => {
-            let (tx, mut rx) = mpsc::channel::<ToolProgress>(64);
-
-            // Forwarder: drain the tool's progress channel and re-emit each item
-            // as a `HiveEvent::ToolProgress`. Owns its own emitter clone + labels
-            // so it is `Send + 'static` for `tokio::spawn`.
-            let forwarder_emitter = event_emitter.clone();
-            let forwarder_agent = agent_id.to_string();
-            let forwarder_tool = tool_name.to_string();
-            let mut forwarder = tokio::spawn(async move {
-                while let Some(progress) = rx.recv().await {
-                    forwarder_emitter.emit(HiveEvent::ToolProgress {
-                        timestamp_ms: pulsehive_core::event::now_ms(),
-                        agent_id: forwarder_agent.clone(),
-                        tool_name: forwarder_tool.clone(),
-                        progress,
-                    });
-                }
-            });
-
-            // Run the streaming body. The `tx` we passed is the only sender clone;
-            // it drops when `execute_streaming` returns, closing the channel so the
-            // forwarder observes end-of-stream.
-            let result = streaming
-                .execute_streaming(params, &context, tx)
-                .instrument(tracing::debug_span!("tool_execute", tool = %tool_name))
-                .await;
-
-            // The tool has returned; drain the forwarder so every buffered progress
-            // event is emitted before the `Completed` bookend below. Under the normal
-            // contract (the sole `progress_tx` drops when `execute_streaming` returns)
-            // the channel closes and the forwarder finishes immediately. But
-            // `mpsc::Sender` is `Clone` and tools are third-party code: a tool that
-            // clones/leaks the sender into a background task would keep the channel
-            // open forever, so an unbounded `forwarder.await` here would hang the whole
-            // deployment (no `Completed` / `ToolCallCompleted` / next turn). Bound the
-            // wait: give the forwarder a short grace to drain, then stop it — a
-            // misbehaving tool must not wedge the agent. (Fuller hardening — scoped
-            // sender, backpressure contract, adversarial tests — tracked in the
-            // streaming-tool hardening follow-up.)
-            const FORWARDER_DRAIN_GRACE: Duration = Duration::from_secs(5);
-            if tokio::time::timeout(FORWARDER_DRAIN_GRACE, &mut forwarder)
-                .await
-                .is_err()
-            {
-                tracing::warn!(
-                    tool = %tool_name,
-                    "streaming tool left a progress sender open after returning; \
-                     stopping the progress forwarder after the drain grace period"
-                );
-                forwarder.abort();
-            }
-            result
+            execute_streaming_body(
+                agent_id,
+                tool_name,
+                params,
+                streaming,
+                &context,
+                event_emitter,
+            )
+            .await
         }
         None => {
-            tool.execute(params, &context)
-                .instrument(tracing::debug_span!("tool_execute", tool = %tool_name))
-                .await
+            AssertUnwindSafe(
+                tool.execute(params, &context)
+                    .instrument(tracing::debug_span!("tool_execute", tool = %tool_name)),
+            )
+            .catch_unwind()
+            .await
         }
     };
 
-    let result = match exec_result {
-        Ok(result) => result,
-        Err(e) => {
+    let result = normalize_tool_result(tool_name, exec_result);
+    emit_tool_completion(agent_id, tool_name, start, &result, event_emitter);
+    result
+}
+
+/// Normalizes a caught tool-execution result into a `ToolResult`. A panicked
+/// tool becomes an ordinary tool error carrying the panic message (ADR-007:
+/// fail loudly, never silently) — bookends and `ToolCallCompleted` are then
+/// emitted exactly as for any other failure, and the turn continues.
+fn normalize_tool_result(
+    tool_name: &str,
+    exec_result: Result<Result<ToolResult, PulseHiveError>, Box<dyn Any + Send>>,
+) -> ToolResult {
+    match exec_result {
+        Ok(Ok(result)) => result,
+        Ok(Err(e)) => {
             tracing::warn!(tool = %tool_name, error = %e, "Tool execution failed");
             ToolResult::error(e.to_string())
         }
-    };
+        Err(payload) => {
+            let message = panic_message(payload.as_ref());
+            tracing::error!(tool = %tool_name, panic = %message, "Tool panicked");
+            ToolResult::error(format!("tool '{tool_name}' panicked: {message}"))
+        }
+    }
+}
 
+/// Spawns the progress forwarder for a streaming tool call: drains the tool's
+/// progress channel and re-emits each item as a `HiveEvent::ToolProgress`.
+/// The `Started`/`Completed` bookends are the loop's alone — a tool that
+/// sends them anyway gets them dropped (with a warning) so the call keeps
+/// exactly one runtime-emitted pair instead of duplicates.
+fn spawn_progress_forwarder(
+    agent_id: &str,
+    tool_name: &str,
+    event_emitter: &EventEmitter,
+    mut rx: mpsc::Receiver<ToolProgress>,
+) -> tokio::task::JoinHandle<()> {
+    // Owns its own emitter clone + labels so it is `Send + 'static` for
+    // `tokio::spawn`.
+    let forwarder_emitter = event_emitter.clone();
+    let forwarder_agent = agent_id.to_string();
+    let forwarder_tool = tool_name.to_string();
+    tokio::spawn(async move {
+        while let Some(progress) = rx.recv().await {
+            if matches!(
+                progress,
+                ToolProgress::Started { .. } | ToolProgress::Completed { .. }
+            ) {
+                tracing::warn!(
+                    tool = %forwarder_tool,
+                    "dropping tool-sent progress bookend; Started/Completed are emitted by the loop"
+                );
+                continue;
+            }
+            forwarder_emitter.emit(HiveEvent::ToolProgress {
+                timestamp_ms: pulsehive_core::event::now_ms(),
+                agent_id: forwarder_agent.clone(),
+                tool_name: forwarder_tool.clone(),
+                progress,
+            });
+        }
+    })
+}
+
+/// Runs a streaming tool's body under a panic guard with its progress
+/// forwarder: opens the 64-event channel, spawns the bookend-filtering
+/// forwarder, awaits `execute_streaming` under `catch_unwind`, then drains
+/// the forwarder under a bounded grace. The outer `Err` carries the caught
+/// panic payload; `Ok` carries the tool's own `Result`.
+async fn execute_streaming_body(
+    agent_id: &str,
+    tool_name: &str,
+    params: serde_json::Value,
+    streaming: &dyn StreamingTool,
+    context: &ToolContext,
+    event_emitter: &EventEmitter,
+) -> Result<Result<ToolResult, PulseHiveError>, Box<dyn Any + Send>> {
+    let (tx, rx) = mpsc::channel::<ToolProgress>(64);
+    let mut forwarder = spawn_progress_forwarder(agent_id, tool_name, event_emitter, rx);
+
+    // Run the streaming body. The `tx` we passed is the only sender clone;
+    // it drops when `execute_streaming` returns, closing the channel so the
+    // forwarder observes end-of-stream. A panic in the tool body is caught
+    // (not propagated): unwinding would kill the spawned agent task and
+    // the stream would go silent with no bookends or ToolCallCompleted.
+    // On panic the future — and with it `tx` — is dropped, so the
+    // forwarder still observes end-of-stream and drains normally.
+    let result = AssertUnwindSafe(
+        streaming
+            .execute_streaming(params, context, tx)
+            .instrument(tracing::debug_span!("tool_execute", tool = %tool_name)),
+    )
+    .catch_unwind()
+    .await;
+
+    // The tool has returned; drain the forwarder so every buffered progress
+    // event is emitted before the `Completed` bookend. Under the normal
+    // contract (the sole `progress_tx` drops when `execute_streaming` returns)
+    // the channel closes and the forwarder finishes immediately. But
+    // `mpsc::Sender` is `Clone` and tools are third-party code: a tool that
+    // clones/leaks the sender into a background task would keep the channel
+    // open forever, so an unbounded `forwarder.await` here would hang the whole
+    // deployment (no `Completed` / `ToolCallCompleted` / next turn). Bound the
+    // wait: give the forwarder a short grace to drain, then stop it — a
+    // misbehaving tool must not wedge the agent. (Fuller hardening — scoped
+    // sender, backpressure contract, adversarial tests — tracked in the
+    // streaming-tool hardening follow-up.)
+    const FORWARDER_DRAIN_GRACE: Duration = Duration::from_secs(5);
+    if tokio::time::timeout(FORWARDER_DRAIN_GRACE, &mut forwarder)
+        .await
+        .is_err()
+    {
+        tracing::warn!(
+            tool = %tool_name,
+            "streaming tool left a progress sender open after returning; \
+             stopping the progress forwarder after the drain grace period"
+        );
+        forwarder.abort();
+    }
+    result
+}
+
+/// Emits the loop-generated `Completed` bookend and `ToolCallCompleted` for a
+/// finished call, reusing the same `start.elapsed()` measurement so the two
+/// events' `duration_ms` match.
+fn emit_tool_completion(
+    agent_id: &str,
+    tool_name: &str,
+    start: Instant,
+    result: &ToolResult,
+    event_emitter: &EventEmitter,
+) {
     let duration_ms = start.elapsed().as_millis() as u64;
     tracing::debug!(tool = %tool_name, duration_ms, "Tool completed");
 
-    // Loop-generated `Completed` bookend — emitted right before `ToolCallCompleted`,
-    // reusing the same `start.elapsed()` measurement so it matches
-    // `ToolCallCompleted.duration_ms`.
     event_emitter.emit(HiveEvent::ToolProgress {
         timestamp_ms: pulsehive_core::event::now_ms(),
         agent_id: agent_id.to_string(),
@@ -539,8 +637,6 @@ async fn execute_tool_inner(
         duration_ms,
         result_preview,
     });
-
-    result
 }
 
 // ── Perceive Phase ───────────────────────────────────────────────────

@@ -334,6 +334,18 @@ pub trait StreamingTool: Tool {
 }
 ```
 
+**Delivery contract (tool → loop).** `progress_tx` is the internal channel from
+the tool to the agent loop — not the consumer's `deploy()` stream. It provides
+**guaranteed delivery with backpressure**, in send order: the buffer holds 64
+events, and a full buffer makes `send().await` wait for the loop's forwarder —
+an accepted event is never silently dropped on this hop. Chatty tools should
+coalesce high-frequency updates rather than stall on that backpressure, and a
+tool parked on a full buffer can still observe `context.cancel` (the token is
+independent of the channel). `Started`/`Completed` bookends are the loop's
+alone: a tool that sends them has them dropped by the forwarder (with a
+warning), so every call keeps exactly one runtime-emitted pair. The `deploy()`
+subscriber broadcast downstream is separately lossy, as covered next.
+
 **Observing progress.** The agent loop forwards each `ToolProgress` as a
 [`HiveEvent::ToolProgress`](#42-hiveevent) `{ agent_id, tool_name, progress }` on
 the `HiveMind::deploy()` stream. Because the event bus is a lossy broadcast,
