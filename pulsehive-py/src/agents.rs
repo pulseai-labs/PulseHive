@@ -201,10 +201,12 @@ impl PyAgentDefinition {
 
 // ── AgentOutcome ─────────────────────────────────────────────────────
 
-/// Result of agent execution — complete, error, or max iterations reached.
+/// Result of agent execution — complete, error, cancelled, partial, or
+/// max iterations reached.
 ///
 /// Properties:
-///     kind: "complete", "error", or "max_iterations_reached"
+///     kind: "complete", "error", "cancelled", "partial_complete",
+///         "max_iterations_reached", or "unknown" (future variants)
 ///     response: Agent's final response (only for "complete")
 ///     error: Error description (only for "error")
 #[pyclass(name = "AgentOutcome", frozen, from_py_object)]
@@ -215,13 +217,17 @@ pub struct PyAgentOutcome {
 
 #[pymethods]
 impl PyAgentOutcome {
-    /// Outcome kind: "complete", "error", or "max_iterations_reached".
+    /// Outcome kind: "complete", "error", "cancelled", "partial_complete",
+    /// or "max_iterations_reached".
     #[getter]
     fn kind(&self) -> &str {
         match &self.inner {
             AgentOutcome::Complete { .. } => "complete",
             AgentOutcome::Error { .. } => "error",
             AgentOutcome::MaxIterationsReached => "max_iterations_reached",
+            AgentOutcome::Cancelled { .. } => "cancelled",
+            AgentOutcome::PartialComplete { .. } => "partial_complete",
+            _ => "unknown",
         }
     }
 
@@ -254,6 +260,20 @@ impl PyAgentOutcome {
             AgentOutcome::MaxIterationsReached => {
                 "AgentOutcome(max_iterations_reached)".to_string()
             }
+            AgentOutcome::Cancelled { partial_response } => {
+                format!(
+                    "AgentOutcome(cancelled, '{}')",
+                    truncate(partial_response, 60)
+                )
+            }
+            AgentOutcome::PartialComplete { responses, errors } => {
+                format!(
+                    "AgentOutcome(partial_complete, {} responses, {} errors)",
+                    responses.len(),
+                    errors.len()
+                )
+            }
+            _ => "AgentOutcome(unknown)".to_string(),
         }
     }
 }

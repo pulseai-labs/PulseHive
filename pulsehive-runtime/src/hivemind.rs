@@ -24,6 +24,7 @@ use futures::stream;
 use futures::{Stream, StreamExt};
 use pulsedb::{Config, NewExperience, PulseDB, PulseDBSubstrate, SubstrateProvider};
 use tokio::sync::broadcast;
+use tokio_util::sync::CancellationToken;
 
 use pulsehive_core::agent::AgentDefinition;
 use pulsehive_core::approval::{ApprovalHandler, AutoApprove};
@@ -54,6 +55,10 @@ pub struct Task {
     pub description: String,
     /// Collective (namespace) this task operates within.
     pub collective_id: CollectiveId,
+    /// The caller's cancellation token for this task (ADR-014). Each agent
+    /// run spawned for the task observes a child of it; `None` means the
+    /// task runs uncancellable. Cloned tasks share the token.
+    cancel: Option<CancellationToken>,
 }
 
 impl Task {
@@ -62,6 +67,7 @@ impl Task {
         Self {
             description: description.into(),
             collective_id: CollectiveId::new(),
+            cancel: None,
         }
     }
 
@@ -82,7 +88,25 @@ impl Task {
         Self {
             description: description.into(),
             collective_id,
+            cancel: None,
         }
+    }
+
+    /// Attaches the caller's cancellation token to this task (ADR-014).
+    ///
+    /// Every agent run spawned for the task observes a child of `token`, so
+    /// cancelling it stops the task's runs at their next safe checkpoint —
+    /// cooperatively, never by force-aborting a tool body or a child agent
+    /// task.
+    pub fn with_cancel(mut self, token: CancellationToken) -> Self {
+        self.cancel = Some(token);
+        self
+    }
+
+    /// The caller's cancellation token for this task, if one was attached
+    /// with [`Task::with_cancel`].
+    pub fn cancel_token(&self) -> Option<&CancellationToken> {
+        self.cancel.as_ref()
     }
 }
 
@@ -504,6 +528,14 @@ impl HiveMind {
     /// The returned handle lets a deployment's watch task observe when its
     /// agents have finished.
     fn spawn_agent(&self, agent: AgentDefinition, task: Task) -> tokio::task::JoinHandle<()> {
+        // One run token per spawned agent run (ADR-014): a child of the
+        // task's caller-owned token when one is set, otherwise a fresh
+        // token. w4 links it to the internal HiveMind root so shutdown/Drop
+        // cancel every run.
+        let run_token = task
+            .cancel_token()
+            .map(CancellationToken::child_token)
+            .unwrap_or_default();
         let ctx = WorkflowContext {
             task,
             llm_providers: self.llm_providers.clone(),
@@ -511,6 +543,7 @@ impl HiveMind {
             approval_handler: Arc::clone(&self.approval_handler),
             event_emitter: self.event_bus.clone(),
             embedding_provider: self.embedding_provider.clone(),
+            cancel: run_token,
         };
 
         tokio::spawn(async move {
