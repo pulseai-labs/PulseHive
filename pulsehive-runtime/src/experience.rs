@@ -67,6 +67,10 @@ impl ExperienceExtractor for DefaultExperienceExtractor {
                 exp.confidence = 0.7;
                 vec![exp]
             }
+            // Cancelled and PartialComplete extract nothing yet (ADR-014);
+            // the wildcard also covers future `#[non_exhaustive]` variants.
+            AgentOutcome::Cancelled { .. } | AgentOutcome::PartialComplete { .. } => vec![],
+            _ => vec![],
         }
     }
 }

@@ -199,7 +199,8 @@ impl JsAgentDefinition {
 
 // ── AgentOutcome ─────────────────────────────────────────────────────
 
-/// Result of agent execution — complete, error, or max iterations reached.
+/// Result of agent execution — complete, error, cancelled, partial, or
+/// max iterations reached.
 #[cfg_attr(feature = "napi", napi)]
 pub struct JsAgentOutcome {
     pub(crate) inner: AgentOutcome,
@@ -207,13 +208,17 @@ pub struct JsAgentOutcome {
 
 #[cfg_attr(feature = "napi", napi)]
 impl JsAgentOutcome {
-    /// Outcome kind: "complete", "error", or "max_iterations_reached".
+    /// Outcome kind: "complete", "error", "cancelled", "partial_complete",
+    /// or "max_iterations_reached".
     #[cfg_attr(feature = "napi", napi(getter))]
     pub fn kind(&self) -> String {
         match &self.inner {
             AgentOutcome::Complete { .. } => "complete".to_string(),
             AgentOutcome::Error { .. } => "error".to_string(),
             AgentOutcome::MaxIterationsReached => "max_iterations_reached".to_string(),
+            AgentOutcome::Cancelled { .. } => "cancelled".to_string(),
+            AgentOutcome::PartialComplete { .. } => "partial_complete".to_string(),
+            _ => "unknown".to_string(),
         }
     }
 
@@ -248,6 +253,20 @@ impl JsAgentOutcome {
             AgentOutcome::MaxIterationsReached => {
                 "AgentOutcome(max_iterations_reached)".to_string()
             }
+            AgentOutcome::Cancelled { partial_response } => {
+                format!(
+                    "AgentOutcome(cancelled, '{}')",
+                    truncate(partial_response, 60)
+                )
+            }
+            AgentOutcome::PartialComplete { responses, errors } => {
+                format!(
+                    "AgentOutcome(partial_complete, {} responses, {} errors)",
+                    responses.len(),
+                    errors.len()
+                )
+            }
+            _ => "AgentOutcome(unknown)".to_string(),
         }
     }
 }
@@ -262,6 +281,26 @@ fn truncate(s: &str, max: usize) -> String {
     if s.len() <= max {
         s.to_string()
     } else {
-        format!("{}...", &s[..max])
+        // Cut on a UTF-8 character boundary — `&s[..max]` panics when
+        // `max` lands inside a multibyte character.
+        format!("{}...", crate::events::truncate_chars(s, max))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// r1.s2 review: a cancelled response whose byte 60 lands inside a
+    /// multibyte character must not panic `toString` — the preview cuts
+    /// on a UTF-8 boundary.
+    #[test]
+    fn cancelled_repr_truncates_on_char_boundary() {
+        // 59 ASCII bytes then four-byte emoji: byte 60 is mid-character.
+        let partial_response = format!("{}{}", "x".repeat(59), "😀".repeat(4));
+        let outcome = JsAgentOutcome::from(AgentOutcome::Cancelled { partial_response });
+        let rendered = outcome.to_string_js();
+        assert!(rendered.starts_with("AgentOutcome(cancelled, '"));
+        assert!(rendered.ends_with("...')"));
     }
 }

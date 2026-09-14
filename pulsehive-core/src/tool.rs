@@ -30,6 +30,7 @@ use pulsedb::SubstrateProvider;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 
 use crate::error::Result;
 use crate::event::EventEmitter;
@@ -54,6 +55,11 @@ pub trait Tool: Send + Sync {
     fn parameters(&self) -> Value;
 
     /// Execute the tool with the given parameters.
+    ///
+    /// `context.cancel` is this invocation's cooperative cancellation
+    /// signal (ADR-014): a long-running tool SHOULD poll
+    /// `context.cancel.is_cancelled()` at safe points or await
+    /// `context.cancel.cancelled()` and wind down when it fires.
     async fn execute(&self, params: Value, context: &ToolContext) -> Result<ToolResult>;
 
     /// Whether this tool requires human approval before execution.
@@ -90,6 +96,13 @@ pub struct ToolContext {
     pub substrate: Arc<dyn SubstrateProvider>,
     /// Event emitter for tools that need to emit custom events.
     pub event_emitter: EventEmitter,
+    /// This invocation's cooperative cancellation signal (ADR-014).
+    ///
+    /// A child of the run's cancellation token: it fires when the caller's
+    /// `Task` token, the run token, or this invocation's own token is
+    /// cancelled. Tools never observe cancellation by preempt — they check
+    /// this token at safe points.
+    pub cancel: CancellationToken,
 }
 
 /// Result of a tool execution.
@@ -201,21 +214,32 @@ pub trait StreamingTool: Tool {
     ///
     /// `progress_tx` is a bounded channel owned by the agent loop. Implementations
     /// SHOULD send `Progress` / `PartialResult` / `Log` events; they MUST NOT send
-    /// `Started` or `Completed` (the loop emits those as bookends). Returns the
-    /// final [`ToolResult`] after the stream is drained. If the receiver is dropped
+    /// `Started` or `Completed` — the loop emits those as bookends, and the
+    /// forwarder drops tool-sent bookends with a warning. Returns the
+    /// final [`ToolResult`] after the stream is drained. `context.cancel` is
+    /// this invocation's cooperative cancellation signal (ADR-014) — a
+    /// streaming tool SHOULD observe it like any other tool. If the receiver is dropped
     /// (consumer gone), `progress_tx.send().await` errors — implementations SHOULD
     /// treat that as a soft signal, keep computing, and return the result anyway.
     ///
-    /// **Progress is observability, not control.** `progress_tx` is the *internal*
-    /// loop→forwarder channel — NOT the consumer's `HiveMind::deploy()` stream. A
-    /// consumer dropping the `deploy()` stream does **not** cancel this tool or stop
-    /// it computing; cooperative cancellation is a separate mechanism (a future
-    /// release). The channel is bounded, so `send().await` can apply backpressure if
-    /// the loop's forwarder falls behind — treat progress as best-effort telemetry,
-    /// and prefer coalescing high-frequency updates rather than relying on every
-    /// send being delivered. Do NOT retain or clone `progress_tx` beyond this call:
-    /// the loop closes the channel by observing your returned future drop it, and a
-    /// leaked/cloned sender keeps the forwarder alive.
+    /// **Delivery contract — guaranteed delivery with backpressure.**
+    /// `progress_tx` is the *internal* tool→loop channel — NOT the consumer's
+    /// `HiveMind::deploy()` stream. Events on this channel reach the
+    /// loop's forwarder **in send order**: the buffer holds 64 events, and once
+    /// it fills
+    /// `send().await` waits for the forwarder to drain — an accepted event is
+    /// never silently dropped on this hop. Chatty tools SHOULD coalesce
+    /// high-frequency updates rather than stall on that backpressure, and a
+    /// tool parked on a full buffer can still observe `context.cancel` (the
+    /// token is independent of the channel). The `deploy()` subscriber stream
+    /// downstream is a *separate*, lossy broadcast that drops events for
+    /// lagging consumers — this guarantee covers the tool→loop hop only. A
+    /// consumer dropping the `deploy()` stream does **not** cancel this tool
+    /// or stop it computing; cooperative cancellation is a separate mechanism.
+    /// Do NOT retain or clone `progress_tx` beyond this call: the loop closes
+    /// the channel by observing your returned future drop it, and a
+    /// leaked/cloned sender keeps the forwarder alive until the drain grace
+    /// aborts it.
     async fn execute_streaming(
         &self,
         params: Value,
@@ -358,6 +382,7 @@ mod tests {
             collective_id: CollectiveId::new(),
             substrate: Arc::new(pulsedb::PulseDBSubstrate::from_db(db)),
             event_emitter: EventEmitter::default(),
+            cancel: CancellationToken::new(),
         }
     }
 

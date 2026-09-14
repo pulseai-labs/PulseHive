@@ -39,6 +39,12 @@ PulseHive has fundamental architectural constraints that apply across all module
 - Provider crates may implement `LlmProvider` (e.g. `pulsehive-openai`)
 - Pluggable provider model
 
+**Cooperative Cancellation:**
+- Cancellation is cooperative, caller-owned and task-scoped (`Task::with_cancel`)
+- Tools observe `ToolContext.cancel`; the agent loop checks the run token at safe checkpoints
+- Nothing force-aborts tool bodies or child agent tasks
+- Semantics per ADR-014
+
 **Rationale:** These constraints keep PulseHive small, composable, and maintainable. The five-primitive boundary prevents framework bloat. Object-safe traits enable dynamic composition. AGPL ensures open-source contributions remain open.
 
 ## Consequences

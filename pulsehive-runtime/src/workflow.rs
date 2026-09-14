@@ -15,6 +15,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use pulsedb::SubstrateProvider;
+use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 
 use pulsehive_core::agent::{
@@ -45,6 +46,22 @@ pub(crate) struct WorkflowContext {
     pub event_emitter: EventBus,
     /// Optional embedding provider for computing embeddings before storage.
     pub embedding_provider: Option<Arc<dyn pulsehive_core::embedding::EmbeddingProvider>>,
+    /// This run's cancellation token (ADR-014). The workflow executors check
+    /// it — Sequential before each child, Loop at each iteration top, and the
+    /// agentic loop before each LLM and tool call — and it flows to children
+    /// and tool contexts as child tokens.
+    pub cancel: CancellationToken,
+}
+
+impl WorkflowContext {
+    /// The context a composite hands to each child it dispatches: identical
+    /// except `cancel` is a child of this run's token (ADR-014), so the run
+    /// cancels every descendant while each child keeps a distinct token.
+    fn for_child(&self) -> Self {
+        let mut ctx = self.clone();
+        ctx.cancel = self.cancel.child_token();
+        ctx
+    }
 }
 
 /// Dispatch an agent to the appropriate executor based on its kind.
@@ -81,14 +98,27 @@ pub(crate) fn dispatch_agent(
                 task_description: ctx.task.description.clone(),
             });
 
-            let outcome = match agent.kind {
-                AgentKind::Llm(config) => run_llm_agent(&agent_id, *config, ctx).await,
-                AgentKind::Sequential(children) => run_sequential(children, ctx).await,
-                AgentKind::Parallel(children) => run_parallel(children, ctx).await,
-                AgentKind::Loop {
-                    agent,
-                    max_iterations,
-                } => run_loop(*agent, max_iterations, ctx).await,
+            // Cancellation checkpoint at dispatch entry (ADR-014): a run
+            // whose token already fired — a task cancelled before dispatch,
+            // or an agent deployed after shutdown — ends as `Cancelled`
+            // here, before any executor's fast path (empty Sequential,
+            // empty Parallel, zero-iteration Loop) can return `Complete`
+            // or `MaxIterationsReached`.
+            let outcome = if ctx.cancel.is_cancelled() {
+                tracing::info!(agent = %agent_name, "Run cancelled at dispatch entry");
+                AgentOutcome::Cancelled {
+                    partial_response: String::new(),
+                }
+            } else {
+                match agent.kind {
+                    AgentKind::Llm(config) => run_llm_agent(&agent_id, *config, ctx).await,
+                    AgentKind::Sequential(children) => run_sequential(children, ctx).await,
+                    AgentKind::Parallel(children) => run_parallel(children, ctx).await,
+                    AgentKind::Loop {
+                        agent,
+                        max_iterations,
+                    } => run_loop(*agent, max_iterations, ctx).await,
+                }
             };
 
             // Emit lifecycle completion event with the same task identity.
@@ -114,6 +144,12 @@ pub(crate) fn dispatch_agent(
 ///
 /// Returns the last child's outcome. Stops early on error or `MaxIterationsReached`.
 /// Empty children list returns `Complete` with empty response.
+///
+/// Cancellation (ADR-014): a cancelled run token — checked before each child is
+/// dispatched — ends the sequence as `Cancelled` carrying the last completed
+/// child's response (A16). A child returning `Cancelled` does the same. A child
+/// returning `PartialComplete` counts as progress (D3): its `responses`, joined
+/// by newline, become the last response and the sequence continues.
 async fn run_sequential(children: Vec<AgentDefinition>, ctx: &WorkflowContext) -> AgentOutcome {
     tracing::info!(child_count = children.len(), "Sequential workflow started");
 
@@ -125,14 +161,33 @@ async fn run_sequential(children: Vec<AgentDefinition>, ctx: &WorkflowContext) -
 
     let mut last_response = String::new();
     for (i, child) in children.into_iter().enumerate() {
+        if ctx.cancel.is_cancelled() {
+            tracing::info!(child_index = i, "Sequential: cancelled before child");
+            return AgentOutcome::Cancelled {
+                partial_response: last_response,
+            };
+        }
         tracing::info!(child_index = i, child_name = %child.name, "Sequential: running child");
-        let outcome = dispatch_agent(child, ctx).await;
-        match &outcome {
+        let outcome = dispatch_agent(child, &ctx.for_child()).await;
+        match outcome {
             AgentOutcome::Complete { response } => {
-                last_response = response.clone();
+                last_response = response;
             }
-            AgentOutcome::Error { .. } | AgentOutcome::MaxIterationsReached => {
-                return outcome;
+            // D3: partial results are progress — the child's responses become
+            // the sequence's last response and the next child runs.
+            AgentOutcome::PartialComplete { responses, .. } => {
+                last_response = responses.join("\n");
+            }
+            // A16: the composite reports its own accumulated response, not the
+            // cancelled child's internal partial.
+            AgentOutcome::Cancelled { .. } => {
+                return AgentOutcome::Cancelled {
+                    partial_response: last_response,
+                };
+            }
+            // Error, MaxIterationsReached and any future variant stay terminal.
+            other => {
+                return other;
             }
         }
     }
@@ -147,8 +202,22 @@ async fn run_sequential(children: Vec<AgentDefinition>, ctx: &WorkflowContext) -
 /// experiences as they're written. Each child gets a cloned `WorkflowContext`
 /// (cheap: just Arc reference count bumps).
 ///
-/// Returns combined responses on success. If any child errors, reports all
-/// errors but still waits for all children to complete (no early cancellation).
+/// Cooperative drain (ADR-014 D5/A3): every spawned child is joined to
+/// completion — a child task is never aborted, even when the run token fires
+/// or a sibling fails. A child returning `Cancelled` makes the composite
+/// `Cancelled` carrying the completed children's responses joined by
+/// newline in declaration order (A16); a `PartialComplete` child flattens
+/// its `responses` and `errors` into the parent's (A17). When any child
+/// cancels, the composite returns `Cancelled` with the completed-child
+/// responses while sibling errors remain visible on each child's own
+/// `AgentCompleted` event. Each non-`Complete` child contributes a named
+/// error — `<agent>: <error>`, `<agent>: max iterations reached`,
+/// `<agent>: task failed: <reason>` for a join failure — so every
+/// child's failure stays attributable (#45). `responses` and `errors`
+/// are both assembled in child declaration order, never finish order.
+/// Some responses plus some errors returns `PartialComplete`; no
+/// responses returns `Error` with the errors joined by `"; "`; no errors
+/// returns `Complete` as before.
 async fn run_parallel(children: Vec<AgentDefinition>, ctx: &WorkflowContext) -> AgentOutcome {
     tracing::info!(child_count = children.len(), "Parallel workflow started");
 
@@ -162,35 +231,89 @@ async fn run_parallel(children: Vec<AgentDefinition>, ctx: &WorkflowContext) -> 
     tracing::info!(child_count, "Parallel: spawning children");
 
     let mut join_set = tokio::task::JoinSet::new();
-    for child in children {
-        let child_ctx = ctx.clone();
-        join_set.spawn(async move { dispatch_agent(child, &child_ctx).await });
+    // Task id → (declaration index, child name), so a join failure still
+    // orders and names its child. Only the id is kept from each
+    // AbortHandle — nothing ever aborts a child task.
+    let mut names: HashMap<tokio::task::Id, (usize, String)> = HashMap::new();
+    for (index, child) in children.into_iter().enumerate() {
+        let name = child.name.clone();
+        let child_ctx = ctx.for_child();
+        let handle = join_set.spawn(async move { dispatch_agent(child, &child_ctx).await });
+        names.insert(handle.id(), (index, name));
     }
+
+    // Children finish in scheduler order — nondeterministic across runs and
+    // platforms. Each outcome therefore carries its declaration index
+    // through the drain and the composite is assembled in declaration
+    // order, so `Complete`, `PartialComplete`, `Error`, and the `Cancelled`
+    // partial response are identical regardless of which child won which
+    // await first.
+    let mut outcomes: Vec<(usize, String, AgentOutcome)> = Vec::with_capacity(child_count);
+    while let Some(result) = join_set.join_next_with_id().await {
+        let (id, outcome) = match result {
+            Ok(joined) => joined,
+            Err(join_err) => {
+                let (index, name) = names.remove(&join_err.id()).unwrap_or_default();
+                outcomes.push((
+                    index,
+                    name,
+                    AgentOutcome::Error {
+                        error: format!("task failed: {join_err}"),
+                    },
+                ));
+                continue;
+            }
+        };
+        let (index, name) = names.remove(&id).unwrap_or_default();
+        outcomes.push((index, name, outcome));
+    }
+    outcomes.sort_by_key(|(index, _, _)| *index);
 
     let mut responses = Vec::new();
     let mut errors = Vec::new();
-    while let Some(result) = join_set.join_next().await {
-        match result {
-            Ok(AgentOutcome::Complete { response }) => {
+    let mut cancelled = false;
+    for (_index, name, outcome) in outcomes {
+        match outcome {
+            AgentOutcome::Complete { response } => {
                 responses.push(response);
             }
-            Ok(outcome) => {
-                errors.push(format!("{outcome:?}"));
+            AgentOutcome::PartialComplete {
+                responses: child_responses,
+                errors: child_errors,
+            } => {
+                responses.extend(child_responses);
+                errors.extend(child_errors);
             }
-            Err(join_err) => {
-                errors.push(format!("Task panic: {join_err}"));
+            AgentOutcome::Cancelled { .. } => {
+                cancelled = true;
+            }
+            AgentOutcome::Error { error } => {
+                errors.push(format!("{name}: {error}"));
+            }
+            AgentOutcome::MaxIterationsReached => {
+                errors.push(format!("{name}: max iterations reached"));
+            }
+            other => {
+                errors.push(format!("{name}: {other:?}"));
             }
         }
     }
 
-    if !errors.is_empty() {
+    if cancelled {
+        return AgentOutcome::Cancelled {
+            partial_response: responses.join("\n"),
+        };
+    }
+    if errors.is_empty() {
+        AgentOutcome::Complete {
+            response: responses.join("\n"),
+        }
+    } else if responses.is_empty() {
         AgentOutcome::Error {
             error: errors.join("; "),
         }
     } else {
-        AgentOutcome::Complete {
-            response: responses.join("\n"),
-        }
+        AgentOutcome::PartialComplete { responses, errors }
     }
 }
 
@@ -208,6 +331,14 @@ const LOOP_DONE_SIGNAL: &str = "[LOOP_DONE]";
 ///
 /// Each iteration perceives cumulative experiences from all prior iterations
 /// via the shared substrate.
+///
+/// Cancellation (ADR-014): the run token is checked at the top of each
+/// iteration, beside the `[LOOP_DONE]` check — a cancelled token ends the loop
+/// as `Cancelled` carrying the last completed iteration's response (A16). A
+/// child returning `Cancelled` does the same. A child returning
+/// `PartialComplete` counts as progress (D3): its `responses`, joined by
+/// newline, are the iteration's response — including for the `[LOOP_DONE]`
+/// check. `Error` keeps returning immediately.
 async fn run_loop(
     child: AgentDefinition,
     max_iterations: usize,
@@ -223,26 +354,58 @@ async fn run_loop(
     }
 
     let mut last_outcome = AgentOutcome::MaxIterationsReached;
+    let mut last_response = String::new();
     for i in 0..max_iterations {
+        if ctx.cancel.is_cancelled() {
+            tracing::info!(iteration = i + 1, "Loop: cancelled at iteration top");
+            return AgentOutcome::Cancelled {
+                partial_response: last_response,
+            };
+        }
         tracing::info!(
             iteration = i + 1,
             max = max_iterations,
             "Loop: starting iteration"
         );
-        let outcome = dispatch_agent(child.clone(), ctx).await;
+        let outcome = dispatch_agent(child.clone(), &ctx.for_child()).await;
 
-        match &outcome {
-            AgentOutcome::Complete { response } if response.contains(LOOP_DONE_SIGNAL) => {
-                tracing::info!(iteration = i + 1, "Loop: completion signal received");
-                last_outcome = outcome;
-                break;
+        match outcome {
+            AgentOutcome::Complete { response } => {
+                let done = response.contains(LOOP_DONE_SIGNAL);
+                last_response = response.clone();
+                last_outcome = AgentOutcome::Complete { response };
+                if done {
+                    tracing::info!(iteration = i + 1, "Loop: completion signal received");
+                    break;
+                }
+            }
+            // D3: partial results are progress — the joined responses are the
+            // iteration's response, and the loop's outcome keeps the child's
+            // errors visible.
+            AgentOutcome::PartialComplete { responses, errors } => {
+                let joined = responses.join("\n");
+                let done = joined.contains(LOOP_DONE_SIGNAL);
+                last_response = joined;
+                last_outcome = AgentOutcome::PartialComplete { responses, errors };
+                if done {
+                    tracing::info!(iteration = i + 1, "Loop: completion signal received");
+                    break;
+                }
             }
             AgentOutcome::Error { .. } => {
                 tracing::warn!(iteration = i + 1, "Loop: child errored, stopping");
                 return outcome;
             }
-            _ => {
-                last_outcome = outcome;
+            AgentOutcome::Cancelled { .. } => {
+                tracing::info!(iteration = i + 1, "Loop: child cancelled, stopping");
+                return AgentOutcome::Cancelled {
+                    partial_response: last_response,
+                };
+            }
+            // MaxIterationsReached and any future variant keep today's
+            // behavior: recorded and looped through to the cap.
+            other => {
+                last_outcome = other;
             }
         }
     }
@@ -285,6 +448,7 @@ async fn run_llm_agent(
             event_emitter: ctx.event_emitter.clone(),
             max_iterations: DEFAULT_MAX_ITERATIONS,
             embedding_provider: ctx.embedding_provider.clone(),
+            cancel: ctx.cancel.clone(),
         },
     )
     .await
@@ -374,14 +538,19 @@ mod tests {
     }
 
     async fn test_workflow_ctx(provider: MockLlm) -> WorkflowContext {
+        let mut providers: HashMap<String, Arc<dyn LlmProvider>> = HashMap::new();
+        providers.insert("mock".into(), Arc::new(provider));
+        test_workflow_ctx_with_providers(providers).await
+    }
+
+    async fn test_workflow_ctx_with_providers(
+        providers: HashMap<String, Arc<dyn LlmProvider>>,
+    ) -> WorkflowContext {
         let substrate = test_substrate();
         let collective_id = substrate
             .get_or_create_collective("test-workflow")
             .await
             .unwrap();
-
-        let mut providers: HashMap<String, Arc<dyn LlmProvider>> = HashMap::new();
-        providers.insert("mock".into(), Arc::new(provider));
 
         WorkflowContext {
             task: Task::with_collective(
@@ -393,20 +562,73 @@ mod tests {
             approval_handler: Arc::new(pulsehive_core::approval::AutoApprove),
             event_emitter: EventBus::default(),
             embedding_provider: None,
+            cancel: CancellationToken::new(),
         }
     }
 
     fn llm_agent_def(name: &str) -> AgentDefinition {
+        llm_agent_def_on(name, "mock")
+    }
+
+    fn llm_agent_def_on(name: &str, provider: &str) -> AgentDefinition {
         AgentDefinition {
             name: name.into(),
             kind: AgentKind::Llm(Box::new(LlmAgentConfig {
                 system_prompt: "You are a test agent.".into(),
                 tools: vec![],
                 lens: Lens::default(),
-                llm_config: LlmConfig::new("mock", "test-model"),
+                llm_config: LlmConfig::new(provider, "test-model"),
                 experience_extractor: None,
                 refresh_every_n_tool_calls: None,
             })),
+        }
+    }
+
+    // ── Sequenced provider ────────────────────────────────────────────
+
+    /// A provider whose `chat` optionally waits on `wait_for` before
+    /// answering, then replies with `text` or fails with `error`. Parallel
+    /// ordering tests use the gate to fix which child finishes first — a
+    /// shared response queue lets scheduler timing pick the winner instead.
+    struct SequencedProvider {
+        wait_for: Option<Arc<tokio::sync::Notify>>,
+        text: Option<&'static str>,
+        error: Option<&'static str>,
+    }
+
+    #[async_trait]
+    impl LlmProvider for SequencedProvider {
+        async fn chat(
+            &self,
+            _messages: Vec<Message>,
+            _tools: Vec<ToolDefinition>,
+            _config: &LlmConfig,
+        ) -> pulsehive_core::error::Result<LlmResponse> {
+            if let Some(notify) = &self.wait_for {
+                notify.notified().await;
+            }
+            if let Some(error) = self.error {
+                Err(pulsehive_core::error::PulseHiveError::llm(error))
+            } else {
+                Ok(LlmResponse::text(self.text.unwrap_or_default()))
+            }
+        }
+
+        async fn chat_stream(
+            &self,
+            _messages: Vec<Message>,
+            _tools: Vec<ToolDefinition>,
+            _config: &LlmConfig,
+        ) -> pulsehive_core::error::Result<
+            std::pin::Pin<
+                Box<
+                    dyn futures_core::Stream<Item = pulsehive_core::error::Result<LlmChunk>> + Send,
+                >,
+            >,
+        > {
+            Err(pulsehive_core::error::PulseHiveError::llm(
+                "Streaming not used in tests",
+            ))
         }
     }
 
@@ -485,6 +707,67 @@ mod tests {
         assert!(
             matches!(&outcome, AgentOutcome::Error { error } if error.contains("nonexistent")),
             "Expected provider error, got: {outcome:?}"
+        );
+    }
+
+    /// r1.s2 round 2: an already-cancelled run — a pre-cancelled task or a
+    /// post-shutdown deploy — must observe cancellation before the empty
+    /// fast paths can return `Complete`/`MaxIterationsReached`. The check
+    /// lives at dispatch entry so every executor's early return honors it.
+    #[tokio::test]
+    async fn test_cancelled_dispatch_empty_sequential() {
+        let provider = MockLlm::new(vec![]);
+        let ctx = test_workflow_ctx(provider).await;
+        ctx.cancel.cancel();
+
+        let agent = AgentDefinition {
+            name: "seq-empty".into(),
+            kind: AgentKind::Sequential(vec![]),
+        };
+
+        let outcome = dispatch_agent(agent, &ctx).await;
+        assert!(
+            matches!(&outcome, AgentOutcome::Cancelled { partial_response } if partial_response.is_empty()),
+            "Cancelled dispatch of an empty Sequential must return Cancelled with empty partial, got: {outcome:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cancelled_dispatch_empty_parallel() {
+        let provider = MockLlm::new(vec![]);
+        let ctx = test_workflow_ctx(provider).await;
+        ctx.cancel.cancel();
+
+        let agent = AgentDefinition {
+            name: "par-empty".into(),
+            kind: AgentKind::Parallel(vec![]),
+        };
+
+        let outcome = dispatch_agent(agent, &ctx).await;
+        assert!(
+            matches!(&outcome, AgentOutcome::Cancelled { partial_response } if partial_response.is_empty()),
+            "Cancelled dispatch of an empty Parallel must return Cancelled with empty partial, got: {outcome:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cancelled_dispatch_zero_iteration_loop() {
+        let provider = MockLlm::new(vec![]);
+        let ctx = test_workflow_ctx(provider).await;
+        ctx.cancel.cancel();
+
+        let agent = AgentDefinition {
+            name: "loop-0".into(),
+            kind: AgentKind::Loop {
+                agent: Box::new(llm_agent_def("child")),
+                max_iterations: 0,
+            },
+        };
+
+        let outcome = dispatch_agent(agent, &ctx).await;
+        assert!(
+            matches!(&outcome, AgentOutcome::Cancelled { partial_response } if partial_response.is_empty()),
+            "Cancelled dispatch of a zero-iteration Loop must return Cancelled with empty partial, got: {outcome:?}"
         );
     }
 
@@ -599,23 +882,175 @@ mod tests {
 
     #[tokio::test]
     async fn test_parallel_one_error_reports_all() {
-        // Only one response — one child succeeds, other errors
-        let provider = MockLlm::new(vec![MockLlm::text_response("I succeeded")]);
-        let ctx = test_workflow_ctx(provider).await;
+        // Per-child providers keep the outcome deterministic: a shared
+        // response queue lets whichever child is scheduled first grab the
+        // one reply, so either name could land in `errors`. With its own
+        // provider, "will-error" always errors and "will-succeed" always
+        // gets the reply.
+        let mut providers: HashMap<String, Arc<dyn LlmProvider>> = HashMap::new();
+        providers.insert(
+            "mock".into(),
+            Arc::new(MockLlm::new(vec![MockLlm::text_response("I succeeded")])),
+        );
+        providers.insert("mock-fail".into(), Arc::new(MockLlm::new(vec![])));
+        let ctx = test_workflow_ctx_with_providers(providers).await;
 
         let agent = AgentDefinition {
             name: "par-err".into(),
             kind: AgentKind::Parallel(vec![
-                llm_agent_def("will-succeed"),
-                llm_agent_def("will-error"),
+                llm_agent_def_on("will-succeed", "mock"),
+                llm_agent_def_on("will-error", "mock-fail"),
             ]),
         };
 
         let outcome = dispatch_agent(agent, &ctx).await;
-        assert!(
-            matches!(&outcome, AgentOutcome::Error { .. }),
-            "Parallel with one error should return Error, got: {outcome:?}"
+        // #45: the survivor's response is kept and the failure names its child.
+        match &outcome {
+            AgentOutcome::PartialComplete { responses, errors } => {
+                assert_eq!(responses, &["I succeeded".to_string()]);
+                assert_eq!(errors.len(), 1);
+                assert!(errors[0].starts_with("will-error: "));
+            }
+            other => {
+                panic!("Parallel with one error should return PartialComplete, got: {other:?}")
+            }
+        }
+    }
+
+    /// Watches the event bus until `AgentCompleted` arrives for the child
+    /// named `name` (its `AgentStarted` supplies the agent_id), then fires
+    /// `gate`. Runs as the release half of a `tokio::join!` with the
+    /// dispatch under test.
+    async fn release_after_child_completes(
+        rx: &mut tokio::sync::broadcast::Receiver<HiveEvent>,
+        name: &str,
+        gate: Arc<tokio::sync::Notify>,
+    ) {
+        let mut watched_id: Option<String> = None;
+        loop {
+            match rx.recv().await {
+                Ok(HiveEvent::AgentStarted {
+                    agent_id,
+                    name: started,
+                    ..
+                }) if started == name => watched_id = Some(agent_id),
+                Ok(HiveEvent::AgentCompleted { agent_id, .. })
+                    if watched_id.as_ref() == Some(&agent_id) =>
+                {
+                    gate.notify_one();
+                    return;
+                }
+                Ok(_) => {}
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+            }
+        }
+    }
+
+    /// r1.s2 round 2 (Ubuntu CI flake): the parallel drain must assemble
+    /// the composite in declaration order, not completion order. `second`
+    /// finishes strictly before `first` — its provider answers instantly
+    /// while `first`'s is gated until `second`'s `AgentCompleted` — yet the
+    /// composite response must still join them as declared.
+    #[tokio::test]
+    async fn test_parallel_responses_follow_declaration_order() {
+        let first_gate = Arc::new(tokio::sync::Notify::new());
+        let mut providers: HashMap<String, Arc<dyn LlmProvider>> = HashMap::new();
+        providers.insert(
+            "gated".into(),
+            Arc::new(SequencedProvider {
+                wait_for: Some(first_gate.clone()),
+                text: Some("first response"),
+                error: None,
+            }),
         );
+        providers.insert(
+            "instant".into(),
+            Arc::new(SequencedProvider {
+                wait_for: None,
+                text: Some("second response"),
+                error: None,
+            }),
+        );
+        let ctx = test_workflow_ctx_with_providers(providers).await;
+        let mut rx = ctx.event_emitter.subscribe();
+
+        let agent = AgentDefinition {
+            name: "par-order".into(),
+            kind: AgentKind::Parallel(vec![
+                llm_agent_def_on("first", "gated"),
+                llm_agent_def_on("second", "instant"),
+            ]),
+        };
+
+        let (outcome, ()) = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            tokio::join!(
+                dispatch_agent(agent, &ctx),
+                release_after_child_completes(&mut rx, "second", first_gate),
+            )
+        })
+        .await
+        .expect("dispatch timed out waiting on the child-completion gate");
+
+        match &outcome {
+            AgentOutcome::Complete { response } => assert_eq!(
+                response, "first response\nsecond response",
+                "composite response must join children in declaration order"
+            ),
+            other => panic!("Expected Complete, got: {other:?}"),
+        }
+    }
+
+    /// Same ordering contract on the error path: both children fail and
+    /// `second` finishes first, but the joined error still names them in
+    /// declaration order.
+    #[tokio::test]
+    async fn test_parallel_errors_follow_declaration_order() {
+        let first_gate = Arc::new(tokio::sync::Notify::new());
+        let mut providers: HashMap<String, Arc<dyn LlmProvider>> = HashMap::new();
+        providers.insert(
+            "gated".into(),
+            Arc::new(SequencedProvider {
+                wait_for: Some(first_gate.clone()),
+                text: None,
+                error: Some("first exploded"),
+            }),
+        );
+        providers.insert(
+            "instant".into(),
+            Arc::new(SequencedProvider {
+                wait_for: None,
+                text: None,
+                error: Some("second exploded"),
+            }),
+        );
+        let ctx = test_workflow_ctx_with_providers(providers).await;
+        let mut rx = ctx.event_emitter.subscribe();
+
+        let agent = AgentDefinition {
+            name: "par-err-order".into(),
+            kind: AgentKind::Parallel(vec![
+                llm_agent_def_on("first", "gated"),
+                llm_agent_def_on("second", "instant"),
+            ]),
+        };
+
+        let (outcome, ()) = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            tokio::join!(
+                dispatch_agent(agent, &ctx),
+                release_after_child_completes(&mut rx, "second", first_gate),
+            )
+        })
+        .await
+        .expect("dispatch timed out waiting on the child-completion gate");
+
+        match &outcome {
+            AgentOutcome::Error { error } => assert_eq!(
+                error, "first: LLM error: first exploded; second: LLM error: second exploded",
+                "composite error must join children in declaration order"
+            ),
+            other => panic!("Expected Error, got: {other:?}"),
+        }
     }
 
     #[tokio::test]

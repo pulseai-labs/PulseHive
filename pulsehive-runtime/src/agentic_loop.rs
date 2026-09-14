@@ -4,22 +4,42 @@
 //! runs through: perceive substrate → think via LLM → act on tool calls → record experiences.
 //!
 //! The loop is driven by [`run_agentic_loop`], called from `HiveMind::deploy()`.
+//!
+//! ## Cancellation (ADR-014)
+//!
+//! [`LoopContext::cancel`] is the run's cancellation token. The loop checks it
+//! before every LLM call and before every tool call: a cancelled token ends
+//! the turn as [`AgentOutcome::Cancelled`] carrying the latest assistant text
+//! as `partial_response`, with no `LlmCallStarted` or `ToolCallStarted` for
+//! work that never began. Each provider call also carries a child of the run
+//! token on its `LlmConfig.cancel` — bridged to the agent's own
+//! `LlmConfig.cancel` when one is set, so either token aborts the in-flight
+//! request — and a provider `LlmTransport` error of kind `Cancelled` maps to
+//! the same outcome. Cancellation is cooperative: a tool already executing is
+//! always awaited, never force-aborted.
 
+use std::any::Any;
 use std::collections::HashMap;
+use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use futures::FutureExt;
 use pulsedb::SubstrateProvider;
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 
 use pulsehive_core::agent::{AgentOutcome, ExperienceExtractor, LlmAgentConfig};
 use pulsehive_core::approval::{ApprovalHandler, ApprovalResult, PendingAction};
+use pulsehive_core::error::PulseHiveError;
 use pulsehive_core::event::{EventEmitter, HiveEvent};
 use pulsehive_core::ids::CollectiveId;
 use pulsehive_core::lens::Lens;
-use pulsehive_core::llm::{LlmConfig, LlmProvider, Message, ToolCall, ToolDefinition};
-use pulsehive_core::tool::{Tool, ToolContext, ToolProgress, ToolResult};
+use pulsehive_core::llm::{
+    LlmConfig, LlmErrorKind, LlmProvider, Message, ToolCall, ToolDefinition,
+};
+use pulsehive_core::tool::{StreamingTool, Tool, ToolContext, ToolProgress, ToolResult};
 
 use crate::hivemind::Task;
 use crate::substrate_ids;
@@ -38,6 +58,13 @@ pub struct LoopContext<'a> {
     pub max_iterations: usize,
     /// Optional embedding provider for computing embeddings before storage.
     pub embedding_provider: Option<Arc<dyn pulsehive_core::embedding::EmbeddingProvider>>,
+    /// This run's cancellation token (ADR-014). `think_act_loop` checks it
+    /// before each LLM call and each tool call — a cancelled token ends the
+    /// turn as `AgentOutcome::Cancelled` with the latest assistant text as
+    /// `partial_response` — and each provider call carries a child token on
+    /// its `LlmConfig.cancel` so an in-flight request aborts. Each tool
+    /// invocation still receives its own child via `ToolContext.cancel`.
+    pub cancel: CancellationToken,
 }
 
 /// Run the agentic loop for a single LLM agent.
@@ -94,12 +121,56 @@ pub async fn run_agentic_loop(config: LlmAgentConfig, ctx: LoopContext<'_>) -> A
     )
     .await;
 
-    // 4. RECORD — extract experiences and store in substrate
-    record(&messages, &outcome, &ctx, experience_extractor.as_deref())
-        .instrument(tracing::info_span!("record", agent_id = %ctx.agent_id))
-        .await;
+    // 4. RECORD — extract experiences and store in substrate. A cancelled
+    // run records no experience: the extractor — default or custom — is
+    // never invoked, so a custom extractor (which receives no cancellation
+    // token) cannot start new work, e.g. its own LLM calls, after the run
+    // has already ended. An extraction underway for a non-cancelled
+    // outcome is awaited to completion — never aborted.
+    if !matches!(outcome, AgentOutcome::Cancelled { .. }) {
+        record(&messages, &outcome, &ctx, experience_extractor.as_deref())
+            .instrument(tracing::info_span!("record", agent_id = %ctx.agent_id))
+            .await;
+    }
 
     outcome
+}
+
+/// Aborts a caller-token bridge task on drop — the bridge must not outlive
+/// the provider call it serves, whichever path the call exits on (early
+/// return, error arm, or panic).
+struct CancelBridge(Option<tokio::task::JoinHandle<()>>);
+
+impl CancelBridge {
+    /// When the agent's `LlmConfig` carries its own `cancel` token, spawn the
+    /// task that cancels `call_token` when the caller's token fires, so EITHER
+    /// token aborts the in-flight call (ADR-014 A15 — the caller's token is
+    /// never dropped or replaced by the loop's). `None` when the config has no
+    /// caller token: nothing to bridge. A caller token that is ALREADY
+    /// cancelled cancels `call_token` synchronously instead — a spawned task
+    /// is only polled after the call is underway, so a fast provider would
+    /// inspect a still-live token and complete before the bridge ever ran.
+    fn spawn(caller: Option<CancellationToken>, call_token: CancellationToken) -> Self {
+        let Some(caller) = caller else {
+            return Self(None);
+        };
+        if caller.is_cancelled() {
+            call_token.cancel();
+            return Self(None);
+        }
+        Self(Some(tokio::spawn(async move {
+            caller.cancelled().await;
+            call_token.cancel();
+        })))
+    }
+}
+
+impl Drop for CancelBridge {
+    fn drop(&mut self) {
+        if let Some(handle) = self.0.take() {
+            handle.abort();
+        }
+    }
 }
 
 /// The core Think→Act loop. Returns when LLM produces a final response or max iterations hit.
@@ -119,8 +190,18 @@ async fn think_act_loop(
     refresh_every: Option<usize>,
 ) -> AgentOutcome {
     let mut tool_calls_since_refresh: usize = 0;
+    // Latest assistant text produced this turn — the `partial_response` a
+    // `Cancelled` outcome carries; empty until the provider produces any.
+    let mut partial_response = String::new();
 
     for iteration in 1..=ctx.max_iterations {
+        // Cancellation checkpoint (ADR-014): a cancelled run token ends the
+        // turn before the next LLM call — no `LlmCallStarted`, no request sent.
+        if ctx.cancel.is_cancelled() {
+            tracing::info!(agent_id = %agent_id, "Run cancelled before LLM call");
+            return AgentOutcome::Cancelled { partial_response };
+        }
+
         let think_span = tracing::info_span!(
             "think",
             agent_id = %agent_id,
@@ -137,10 +218,21 @@ async fn think_act_loop(
             message_count: messages.len(),
         });
 
+        // Per-call cancellation (ADR-014 A2): every provider call carries a
+        // child of the run token on its `LlmConfig`, so cancelling the run
+        // aborts the in-flight request. When the agent definition already
+        // carries its own `LlmConfig.cancel`, the bridge cancels the call
+        // token when the caller's fires — either token aborts the call (A15).
+        // The guard aborts the bridge task on every exit path.
+        let mut call_config = llm_config.clone();
+        let call_token = ctx.cancel.child_token();
+        let _cancel_bridge = CancelBridge::spawn(call_config.cancel.take(), call_token.clone());
+        call_config.cancel = Some(call_token);
+
         let start = Instant::now();
         let response = ctx
             .provider
-            .chat(messages.clone(), tool_defs.to_vec(), llm_config)
+            .chat(messages.clone(), tool_defs.to_vec(), &call_config)
             .instrument(think_span)
             .await;
         let duration_ms = start.elapsed().as_millis() as u64;
@@ -160,6 +252,14 @@ async fn think_act_loop(
 
         let response = match response {
             Ok(r) => r,
+            // A provider-side cancellation (ADR-011's `LlmTransport` with kind
+            // `Cancelled`) ends the turn as `Cancelled`, not `Error`. The call
+            // follows the existing provider-error event path — `LlmCallCompleted`
+            // was already emitted above exactly as for any other failure.
+            Err(PulseHiveError::LlmTransport(e)) if e.kind == LlmErrorKind::Cancelled => {
+                tracing::info!(agent_id = %agent_id, "Provider call cancelled");
+                return AgentOutcome::Cancelled { partial_response };
+            }
             Err(e) => {
                 tracing::error!(agent_id = %agent_id, error = %e, "LLM call failed");
                 return AgentOutcome::Error {
@@ -167,6 +267,16 @@ async fn think_act_loop(
                 };
             }
         };
+
+        // Track the latest assistant text — a later `Cancelled` carries it as
+        // `partial_response`. A `Some("")` (providers emit empty content
+        // beside tool calls) is not text: it must not erase the last real
+        // partial.
+        if let Some(text) = response.content.clone() {
+            if !text.is_empty() {
+                partial_response = text;
+            }
+        }
 
         // ── ACT: handle response ─────────────────────────────────────
         if response.tool_calls.is_empty() {
@@ -187,7 +297,20 @@ async fn think_act_loop(
         ));
 
         for tool_call in &response.tool_calls {
-            let result = execute_tool_call(
+            // Cancellation checkpoint (ADR-014 A7): a cancelled run token
+            // means no further tool call starts — no `ToolCallStarted`, no
+            // execute. A tool already running is awaited above, never
+            // force-aborted (A3).
+            if ctx.cancel.is_cancelled() {
+                tracing::info!(
+                    agent_id = %agent_id,
+                    tool = %tool_call.name,
+                    "Run cancelled before tool call"
+                );
+                return AgentOutcome::Cancelled { partial_response };
+            }
+
+            let result = match execute_tool_call(
                 agent_id,
                 tool_call,
                 tool_map,
@@ -195,9 +318,19 @@ async fn think_act_loop(
                 ctx.approval_handler,
                 &ctx.event_emitter,
                 &ctx.task.collective_id,
+                &ctx.cancel,
             )
             .instrument(tracing::info_span!("act", agent_id = %agent_id, tool = %tool_call.name))
-            .await;
+            .await
+            {
+                Ok(result) => result,
+                // Cancelled at the approval boundary: the tool body never
+                // ran, so no tool result is recorded — the turn ends as
+                // `Cancelled` with the turn's partial response.
+                Err(ApprovalCancelled) => {
+                    return AgentOutcome::Cancelled { partial_response };
+                }
+            };
 
             messages.push(Message::tool_result(&tool_call.id, result.to_content()));
             tool_calls_since_refresh += 1;
@@ -206,6 +339,17 @@ async fn think_act_loop(
         // ── MID-TASK REFRESH: re-perceive substrate if threshold reached ──
         if let Some(interval) = refresh_every {
             if tool_calls_since_refresh >= interval {
+                // Cancellation checkpoint before the refresh (ADR-014): a
+                // token that fired while the last tool was running must not
+                // start a `perceive` that a slow or hung custom substrate
+                // could hold open past the end of the run.
+                if ctx.cancel.is_cancelled() {
+                    tracing::info!(
+                        agent_id = %agent_id,
+                        "Run cancelled before mid-task refresh"
+                    );
+                    return AgentOutcome::Cancelled { partial_response };
+                }
                 tracing::info!(
                     agent_id = %agent_id,
                     tool_calls = tool_calls_since_refresh,
@@ -226,11 +370,27 @@ async fn think_act_loop(
         }
     }
 
+    // Cancellation checkpoint at the iteration cap (ADR-014): a token that
+    // fired during the final iteration's last tool call — or its mid-task
+    // refresh — ends the run as `Cancelled` with the turn's partial
+    // response, never `MaxIterationsReached`.
+    if ctx.cancel.is_cancelled() {
+        tracing::info!(agent_id = %agent_id, "Run cancelled at iteration cap");
+        return AgentOutcome::Cancelled { partial_response };
+    }
+
     tracing::warn!(agent_id = %agent_id, max = ctx.max_iterations, "Max iterations reached");
     AgentOutcome::MaxIterationsReached
 }
 
+/// Marker: the run token fired while the turn was awaiting an approval
+/// decision. The pending approval future was dropped and the tool body
+/// never started, so no tool result is recorded — the caller ends the
+/// turn as [`AgentOutcome::Cancelled`].
+struct ApprovalCancelled;
+
 /// Execute a single tool call with approval check.
+#[allow(clippy::too_many_arguments)]
 async fn execute_tool_call(
     agent_id: &str,
     tool_call: &ToolCall,
@@ -239,10 +399,14 @@ async fn execute_tool_call(
     approval_handler: &dyn ApprovalHandler,
     event_emitter: &EventEmitter,
     collective_id: &CollectiveId,
-) -> ToolResult {
+    cancel: &CancellationToken,
+) -> std::result::Result<ToolResult, ApprovalCancelled> {
     let Some(&tool) = tool_map.get(tool_call.name.as_str()) else {
         tracing::warn!(agent_id = %agent_id, tool = %tool_call.name, "Tool not found");
-        return ToolResult::error(format!("Tool '{}' not found", tool_call.name));
+        return Ok(ToolResult::error(format!(
+            "Tool '{}' not found",
+            tool_call.name
+        )));
     };
 
     // Check approval if required
@@ -261,14 +425,40 @@ async fn execute_tool_call(
             description: format!("Execute {} tool", tool_call.name),
         };
 
-        match approval_handler.request_approval(&action).await {
+        // Race the approval decision against the run token (ADR-014): a
+        // handler that stays pending — a human or webhook that never
+        // answers — must not hold the turn open forever. When the token
+        // wins, the pending approval future is dropped, no tool body
+        // starts, and the turn ends as `Cancelled` at the call site.
+        let decision = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return Err(ApprovalCancelled),
+            decision = approval_handler.request_approval(&action) => decision,
+        };
+
+        // Cancellation checkpoint on the approval boundary (ADR-014): the
+        // token may have fired in the same instant the decision resolved,
+        // and neither the `Approved` nor the `Modified` path may start the
+        // tool afterwards.
+        if cancel.is_cancelled() {
+            tracing::info!(
+                agent_id = %agent_id,
+                tool = %tool_call.name,
+                "Run cancelled while awaiting tool approval"
+            );
+            return Err(ApprovalCancelled);
+        }
+
+        match decision {
             Ok(ApprovalResult::Approved) => {} // proceed
             Ok(ApprovalResult::Denied { reason }) => {
-                return ToolResult::error(format!("Tool execution denied: {reason}"));
+                return Ok(ToolResult::error(format!(
+                    "Tool execution denied: {reason}"
+                )));
             }
             Ok(ApprovalResult::Modified { new_params }) => {
                 // Execute with modified params
-                return execute_tool_inner(
+                return Ok(execute_tool_inner(
                     agent_id,
                     &tool_call.name,
                     new_params,
@@ -276,16 +466,17 @@ async fn execute_tool_call(
                     substrate,
                     event_emitter,
                     collective_id,
+                    cancel,
                 )
-                .await;
+                .await);
             }
             Err(e) => {
-                return ToolResult::error(format!("Approval handler error: {e}"));
+                return Ok(ToolResult::error(format!("Approval handler error: {e}")));
             }
         }
     }
 
-    execute_tool_inner(
+    Ok(execute_tool_inner(
         agent_id,
         &tool_call.name,
         tool_call.arguments.clone(),
@@ -293,11 +484,26 @@ async fn execute_tool_call(
         substrate,
         event_emitter,
         collective_id,
+        cancel,
     )
-    .await
+    .await)
+}
+
+/// Renders a caught panic payload as a message: the `&'static str` /
+/// `String` payloads every `panic!` form produces, or a placeholder for
+/// anything else.
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = payload.downcast_ref::<&'static str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "non-string panic payload".to_string()
+    }
 }
 
 /// Execute a tool and emit events.
+#[allow(clippy::too_many_arguments)]
 async fn execute_tool_inner(
     agent_id: &str,
     tool_name: &str,
@@ -306,6 +512,7 @@ async fn execute_tool_inner(
     substrate: &Arc<dyn SubstrateProvider>,
     event_emitter: &EventEmitter,
     collective_id: &CollectiveId,
+    cancel: &CancellationToken,
 ) -> ToolResult {
     let params_str = serde_json::to_string(&params).unwrap_or_default();
     event_emitter.emit(HiveEvent::ToolCallStarted {
@@ -333,6 +540,8 @@ async fn execute_tool_inner(
         collective_id: *collective_id,
         substrate: Arc::clone(substrate),
         event_emitter: event_emitter.clone(),
+        // Each invocation gets a child of the run token (ADR-014).
+        cancel: cancel.child_token(),
     };
 
     // Dispatch on the streaming capability probe. Streaming tools get a bounded
@@ -340,80 +549,166 @@ async fn execute_tool_inner(
     // the `HiveEvent` stream; non-streaming tools take the existing path verbatim.
     let exec_result = match tool.as_streaming() {
         Some(streaming) => {
-            let (tx, mut rx) = mpsc::channel::<ToolProgress>(64);
-
-            // Forwarder: drain the tool's progress channel and re-emit each item
-            // as a `HiveEvent::ToolProgress`. Owns its own emitter clone + labels
-            // so it is `Send + 'static` for `tokio::spawn`.
-            let forwarder_emitter = event_emitter.clone();
-            let forwarder_agent = agent_id.to_string();
-            let forwarder_tool = tool_name.to_string();
-            let mut forwarder = tokio::spawn(async move {
-                while let Some(progress) = rx.recv().await {
-                    forwarder_emitter.emit(HiveEvent::ToolProgress {
-                        timestamp_ms: pulsehive_core::event::now_ms(),
-                        agent_id: forwarder_agent.clone(),
-                        tool_name: forwarder_tool.clone(),
-                        progress,
-                    });
-                }
-            });
-
-            // Run the streaming body. The `tx` we passed is the only sender clone;
-            // it drops when `execute_streaming` returns, closing the channel so the
-            // forwarder observes end-of-stream.
-            let result = streaming
-                .execute_streaming(params, &context, tx)
-                .instrument(tracing::debug_span!("tool_execute", tool = %tool_name))
-                .await;
-
-            // The tool has returned; drain the forwarder so every buffered progress
-            // event is emitted before the `Completed` bookend below. Under the normal
-            // contract (the sole `progress_tx` drops when `execute_streaming` returns)
-            // the channel closes and the forwarder finishes immediately. But
-            // `mpsc::Sender` is `Clone` and tools are third-party code: a tool that
-            // clones/leaks the sender into a background task would keep the channel
-            // open forever, so an unbounded `forwarder.await` here would hang the whole
-            // deployment (no `Completed` / `ToolCallCompleted` / next turn). Bound the
-            // wait: give the forwarder a short grace to drain, then stop it — a
-            // misbehaving tool must not wedge the agent. (Fuller hardening — scoped
-            // sender, backpressure contract, adversarial tests — tracked in the
-            // streaming-tool hardening follow-up.)
-            const FORWARDER_DRAIN_GRACE: Duration = Duration::from_secs(5);
-            if tokio::time::timeout(FORWARDER_DRAIN_GRACE, &mut forwarder)
-                .await
-                .is_err()
-            {
-                tracing::warn!(
-                    tool = %tool_name,
-                    "streaming tool left a progress sender open after returning; \
-                     stopping the progress forwarder after the drain grace period"
-                );
-                forwarder.abort();
-            }
-            result
+            execute_streaming_body(
+                agent_id,
+                tool_name,
+                params,
+                streaming,
+                &context,
+                event_emitter,
+            )
+            .await
         }
         None => {
-            tool.execute(params, &context)
-                .instrument(tracing::debug_span!("tool_execute", tool = %tool_name))
-                .await
+            AssertUnwindSafe(
+                tool.execute(params, &context)
+                    .instrument(tracing::debug_span!("tool_execute", tool = %tool_name)),
+            )
+            .catch_unwind()
+            .await
         }
     };
 
-    let result = match exec_result {
-        Ok(result) => result,
-        Err(e) => {
+    let result = normalize_tool_result(tool_name, exec_result);
+    emit_tool_completion(agent_id, tool_name, start, &result, event_emitter);
+    result
+}
+
+/// Normalizes a caught tool-execution result into a `ToolResult`. A panicked
+/// tool becomes an ordinary tool error carrying the panic message (ADR-007:
+/// fail loudly, never silently) — bookends and `ToolCallCompleted` are then
+/// emitted exactly as for any other failure, and the turn continues.
+fn normalize_tool_result(
+    tool_name: &str,
+    exec_result: Result<Result<ToolResult, PulseHiveError>, Box<dyn Any + Send>>,
+) -> ToolResult {
+    match exec_result {
+        Ok(Ok(result)) => result,
+        Ok(Err(e)) => {
             tracing::warn!(tool = %tool_name, error = %e, "Tool execution failed");
             ToolResult::error(e.to_string())
         }
-    };
+        Err(payload) => {
+            let message = panic_message(payload.as_ref());
+            tracing::error!(tool = %tool_name, panic = %message, "Tool panicked");
+            ToolResult::error(format!("tool '{tool_name}' panicked: {message}"))
+        }
+    }
+}
 
+/// Spawns the progress forwarder for a streaming tool call: drains the tool's
+/// progress channel and re-emits each item as a `HiveEvent::ToolProgress`.
+/// The `Started`/`Completed` bookends are the loop's alone — a tool that
+/// sends them anyway gets them dropped (with a warning) so the call keeps
+/// exactly one runtime-emitted pair instead of duplicates.
+fn spawn_progress_forwarder(
+    agent_id: &str,
+    tool_name: &str,
+    event_emitter: &EventEmitter,
+    mut rx: mpsc::Receiver<ToolProgress>,
+) -> tokio::task::JoinHandle<()> {
+    // Owns its own emitter clone + labels so it is `Send + 'static` for
+    // `tokio::spawn`.
+    let forwarder_emitter = event_emitter.clone();
+    let forwarder_agent = agent_id.to_string();
+    let forwarder_tool = tool_name.to_string();
+    tokio::spawn(async move {
+        while let Some(progress) = rx.recv().await {
+            if matches!(
+                progress,
+                ToolProgress::Started { .. } | ToolProgress::Completed { .. }
+            ) {
+                tracing::warn!(
+                    tool = %forwarder_tool,
+                    "dropping tool-sent progress bookend; Started/Completed are emitted by the loop"
+                );
+                continue;
+            }
+            forwarder_emitter.emit(HiveEvent::ToolProgress {
+                timestamp_ms: pulsehive_core::event::now_ms(),
+                agent_id: forwarder_agent.clone(),
+                tool_name: forwarder_tool.clone(),
+                progress,
+            });
+        }
+    })
+}
+
+/// Runs a streaming tool's body under a panic guard with its progress
+/// forwarder: opens the 64-event channel, spawns the bookend-filtering
+/// forwarder, awaits `execute_streaming` under `catch_unwind`, then drains
+/// the forwarder under a bounded grace. The outer `Err` carries the caught
+/// panic payload; `Ok` carries the tool's own `Result`.
+async fn execute_streaming_body(
+    agent_id: &str,
+    tool_name: &str,
+    params: serde_json::Value,
+    streaming: &dyn StreamingTool,
+    context: &ToolContext,
+    event_emitter: &EventEmitter,
+) -> Result<Result<ToolResult, PulseHiveError>, Box<dyn Any + Send>> {
+    let (tx, rx) = mpsc::channel::<ToolProgress>(64);
+    let mut forwarder = spawn_progress_forwarder(agent_id, tool_name, event_emitter, rx);
+
+    // Run the streaming body. The `tx` we passed is the only sender clone;
+    // it drops when `execute_streaming` returns, closing the channel so the
+    // forwarder observes end-of-stream. A panic in the tool body is caught
+    // (not propagated): unwinding would kill the spawned agent task and
+    // the stream would go silent with no bookends or ToolCallCompleted.
+    // On panic the future — and with it `tx` — is dropped, so the
+    // forwarder still observes end-of-stream and drains normally.
+    let result = AssertUnwindSafe(
+        streaming
+            .execute_streaming(params, context, tx)
+            .instrument(tracing::debug_span!("tool_execute", tool = %tool_name)),
+    )
+    .catch_unwind()
+    .await;
+
+    // The tool has returned; drain the forwarder so every buffered progress
+    // event is emitted before the `Completed` bookend. Under the normal
+    // contract (the sole `progress_tx` drops when `execute_streaming` returns)
+    // the channel closes and the forwarder finishes immediately. But
+    // `mpsc::Sender` is `Clone` and tools are third-party code: a tool that
+    // clones/leaks the sender into a background task would keep the channel
+    // open forever, so an unbounded `forwarder.await` here would hang the whole
+    // deployment (no `Completed` / `ToolCallCompleted` / next turn). Bound the
+    // wait: give the forwarder a short grace to drain, then stop it — a
+    // misbehaving tool must not wedge the agent. (Fuller hardening — scoped
+    // sender, backpressure contract, adversarial tests — tracked in the
+    // streaming-tool hardening follow-up.)
+    const FORWARDER_DRAIN_GRACE: Duration = Duration::from_secs(5);
+    if tokio::time::timeout(FORWARDER_DRAIN_GRACE, &mut forwarder)
+        .await
+        .is_err()
+    {
+        tracing::warn!(
+            tool = %tool_name,
+            "streaming tool left a progress sender open after returning; \
+             stopping the progress forwarder after the drain grace period"
+        );
+        forwarder.abort();
+        // `abort()` only requests the stop — on a multi-thread runtime the
+        // forwarder can still be mid-emit. Await the handle so no progress
+        // event can land after the `Completed` bookend emitted next.
+        let _ = forwarder.await;
+    }
+    result
+}
+
+/// Emits the loop-generated `Completed` bookend and `ToolCallCompleted` for a
+/// finished call, reusing the same `start.elapsed()` measurement so the two
+/// events' `duration_ms` match.
+fn emit_tool_completion(
+    agent_id: &str,
+    tool_name: &str,
+    start: Instant,
+    result: &ToolResult,
+    event_emitter: &EventEmitter,
+) {
     let duration_ms = start.elapsed().as_millis() as u64;
     tracing::debug!(tool = %tool_name, duration_ms, "Tool completed");
 
-    // Loop-generated `Completed` bookend — emitted right before `ToolCallCompleted`,
-    // reusing the same `start.elapsed()` measurement so it matches
-    // `ToolCallCompleted.duration_ms`.
     event_emitter.emit(HiveEvent::ToolProgress {
         timestamp_ms: pulsehive_core::event::now_ms(),
         agent_id: agent_id.to_string(),
@@ -429,8 +724,6 @@ async fn execute_tool_inner(
         duration_ms,
         result_preview,
     });
-
-    result
 }
 
 // ── Perceive Phase ───────────────────────────────────────────────────
@@ -665,10 +958,7 @@ mod tests {
     }
 
     fn test_task() -> Task {
-        Task {
-            description: "Test task".into(),
-            collective_id: CollectiveId::new(),
-        }
+        Task::new("Test task")
     }
 
     fn test_substrate() -> Arc<dyn SubstrateProvider> {
@@ -706,6 +996,7 @@ mod tests {
                 event_emitter: emitter,
                 max_iterations: DEFAULT_MAX_ITERATIONS,
                 embedding_provider: None,
+                cancel: CancellationToken::new(),
             },
         )
         .await;
@@ -738,6 +1029,7 @@ mod tests {
                 event_emitter: emitter,
                 max_iterations: DEFAULT_MAX_ITERATIONS,
                 embedding_provider: None,
+                cancel: CancellationToken::new(),
             },
         )
         .await;
@@ -778,6 +1070,7 @@ mod tests {
                 event_emitter: emitter,
                 max_iterations: 3, // Only 3 iterations
                 embedding_provider: None,
+                cancel: CancellationToken::new(),
             },
         )
         .await;
@@ -809,6 +1102,7 @@ mod tests {
                 event_emitter: emitter,
                 max_iterations: DEFAULT_MAX_ITERATIONS,
                 embedding_provider: None,
+                cancel: CancellationToken::new(),
             },
         )
         .await;
@@ -838,6 +1132,7 @@ mod tests {
                 event_emitter: emitter,
                 max_iterations: DEFAULT_MAX_ITERATIONS,
                 embedding_provider: None,
+                cancel: CancellationToken::new(),
             },
         )
         .await;
@@ -869,6 +1164,7 @@ mod tests {
                 event_emitter: emitter,
                 max_iterations: DEFAULT_MAX_ITERATIONS,
                 embedding_provider: None,
+                cancel: CancellationToken::new(),
             },
         )
         .await;
@@ -934,6 +1230,7 @@ mod tests {
                 event_emitter: emitter,
                 max_iterations: DEFAULT_MAX_ITERATIONS,
                 embedding_provider: None,
+                cancel: CancellationToken::new(),
             },
         )
         .await;
@@ -979,6 +1276,7 @@ mod tests {
                 event_emitter: emitter,
                 max_iterations: DEFAULT_MAX_ITERATIONS,
                 embedding_provider: None,
+                cancel: CancellationToken::new(),
             },
         )
         .await;
@@ -1023,6 +1321,7 @@ mod tests {
                 event_emitter: emitter,
                 max_iterations: DEFAULT_MAX_ITERATIONS,
                 embedding_provider: None,
+                cancel: CancellationToken::new(),
             },
         )
         .await;
@@ -1152,6 +1451,7 @@ mod tests {
                 event_emitter: emitter,
                 max_iterations: DEFAULT_MAX_ITERATIONS,
                 embedding_provider: None,
+                cancel: CancellationToken::new(),
             },
         )
         .await;

@@ -201,10 +201,12 @@ impl PyAgentDefinition {
 
 // ── AgentOutcome ─────────────────────────────────────────────────────
 
-/// Result of agent execution — complete, error, or max iterations reached.
+/// Result of agent execution — complete, error, cancelled, partial, or
+/// max iterations reached.
 ///
 /// Properties:
-///     kind: "complete", "error", or "max_iterations_reached"
+///     kind: "complete", "error", "cancelled", "partial_complete",
+///         "max_iterations_reached", or "unknown" (future variants)
 ///     response: Agent's final response (only for "complete")
 ///     error: Error description (only for "error")
 #[pyclass(name = "AgentOutcome", frozen, from_py_object)]
@@ -215,13 +217,17 @@ pub struct PyAgentOutcome {
 
 #[pymethods]
 impl PyAgentOutcome {
-    /// Outcome kind: "complete", "error", or "max_iterations_reached".
+    /// Outcome kind: "complete", "error", "cancelled", "partial_complete",
+    /// or "max_iterations_reached".
     #[getter]
     fn kind(&self) -> &str {
         match &self.inner {
             AgentOutcome::Complete { .. } => "complete",
             AgentOutcome::Error { .. } => "error",
             AgentOutcome::MaxIterationsReached => "max_iterations_reached",
+            AgentOutcome::Cancelled { .. } => "cancelled",
+            AgentOutcome::PartialComplete { .. } => "partial_complete",
+            _ => "unknown",
         }
     }
 
@@ -254,6 +260,20 @@ impl PyAgentOutcome {
             AgentOutcome::MaxIterationsReached => {
                 "AgentOutcome(max_iterations_reached)".to_string()
             }
+            AgentOutcome::Cancelled { partial_response } => {
+                format!(
+                    "AgentOutcome(cancelled, '{}')",
+                    truncate(partial_response, 60)
+                )
+            }
+            AgentOutcome::PartialComplete { responses, errors } => {
+                format!(
+                    "AgentOutcome(partial_complete, {} responses, {} errors)",
+                    responses.len(),
+                    errors.len()
+                )
+            }
+            _ => "AgentOutcome(unknown)".to_string(),
         }
     }
 }
@@ -268,7 +288,9 @@ fn truncate(s: &str, max: usize) -> String {
     if s.len() <= max {
         s.to_string()
     } else {
-        format!("{}...", &s[..max])
+        // Cut on a UTF-8 character boundary — `&s[..max]` panics when
+        // `max` lands inside a multibyte character.
+        format!("{}...", crate::events::truncate_chars(s, max))
     }
 }
 
@@ -278,4 +300,22 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyAgentDefinition>()?;
     m.add_class::<PyAgentOutcome>()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// r1.s2 review: a cancelled response whose byte 60 lands inside a
+    /// multibyte character must not panic `__repr__` — the preview cuts
+    /// on a UTF-8 boundary.
+    #[test]
+    fn cancelled_repr_truncates_on_char_boundary() {
+        // 59 ASCII bytes then four-byte emoji: byte 60 is mid-character.
+        let partial_response = format!("{}{}", "x".repeat(59), "😀".repeat(4));
+        let outcome = PyAgentOutcome::from(AgentOutcome::Cancelled { partial_response });
+        let rendered = outcome.__repr__();
+        assert!(rendered.starts_with("AgentOutcome(cancelled, '"));
+        assert!(rendered.ends_with("...')"));
+    }
 }
