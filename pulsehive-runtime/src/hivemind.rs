@@ -126,6 +126,11 @@ pub struct HiveMind {
     pub(crate) embedding_provider: Option<Arc<dyn EmbeddingProvider>>,
     /// Shutdown signal for background tasks (Watch system).
     shutdown: Arc<AtomicBool>,
+    /// Internal root cancellation token (ADR-014 D1). Every run spawned by
+    /// `spawn_agent` is linked to it, so `shutdown()` and `Drop` cancel all
+    /// running agents. One-shot: once it fires it stays cancelled, and runs
+    /// deployed afterwards start cancelled.
+    cancel_root: CancellationToken,
     /// Handles to the per-deployment Watch background tasks, pruned of
     /// completed entries on each deploy and aborted together on
     /// shutdown/drop.
@@ -474,11 +479,20 @@ impl HiveMind {
         Ok(substrate_ids::from_db_experience_id(id))
     }
 
-    /// Signal shutdown to all background tasks (Watch system).
+    /// Signal shutdown to all background tasks and running agents.
     ///
-    /// Sets the shutdown flag, causing the Watch background tasks to stop
-    /// after processing their current event. This is non-blocking.
+    /// Cancels the internal root token (ADR-014): every running agent stops
+    /// at its next cancellation checkpoint or in-flight provider call and
+    /// ends `AgentOutcome::Cancelled`. Also sets the shutdown flag, causing
+    /// the Watch background tasks to stop after processing their current
+    /// event. This is non-blocking.
+    ///
+    /// The HiveMind is terminal after `shutdown()`: the root token is
+    /// one-shot, so agents deployed afterwards start cancelled and end at
+    /// their first checkpoint — there is deliberately no `abort_handle()`
+    /// or restart path.
     pub fn shutdown(&self) {
+        self.cancel_root.cancel();
         self.shutdown.store(true, Ordering::Relaxed);
         // Abort the Watch background tasks so they drop their EventBus sender
         // clones, allowing the broadcast channel to close and BroadcastStream
@@ -543,17 +557,35 @@ impl HiveMind {
             approval_handler: Arc::clone(&self.approval_handler),
             event_emitter: self.event_bus.clone(),
             embedding_provider: self.embedding_provider.clone(),
-            cancel: run_token,
+            cancel: run_token.clone(),
         };
 
+        // Link the run token to the HiveMind root (ADR-014 A20): when the
+        // root fires — `shutdown()` or `Drop` — the run token is cancelled
+        // and the dispatch is still driven to completion so the run emits
+        // its `AgentCompleted { outcome: Cancelled }`. The fan-in lives
+        // inside the run task itself; no watcher task outlives the run.
+        let root = self.cancel_root.clone();
         tokio::spawn(async move {
-            workflow::dispatch_agent(agent, &ctx).await;
+            let dispatch = workflow::dispatch_agent(agent, &ctx);
+            tokio::pin!(dispatch);
+            tokio::select! {
+                _ = root.cancelled() => {
+                    run_token.cancel();
+                    dispatch.await;
+                }
+                _ = &mut dispatch => {}
+            }
         })
     }
 }
 
 impl Drop for HiveMind {
+    /// Cancels the root token so running agents end `Cancelled` at their
+    /// next checkpoint — a dropped HiveMind stops its runs rather than
+    /// leaving them detached — then aborts the Watch background tasks.
     fn drop(&mut self) {
+        self.cancel_root.cancel();
         self.shutdown.store(true, Ordering::Relaxed);
         for handle in self.watch_handles.get_mut().unwrap().drain(..) {
             handle.abort();
@@ -746,6 +778,7 @@ impl HiveMindBuilder {
             insight_synthesizer,
             embedding_provider: self.embedding_provider,
             shutdown: Arc::new(AtomicBool::new(false)),
+            cancel_root: CancellationToken::new(),
             watch_handles: std::sync::Mutex::new(Vec::new()),
         })
     }

@@ -444,8 +444,17 @@ impl HiveMind {
         task: &Task,
         budget: ContextBudget,
     ) -> Result<AgentContext, PulseHiveError>;
+
+    /// Cancel all running agents and signal shutdown to background tasks.
+    /// Non-blocking; see §5.5.
+    pub fn shutdown(&self);
+
+    /// True once shutdown() (or Drop) has run.
+    pub fn is_shutdown(&self) -> bool;
 }
 ```
+
+`shutdown()` cancels the HiveMind's internal root token, so every running agent stops at its next checkpoint or in-flight provider call and ends `AgentOutcome::Cancelled`; `Drop` does the same. A HiveMind is terminal after `shutdown()` — agents deployed afterwards start cancelled, and there is no `abort_handle()`.
 
 ### 3.2 HiveMindBuilder
 
@@ -598,12 +607,17 @@ A unit of work for an agent:
 pub struct Task {
     pub description: String,
     pub collective_id: CollectiveId,
-    pub metadata: Option<serde_json::Value>,
+    // caller-owned cancellation token (private; set via with_cancel)
 }
 
 impl Task {
     pub fn new(description: &str) -> Self;
     pub fn with_collective(description: &str, collective: CollectiveId) -> Self;
+    /// Attach the caller's cancellation token; every run spawned for the
+    /// task observes a child of it. See §5.5.
+    pub fn with_cancel(self, token: CancellationToken) -> Self;
+    /// The token attached by with_cancel, if any.
+    pub fn cancel_token(&self) -> Option<&CancellationToken>;
 }
 ```
 
@@ -636,10 +650,15 @@ pub struct ToolContext {
     pub collective_id: CollectiveId,
     pub substrate: Arc<dyn SubstrateProvider>,
     pub event_emitter: EventEmitter,
+    /// This invocation's cooperative cancellation signal — a child of the
+    /// run's token (see §5.5).
+    pub cancel: CancellationToken,
 }
 ```
 
 Tools can use `substrate` to query or write experiences directly. This enables tools that interact with the shared consciousness (e.g., a "recall" tool that searches substrate on behalf of the agent).
+
+`cancel` fires when the run is cancelled — by the task's token or by `shutdown()`/`Drop`. A long-running tool polls `cancel.is_cancelled()` at safe points or awaits `cancel.cancelled()` and returns its partial results; a tool that never checks it simply runs to completion.
 
 ### 3.10 ToolResult
 
@@ -924,24 +943,30 @@ Whether a kind is worth retrying is provider policy, not part of this contract.
 ### 4.5 AgentOutcome
 
 ```rust
+#[non_exhaustive]
 pub enum AgentOutcome {
-    /// Agent completed successfully.
-    Success {
-        response: String,
-        experiences_recorded: usize,
-    },
+    /// Agent completed successfully with a final response.
+    Complete { response: String },
 
-    /// Agent failed.
-    Failure {
-        error: PulseHiveError,
-    },
+    /// Agent encountered an error.
+    Error { error: String },
 
-    /// Agent was cancelled (e.g., by approval denial or timeout).
-    Cancelled {
-        reason: String,
-    },
+    /// Agent hit the maximum iteration limit without completing.
+    MaxIterationsReached,
+
+    /// The caller cancelled the run (see §5.5). `partial_response` carries
+    /// the latest assistant text produced before the cancel point — empty
+    /// if the turn ended before any.
+    Cancelled { partial_response: String },
+
+    /// A composite agent finished with only some children succeeding:
+    /// `responses` collects the completed children's responses in finish
+    /// order and `errors` describes each child that did not contribute one.
+    PartialComplete { responses: Vec<String>, errors: Vec<String> },
 }
 ```
+
+`AgentOutcome` is `#[non_exhaustive]` — every `match` needs a wildcard arm; new variants land additively in minor releases. It serializes through the tagged `status` field (`"complete"`, `"error"`, `"max_iterations_reached"`, `"cancelled"`, `"partial_complete"`).
 
 ---
 
@@ -1045,6 +1070,33 @@ for ranked in &context.experiences {
     println!("{:.2} | {}", ranked.relevance_score, ranked.experience.content);
 }
 ```
+
+### 5.5 Cancellation
+
+Cancellation is cooperative and task-scoped (ADR-014). The caller owns a `tokio_util::sync::CancellationToken`, attaches it to a task with `Task::with_cancel(token)`, and cancelling it stops that task's runs only — sibling tasks on the same HiveMind are unaffected, and a later task runs normally.
+
+```rust
+let token = CancellationToken::new();
+let task = Task::new("long running analysis").with_cancel(token.clone());
+let mut stream = hive.deploy(vec![agent], vec![task]).await?;
+
+token.cancel(); // e.g. from a Ctrl-C handler or a UI stop button
+
+while let Some(event) = stream.next().await {
+    if let HiveEvent::AgentCompleted { outcome, .. } = event {
+        // outcome == AgentOutcome::Cancelled { partial_response }
+    }
+}
+```
+
+What a cancelled run does:
+
+- The agent loop checks the run token **before every LLM call and before every tool call** — a cancelled token ends the turn as `AgentOutcome::Cancelled { partial_response }` with the latest assistant text, and no `LlmCallStarted`/`ToolCallStarted` is emitted for work that never began.
+- Each provider call carries a child of the run token on `LlmConfig.cancel`, so an **in-flight provider request aborts mid-flight** (the provider returns a `Cancelled` transport error the loop maps to `AgentOutcome::Cancelled`). An agent definition's own `LlmConfig.cancel` is honored alongside the run token — either token aborts the call.
+- A **tool already executing is awaited, never force-aborted**. Its `ToolContext.cancel` fires so a cooperative tool can wind down and return partial results, which still reach `ToolCallCompleted`.
+- **Workflow agents** pass a child of the run token to every dispatched child, so cancelling the task cancels the whole tree. Sequential and Loop workflows treat a child's `PartialComplete` as progress and continue; a `Cancelled` child ends the workflow as `Cancelled`.
+
+HiveMind-level cancellation: `shutdown()` and `Drop` cancel an internal root token every run is linked to, stopping all running agents — `shutdown() cancels running agents` — in addition to ending the Watch background tasks. The HiveMind is terminal after `shutdown()`: the root token is one-shot, so agents deployed afterwards start cancelled and end at their first checkpoint. There is deliberately **no `HiveMind::abort_handle()` and no `CancellableTool` trait** — `deploy()`/`redeploy()` signatures are unchanged.
 
 ---
 
