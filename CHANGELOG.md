@@ -5,7 +5,7 @@ All notable changes to PulseHive will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [2.1.0] - Unreleased
+## [3.0.0] - 2026-09-14
 
 ### Fixed
 - **pulsehive-runtime**: `AgentKind::Parallel` no longer discards surviving children when a sibling fails (#45) — a partly failed Parallel now returns `AgentOutcome::PartialComplete` to keep the responses of children that completed alongside one error per failed child, each prefixed with the child's name (`<agent>: <error>`, `<agent>: max iterations reached`, `<agent>: task failed: <reason>`); a nested `PartialComplete` flattens into its parent, and an enclosing `Sequential` or `Loop` treats it as progress and continues.
