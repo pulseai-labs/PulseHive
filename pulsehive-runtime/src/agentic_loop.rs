@@ -368,7 +368,25 @@ async fn execute_tool_call(
             description: format!("Execute {} tool", tool_call.name),
         };
 
-        match approval_handler.request_approval(&action).await {
+        let decision = approval_handler.request_approval(&action).await;
+
+        // Cancellation checkpoint on the approval boundary (ADR-014): the
+        // approval await can outlive the run — the token may have fired
+        // while the handler was deciding, and neither the `Approved` nor
+        // the `Modified` path may start the tool afterwards.
+        if cancel.is_cancelled() {
+            tracing::info!(
+                agent_id = %agent_id,
+                tool = %tool_call.name,
+                "Run cancelled while awaiting tool approval"
+            );
+            return ToolResult::error(format!(
+                "Tool '{}' not executed: run cancelled while awaiting approval",
+                tool_call.name
+            ));
+        }
+
+        match decision {
             Ok(ApprovalResult::Approved) => {} // proceed
             Ok(ApprovalResult::Denied { reason }) => {
                 return ToolResult::error(format!("Tool execution denied: {reason}"));

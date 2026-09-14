@@ -17,6 +17,7 @@ use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
 use pulsehive_core::agent::{AgentDefinition, AgentKind, AgentOutcome, LlmAgentConfig};
+use pulsehive_core::approval::{ApprovalHandler, ApprovalResult, PendingAction};
 use pulsehive_core::error::Result;
 use pulsehive_core::event::HiveEvent;
 use pulsehive_core::lens::Lens;
@@ -154,6 +155,81 @@ impl Tool for SpyTool {
         self.executed.store(true, Ordering::SeqCst);
         Ok(ToolResult::text(format!("{} ran", self.tool_name)))
     }
+}
+
+/// A tool that requires approval and records whether its body ever ran —
+/// the probe for the approval-boundary cancellation check.
+struct ApprovalTool {
+    tool_name: &'static str,
+    executed: Arc<AtomicBool>,
+}
+
+#[async_trait]
+impl Tool for ApprovalTool {
+    fn name(&self) -> &str {
+        self.tool_name
+    }
+
+    fn description(&self) -> &str {
+        "Requires approval; records that it executed"
+    }
+
+    fn parameters(&self) -> Value {
+        json!({"type": "object"})
+    }
+
+    fn requires_approval(&self) -> bool {
+        true
+    }
+
+    async fn execute(&self, _params: Value, _ctx: &ToolContext) -> Result<ToolResult> {
+        self.executed.store(true, Ordering::SeqCst);
+        Ok(ToolResult::text(format!("{} ran", self.tool_name)))
+    }
+}
+
+/// An approval handler that blocks until the test releases it, then returns
+/// the scripted decision — the probe for "cancelled while awaiting approval".
+struct GateApproval {
+    release: Arc<Notify>,
+    result: ApprovalResult,
+}
+
+#[async_trait]
+impl ApprovalHandler for GateApproval {
+    async fn request_approval(&self, _action: &PendingAction) -> Result<ApprovalResult> {
+        self.release.notified().await;
+        Ok(self.result.clone())
+    }
+}
+
+/// Drains the deploy stream until `AgentCompleted`; on the first
+/// `ToolApprovalRequested` it cancels `token` and releases the gated
+/// approval handler — the cancel lands while `request_approval` is awaited.
+async fn drain_cancelling_at_approval(
+    mut stream: Pin<Box<dyn Stream<Item = HiveEvent> + Send>>,
+    token: CancellationToken,
+    release: Arc<Notify>,
+) -> Vec<HiveEvent> {
+    tokio::time::timeout(BOUND, async move {
+        let mut seen = Vec::new();
+        let mut fired = false;
+        while let Some(event) = stream.next().await {
+            if matches!(event, HiveEvent::ToolApprovalRequested { .. }) && !fired {
+                token.cancel();
+                release.notify_one();
+                fired = true;
+            }
+            let done = matches!(event, HiveEvent::AgentCompleted { .. });
+            seen.push(event);
+            if done {
+                break;
+            }
+        }
+        seen
+    })
+    .await
+    .expect("drain timed out before AgentCompleted")
 }
 
 /// The outcome of the first `AgentCompleted` in a drained event set.
@@ -460,5 +536,112 @@ async fn uncancelled_turn_is_unchanged() {
         kinds(&with_token),
         kinds(&without_token),
         "event sequence differs between token-carrying and tokenless runs"
+    );
+}
+
+/// r1.s2 review (approval boundary): a run cancelled while
+/// `request_approval` is awaited must not let an `Approved` decision start
+/// the tool — no `ToolCallStarted`, no tool body.
+#[tokio::test]
+async fn cancel_during_approval_blocks_approved_tool() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let executed = Arc::new(AtomicBool::new(false));
+    let release = Arc::new(Notify::new());
+
+    let provider = ScriptedProvider::new().then_tool_call("guarded", json!({}));
+    let hive = HiveMind::builder()
+        .substrate_path(dir.path().join("cancel-loop.db"))
+        .llm_provider("scripted", provider)
+        .approval_handler(GateApproval {
+            release: release.clone(),
+            result: ApprovalResult::Approved,
+        })
+        .no_insight_synthesizer()
+        .build()
+        .expect("build HiveMind");
+    let agent = scripted_agent(
+        vec![Arc::new(ApprovalTool {
+            tool_name: "guarded",
+            executed: executed.clone(),
+        })],
+        LlmConfig::new("scripted", "test-model"),
+    );
+
+    let token = CancellationToken::new();
+    let task = Task::new("approved but cancelled").with_cancel(token.clone());
+    let stream = hive
+        .deploy(vec![agent], vec![task])
+        .await
+        .expect("deploy agents");
+    let events = drain_cancelling_at_approval(stream, token, release).await;
+
+    assert!(
+        matches!(completed_outcome(&events), AgentOutcome::Cancelled { .. }),
+        "expected AgentOutcome::Cancelled, got {:?}",
+        completed_outcome(&events)
+    );
+    assert!(
+        !events.iter().any(
+            |event| matches!(event, HiveEvent::ToolCallStarted { tool_name, .. } if tool_name == "guarded")
+        ),
+        "ToolCallStarted emitted for a tool whose approval raced a cancel"
+    );
+    assert!(
+        !executed.load(Ordering::SeqCst),
+        "approved tool body ran after the run was cancelled"
+    );
+}
+
+/// Same boundary, `Modified` path: an approval carrying rewritten params
+/// must not reach `execute_tool_inner` after the run token fired.
+#[tokio::test]
+async fn cancel_during_approval_blocks_modified_tool() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let executed = Arc::new(AtomicBool::new(false));
+    let release = Arc::new(Notify::new());
+
+    let provider = ScriptedProvider::new().then_tool_call("guarded", json!({}));
+    let hive = HiveMind::builder()
+        .substrate_path(dir.path().join("cancel-loop.db"))
+        .llm_provider("scripted", provider)
+        .approval_handler(GateApproval {
+            release: release.clone(),
+            result: ApprovalResult::Modified {
+                new_params: json!({"rewritten": true}),
+            },
+        })
+        .no_insight_synthesizer()
+        .build()
+        .expect("build HiveMind");
+    let agent = scripted_agent(
+        vec![Arc::new(ApprovalTool {
+            tool_name: "guarded",
+            executed: executed.clone(),
+        })],
+        LlmConfig::new("scripted", "test-model"),
+    );
+
+    let token = CancellationToken::new();
+    let task = Task::new("modified but cancelled").with_cancel(token.clone());
+    let stream = hive
+        .deploy(vec![agent], vec![task])
+        .await
+        .expect("deploy agents");
+    let events = drain_cancelling_at_approval(stream, token, release).await;
+
+    assert!(
+        matches!(completed_outcome(&events), AgentOutcome::Cancelled { .. }),
+        "expected AgentOutcome::Cancelled, got {:?}",
+        completed_outcome(&events)
+    );
+    assert!(
+        !events.iter().any(
+            |event| matches!(event, HiveEvent::ToolCallStarted { tool_name, .. } if tool_name == "guarded")
+        ),
+        "ToolCallStarted emitted for a tool whose modified approval raced a cancel"
+    );
+    assert!(
+        !executed.load(Ordering::SeqCst),
+        "modified-approval tool body ran after the run was cancelled"
     );
 }
