@@ -569,6 +569,15 @@ impl HiveMind {
         tokio::spawn(async move {
             let dispatch = workflow::dispatch_agent(agent, &ctx);
             tokio::pin!(dispatch);
+            // A root that already fired — a deploy racing or following
+            // `shutdown()` — cancels the run token before `dispatch` is ever
+            // polled: `select!` may otherwise poll an immediately-ready
+            // dispatch first and finish the run as `Complete`, contradicting
+            // the post-shutdown guarantee that such deployments start
+            // cancelled.
+            if root.is_cancelled() {
+                run_token.cancel();
+            }
             tokio::select! {
                 _ = root.cancelled() => {
                     run_token.cancel();

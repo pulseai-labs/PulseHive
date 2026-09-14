@@ -523,3 +523,158 @@ async fn drop_cancels_running_agents() {
         other => panic!("expected AgentOutcome::Cancelled, got {other:?}"),
     }
 }
+
+/// A substrate whose every method resolves inside a single poll — no
+/// internal awaits — so a dispatch driving it can finish within the first
+/// `select!` poll. The post-shutdown regression needs exactly that shape:
+/// without a synchronous pre-poll cancel, `select!` may poll an
+/// immediately-ready dispatch first and let it complete as `Complete`.
+struct SyncSubstrate;
+
+#[async_trait]
+impl pulsedb::SubstrateProvider for SyncSubstrate {
+    async fn store_experience(
+        &self,
+        _exp: pulsedb::NewExperience,
+    ) -> std::result::Result<pulsedb::ExperienceId, pulsedb::PulseDBError> {
+        Ok(pulsedb::ExperienceId::new())
+    }
+
+    async fn get_experience(
+        &self,
+        _id: pulsedb::ExperienceId,
+    ) -> std::result::Result<Option<pulsedb::Experience>, pulsedb::PulseDBError> {
+        Ok(None)
+    }
+
+    async fn search_similar(
+        &self,
+        _collective: pulsedb::CollectiveId,
+        _embedding: &[f32],
+        _k: usize,
+    ) -> std::result::Result<Vec<(pulsedb::Experience, f32)>, pulsedb::PulseDBError> {
+        Ok(vec![])
+    }
+
+    async fn get_recent(
+        &self,
+        _collective: pulsedb::CollectiveId,
+        _limit: usize,
+    ) -> std::result::Result<Vec<pulsedb::Experience>, pulsedb::PulseDBError> {
+        Ok(vec![])
+    }
+
+    async fn store_relation(
+        &self,
+        _rel: pulsedb::NewExperienceRelation,
+    ) -> std::result::Result<pulsedb::RelationId, pulsedb::PulseDBError> {
+        Ok(pulsedb::RelationId::new())
+    }
+
+    async fn get_related(
+        &self,
+        _exp_id: pulsedb::ExperienceId,
+    ) -> std::result::Result<
+        Vec<(pulsedb::Experience, pulsedb::ExperienceRelation)>,
+        pulsedb::PulseDBError,
+    > {
+        Ok(vec![])
+    }
+
+    async fn store_insight(
+        &self,
+        _insight: pulsedb::NewDerivedInsight,
+    ) -> std::result::Result<pulsedb::InsightId, pulsedb::PulseDBError> {
+        Ok(pulsedb::InsightId::new())
+    }
+
+    async fn get_insights(
+        &self,
+        _collective: pulsedb::CollectiveId,
+        _embedding: &[f32],
+        _k: usize,
+    ) -> std::result::Result<Vec<(pulsedb::DerivedInsight, f32)>, pulsedb::PulseDBError> {
+        Ok(vec![])
+    }
+
+    async fn get_activities(
+        &self,
+        _collective: pulsedb::CollectiveId,
+    ) -> std::result::Result<Vec<pulsedb::Activity>, pulsedb::PulseDBError> {
+        Ok(vec![])
+    }
+
+    async fn get_context_candidates(
+        &self,
+        _request: pulsedb::ContextRequest,
+    ) -> std::result::Result<pulsedb::ContextCandidates, pulsedb::PulseDBError> {
+        Ok(pulsedb::ContextCandidates {
+            similar_experiences: vec![],
+            recent_experiences: vec![],
+            insights: vec![],
+            relations: vec![],
+            active_agents: vec![],
+        })
+    }
+
+    async fn watch(
+        &self,
+        _collective: pulsedb::CollectiveId,
+    ) -> std::result::Result<
+        Pin<Box<dyn Stream<Item = pulsedb::WatchEvent> + Send>>,
+        pulsedb::PulseDBError,
+    > {
+        Ok(Box::pin(futures::stream::empty()))
+    }
+
+    async fn create_collective(
+        &self,
+        _name: &str,
+    ) -> std::result::Result<pulsedb::CollectiveId, pulsedb::PulseDBError> {
+        Ok(pulsedb::CollectiveId::new())
+    }
+
+    async fn get_or_create_collective(
+        &self,
+        _name: &str,
+    ) -> std::result::Result<pulsedb::CollectiveId, pulsedb::PulseDBError> {
+        Ok(pulsedb::CollectiveId::new())
+    }
+
+    async fn list_collectives(
+        &self,
+    ) -> std::result::Result<Vec<pulsedb::Collective>, pulsedb::PulseDBError> {
+        Ok(vec![])
+    }
+}
+
+/// r1.s2 review (post-shutdown race): a deployment spawned when the
+/// HiveMind root is already cancelled must start cancelled — the run token
+/// fires before `dispatch` is ever polled. `select!` picks its first branch
+/// at random, so with a one-poll-ready dispatch the missing pre-poll cancel
+/// lets roughly half of deploys finish as `Complete`; repeated rounds make
+/// the regression deterministic while the fixed contract holds every round.
+#[tokio::test]
+async fn post_shutdown_deploy_starts_cancelled() {
+    let provider = ScriptedProvider::new().then_text("must never be returned");
+    let hive = HiveMind::builder()
+        .substrate(Box::new(SyncSubstrate))
+        .llm_provider("scripted", provider.clone())
+        .no_insight_synthesizer()
+        .build()
+        .expect("build HiveMind");
+    hive.shutdown();
+
+    for round in 0..8 {
+        let agent = scripted_agent(vec![], LlmConfig::new("scripted", "test-model"));
+        let stream = hive
+            .deploy(vec![agent], vec![Task::new("post-shutdown")])
+            .await
+            .expect("deploy post-shutdown");
+        let events = drain_until_completed(stream).await;
+        match completed_outcome(&events) {
+            AgentOutcome::Cancelled { .. } => {}
+            other => panic!("round {round}: expected Cancelled, got {other:?}"),
+        }
+    }
+}
