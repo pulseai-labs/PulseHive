@@ -860,3 +860,67 @@ async fn cancel_during_final_tool_returns_cancelled_not_max_iterations() {
         other => panic!("expected AgentOutcome::Cancelled, got {other:?}"),
     }
 }
+
+/// An approval handler whose decision never arrives — the probe proving the
+/// approval await races the run token. Without the `select!`, a turn
+/// cancelled while `request_approval` is pending waits on the handler
+/// forever and emits no terminal `AgentCompleted`.
+struct NeverApprove;
+
+#[async_trait]
+impl ApprovalHandler for NeverApprove {
+    async fn request_approval(&self, _action: &PendingAction) -> Result<ApprovalResult> {
+        std::future::pending::<Result<ApprovalResult>>().await
+    }
+}
+
+/// r1.s2 review (P1 approval race): cancelling while the approval handler
+/// stays pending must end the turn — the pending approval future is
+/// dropped and the run completes as `Cancelled`, still emitting
+/// `AgentCompleted`, with no tool body ever starting.
+#[tokio::test]
+async fn cancel_ends_turn_while_approval_never_resolves() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let executed = Arc::new(AtomicBool::new(false));
+
+    let provider = ScriptedProvider::new().then_tool_call("guarded", json!({}));
+    let hive = HiveMind::builder()
+        .substrate_path(dir.path().join("cancel-loop.db"))
+        .llm_provider("scripted", provider)
+        .approval_handler(NeverApprove)
+        .no_insight_synthesizer()
+        .build()
+        .expect("build HiveMind");
+    let agent = scripted_agent(
+        vec![Arc::new(ApprovalTool {
+            tool_name: "guarded",
+            executed: executed.clone(),
+        })],
+        LlmConfig::new("scripted", "test-model"),
+    );
+
+    let token = CancellationToken::new();
+    let task = Task::new("cancel a pending approval").with_cancel(token.clone());
+    let stream = hive
+        .deploy(vec![agent], vec![task])
+        .await
+        .expect("deploy agents");
+    // The handler is never released — only the run token can end the turn.
+    let events = drain_cancelling_at_approval(stream, token, Arc::new(Notify::new())).await;
+
+    assert!(
+        matches!(completed_outcome(&events), AgentOutcome::Cancelled { .. }),
+        "expected AgentOutcome::Cancelled, got {:?}",
+        completed_outcome(&events)
+    );
+    assert!(
+        !events.iter().any(
+            |event| matches!(event, HiveEvent::ToolCallStarted { tool_name, .. } if tool_name == "guarded")
+        ),
+        "ToolCallStarted emitted for a tool whose approval never resolved"
+    );
+    assert!(
+        !executed.load(Ordering::SeqCst),
+        "tool body ran after the run was cancelled mid-approval"
+    );
+}

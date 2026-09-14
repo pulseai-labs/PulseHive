@@ -303,7 +303,7 @@ async fn think_act_loop(
                 return AgentOutcome::Cancelled { partial_response };
             }
 
-            let result = execute_tool_call(
+            let result = match execute_tool_call(
                 agent_id,
                 tool_call,
                 tool_map,
@@ -314,7 +314,16 @@ async fn think_act_loop(
                 &ctx.cancel,
             )
             .instrument(tracing::info_span!("act", agent_id = %agent_id, tool = %tool_call.name))
-            .await;
+            .await
+            {
+                Ok(result) => result,
+                // Cancelled at the approval boundary: the tool body never
+                // ran, so no tool result is recorded — the turn ends as
+                // `Cancelled` with the turn's partial response.
+                Err(ApprovalCancelled) => {
+                    return AgentOutcome::Cancelled { partial_response };
+                }
+            };
 
             messages.push(Message::tool_result(&tool_call.id, result.to_content()));
             tool_calls_since_refresh += 1;
@@ -356,6 +365,12 @@ async fn think_act_loop(
     AgentOutcome::MaxIterationsReached
 }
 
+/// Marker: the run token fired while the turn was awaiting an approval
+/// decision. The pending approval future was dropped and the tool body
+/// never started, so no tool result is recorded — the caller ends the
+/// turn as [`AgentOutcome::Cancelled`].
+struct ApprovalCancelled;
+
 /// Execute a single tool call with approval check.
 #[allow(clippy::too_many_arguments)]
 async fn execute_tool_call(
@@ -367,10 +382,13 @@ async fn execute_tool_call(
     event_emitter: &EventEmitter,
     collective_id: &CollectiveId,
     cancel: &CancellationToken,
-) -> ToolResult {
+) -> std::result::Result<ToolResult, ApprovalCancelled> {
     let Some(&tool) = tool_map.get(tool_call.name.as_str()) else {
         tracing::warn!(agent_id = %agent_id, tool = %tool_call.name, "Tool not found");
-        return ToolResult::error(format!("Tool '{}' not found", tool_call.name));
+        return Ok(ToolResult::error(format!(
+            "Tool '{}' not found",
+            tool_call.name
+        )));
     };
 
     // Check approval if required
@@ -389,32 +407,40 @@ async fn execute_tool_call(
             description: format!("Execute {} tool", tool_call.name),
         };
 
-        let decision = approval_handler.request_approval(&action).await;
+        // Race the approval decision against the run token (ADR-014): a
+        // handler that stays pending — a human or webhook that never
+        // answers — must not hold the turn open forever. When the token
+        // wins, the pending approval future is dropped, no tool body
+        // starts, and the turn ends as `Cancelled` at the call site.
+        let decision = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return Err(ApprovalCancelled),
+            decision = approval_handler.request_approval(&action) => decision,
+        };
 
         // Cancellation checkpoint on the approval boundary (ADR-014): the
-        // approval await can outlive the run — the token may have fired
-        // while the handler was deciding, and neither the `Approved` nor
-        // the `Modified` path may start the tool afterwards.
+        // token may have fired in the same instant the decision resolved,
+        // and neither the `Approved` nor the `Modified` path may start the
+        // tool afterwards.
         if cancel.is_cancelled() {
             tracing::info!(
                 agent_id = %agent_id,
                 tool = %tool_call.name,
                 "Run cancelled while awaiting tool approval"
             );
-            return ToolResult::error(format!(
-                "Tool '{}' not executed: run cancelled while awaiting approval",
-                tool_call.name
-            ));
+            return Err(ApprovalCancelled);
         }
 
         match decision {
             Ok(ApprovalResult::Approved) => {} // proceed
             Ok(ApprovalResult::Denied { reason }) => {
-                return ToolResult::error(format!("Tool execution denied: {reason}"));
+                return Ok(ToolResult::error(format!(
+                    "Tool execution denied: {reason}"
+                )));
             }
             Ok(ApprovalResult::Modified { new_params }) => {
                 // Execute with modified params
-                return execute_tool_inner(
+                return Ok(execute_tool_inner(
                     agent_id,
                     &tool_call.name,
                     new_params,
@@ -424,15 +450,15 @@ async fn execute_tool_call(
                     collective_id,
                     cancel,
                 )
-                .await;
+                .await);
             }
             Err(e) => {
-                return ToolResult::error(format!("Approval handler error: {e}"));
+                return Ok(ToolResult::error(format!("Approval handler error: {e}")));
             }
         }
     }
 
-    execute_tool_inner(
+    Ok(execute_tool_inner(
         agent_id,
         &tool_call.name,
         tool_call.arguments.clone(),
@@ -442,7 +468,7 @@ async fn execute_tool_call(
         collective_id,
         cancel,
     )
-    .await
+    .await)
 }
 
 /// Renders a caught panic payload as a message: the `&'static str` /
