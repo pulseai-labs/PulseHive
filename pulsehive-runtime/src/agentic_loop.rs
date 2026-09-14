@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 
 use pulsedb::SubstrateProvider;
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 
 use pulsehive_core::agent::{AgentOutcome, ExperienceExtractor, LlmAgentConfig};
@@ -38,6 +39,10 @@ pub struct LoopContext<'a> {
     pub max_iterations: usize,
     /// Optional embedding provider for computing embeddings before storage.
     pub embedding_provider: Option<Arc<dyn pulsehive_core::embedding::EmbeddingProvider>>,
+    /// This run's cancellation token (ADR-014). The loop does not check it
+    /// yet — w2 adds the checkpoints; today it only flows into each tool
+    /// invocation's `ToolContext.cancel` as a child token.
+    pub cancel: CancellationToken,
 }
 
 /// Run the agentic loop for a single LLM agent.
@@ -195,6 +200,7 @@ async fn think_act_loop(
                 ctx.approval_handler,
                 &ctx.event_emitter,
                 &ctx.task.collective_id,
+                &ctx.cancel,
             )
             .instrument(tracing::info_span!("act", agent_id = %agent_id, tool = %tool_call.name))
             .await;
@@ -231,6 +237,7 @@ async fn think_act_loop(
 }
 
 /// Execute a single tool call with approval check.
+#[allow(clippy::too_many_arguments)]
 async fn execute_tool_call(
     agent_id: &str,
     tool_call: &ToolCall,
@@ -239,6 +246,7 @@ async fn execute_tool_call(
     approval_handler: &dyn ApprovalHandler,
     event_emitter: &EventEmitter,
     collective_id: &CollectiveId,
+    cancel: &CancellationToken,
 ) -> ToolResult {
     let Some(&tool) = tool_map.get(tool_call.name.as_str()) else {
         tracing::warn!(agent_id = %agent_id, tool = %tool_call.name, "Tool not found");
@@ -276,6 +284,7 @@ async fn execute_tool_call(
                     substrate,
                     event_emitter,
                     collective_id,
+                    cancel,
                 )
                 .await;
             }
@@ -293,11 +302,13 @@ async fn execute_tool_call(
         substrate,
         event_emitter,
         collective_id,
+        cancel,
     )
     .await
 }
 
 /// Execute a tool and emit events.
+#[allow(clippy::too_many_arguments)]
 async fn execute_tool_inner(
     agent_id: &str,
     tool_name: &str,
@@ -306,6 +317,7 @@ async fn execute_tool_inner(
     substrate: &Arc<dyn SubstrateProvider>,
     event_emitter: &EventEmitter,
     collective_id: &CollectiveId,
+    cancel: &CancellationToken,
 ) -> ToolResult {
     let params_str = serde_json::to_string(&params).unwrap_or_default();
     event_emitter.emit(HiveEvent::ToolCallStarted {
@@ -333,6 +345,8 @@ async fn execute_tool_inner(
         collective_id: *collective_id,
         substrate: Arc::clone(substrate),
         event_emitter: event_emitter.clone(),
+        // Each invocation gets a child of the run token (ADR-014).
+        cancel: cancel.child_token(),
     };
 
     // Dispatch on the streaming capability probe. Streaming tools get a bounded
@@ -665,10 +679,7 @@ mod tests {
     }
 
     fn test_task() -> Task {
-        Task {
-            description: "Test task".into(),
-            collective_id: CollectiveId::new(),
-        }
+        Task::new("Test task")
     }
 
     fn test_substrate() -> Arc<dyn SubstrateProvider> {
@@ -706,6 +717,7 @@ mod tests {
                 event_emitter: emitter,
                 max_iterations: DEFAULT_MAX_ITERATIONS,
                 embedding_provider: None,
+                cancel: CancellationToken::new(),
             },
         )
         .await;
@@ -738,6 +750,7 @@ mod tests {
                 event_emitter: emitter,
                 max_iterations: DEFAULT_MAX_ITERATIONS,
                 embedding_provider: None,
+                cancel: CancellationToken::new(),
             },
         )
         .await;
@@ -778,6 +791,7 @@ mod tests {
                 event_emitter: emitter,
                 max_iterations: 3, // Only 3 iterations
                 embedding_provider: None,
+                cancel: CancellationToken::new(),
             },
         )
         .await;
@@ -809,6 +823,7 @@ mod tests {
                 event_emitter: emitter,
                 max_iterations: DEFAULT_MAX_ITERATIONS,
                 embedding_provider: None,
+                cancel: CancellationToken::new(),
             },
         )
         .await;
@@ -838,6 +853,7 @@ mod tests {
                 event_emitter: emitter,
                 max_iterations: DEFAULT_MAX_ITERATIONS,
                 embedding_provider: None,
+                cancel: CancellationToken::new(),
             },
         )
         .await;
@@ -869,6 +885,7 @@ mod tests {
                 event_emitter: emitter,
                 max_iterations: DEFAULT_MAX_ITERATIONS,
                 embedding_provider: None,
+                cancel: CancellationToken::new(),
             },
         )
         .await;
@@ -934,6 +951,7 @@ mod tests {
                 event_emitter: emitter,
                 max_iterations: DEFAULT_MAX_ITERATIONS,
                 embedding_provider: None,
+                cancel: CancellationToken::new(),
             },
         )
         .await;
@@ -979,6 +997,7 @@ mod tests {
                 event_emitter: emitter,
                 max_iterations: DEFAULT_MAX_ITERATIONS,
                 embedding_provider: None,
+                cancel: CancellationToken::new(),
             },
         )
         .await;
@@ -1023,6 +1042,7 @@ mod tests {
                 event_emitter: emitter,
                 max_iterations: DEFAULT_MAX_ITERATIONS,
                 embedding_provider: None,
+                cancel: CancellationToken::new(),
             },
         )
         .await;
@@ -1152,6 +1172,7 @@ mod tests {
                 event_emitter: emitter,
                 max_iterations: DEFAULT_MAX_ITERATIONS,
                 embedding_provider: None,
+                cancel: CancellationToken::new(),
             },
         )
         .await;

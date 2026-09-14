@@ -30,6 +30,7 @@ use pulsedb::SubstrateProvider;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 
 use crate::error::Result;
 use crate::event::EventEmitter;
@@ -54,6 +55,11 @@ pub trait Tool: Send + Sync {
     fn parameters(&self) -> Value;
 
     /// Execute the tool with the given parameters.
+    ///
+    /// `context.cancel` is this invocation's cooperative cancellation
+    /// signal (ADR-014): a long-running tool SHOULD poll
+    /// `context.cancel.is_cancelled()` at safe points or await
+    /// `context.cancel.cancelled()` and wind down when it fires.
     async fn execute(&self, params: Value, context: &ToolContext) -> Result<ToolResult>;
 
     /// Whether this tool requires human approval before execution.
@@ -90,6 +96,13 @@ pub struct ToolContext {
     pub substrate: Arc<dyn SubstrateProvider>,
     /// Event emitter for tools that need to emit custom events.
     pub event_emitter: EventEmitter,
+    /// This invocation's cooperative cancellation signal (ADR-014).
+    ///
+    /// A child of the run's cancellation token: it fires when the caller's
+    /// `Task` token, the run token, or this invocation's own token is
+    /// cancelled. Tools never observe cancellation by preempt — they check
+    /// this token at safe points.
+    pub cancel: CancellationToken,
 }
 
 /// Result of a tool execution.
@@ -202,7 +215,9 @@ pub trait StreamingTool: Tool {
     /// `progress_tx` is a bounded channel owned by the agent loop. Implementations
     /// SHOULD send `Progress` / `PartialResult` / `Log` events; they MUST NOT send
     /// `Started` or `Completed` (the loop emits those as bookends). Returns the
-    /// final [`ToolResult`] after the stream is drained. If the receiver is dropped
+    /// final [`ToolResult`] after the stream is drained. `context.cancel` is
+    /// this invocation's cooperative cancellation signal (ADR-014) — a
+    /// streaming tool SHOULD observe it like any other tool. If the receiver is dropped
     /// (consumer gone), `progress_tx.send().await` errors — implementations SHOULD
     /// treat that as a soft signal, keep computing, and return the result anyway.
     ///
@@ -358,6 +373,7 @@ mod tests {
             collective_id: CollectiveId::new(),
             substrate: Arc::new(pulsedb::PulseDBSubstrate::from_db(db)),
             event_emitter: EventEmitter::default(),
+            cancel: CancellationToken::new(),
         }
     }
 

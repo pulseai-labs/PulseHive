@@ -17,6 +17,7 @@ async-trait = { workspace = true }
 pulsehive-core = { workspace = true, features = ["substrate"] }
 pulsehive-db = { workspace = true }
 tokio = { workspace = true, features = ["time"] }
+tokio-util = { workspace = true }
 tracing = { workspace = true }
 futures = { workspace = true }
 futures-core = { workspace = true }

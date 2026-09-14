@@ -158,6 +158,34 @@ impl From<HiveEvent> for PyHiveEvent {
                             PyEventValue::Str("max_iterations_reached".into()),
                         );
                     }
+                    AgentOutcome::Cancelled { partial_response } => {
+                        fields.insert("outcome".into(), PyEventValue::Str("cancelled".into()));
+                        fields.insert(
+                            "partial_response".into(),
+                            PyEventValue::Str(partial_response.clone()),
+                        );
+                    }
+                    AgentOutcome::PartialComplete { responses, errors } => {
+                        fields.insert(
+                            "outcome".into(),
+                            PyEventValue::Str("partial_complete".into()),
+                        );
+                        // No list variant in PyEventValue — same JSON-string
+                        // convention as the ToolProgress `progress` field.
+                        fields.insert(
+                            "responses".into(),
+                            PyEventValue::Str(serde_json::to_string(responses).unwrap_or_default()),
+                        );
+                        fields.insert(
+                            "errors".into(),
+                            PyEventValue::Str(serde_json::to_string(errors).unwrap_or_default()),
+                        );
+                    }
+                    // `AgentOutcome` is `#[non_exhaustive]` (ADR-014): future
+                    // variants surface as an inert `unknown` outcome.
+                    _ => {
+                        fields.insert("outcome".into(), PyEventValue::Str("unknown".into()));
+                    }
                 }
                 ("agent_completed", Some(agent_id))
             }

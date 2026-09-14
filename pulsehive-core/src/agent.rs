@@ -142,8 +142,12 @@ pub trait ExperienceExtractor: Send + Sync {
 }
 
 /// Outcome of an agent's execution.
+///
+/// `#[non_exhaustive]` from Release 1 (ADR-014): consumers must keep a
+/// wildcard arm in every `match`; new variants land additively.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum AgentOutcome {
     /// Agent completed successfully with a final response.
     Complete { response: String },
@@ -154,6 +158,30 @@ pub enum AgentOutcome {
     Error { error: String },
     /// Agent hit the maximum iteration limit without completing.
     MaxIterationsReached,
+    /// The caller cancelled the run (ADR-014).
+    ///
+    /// `partial_response` carries the latest assistant text produced before
+    /// the cancel point — empty if the turn ended before any. Partial tool
+    /// output is not repeated here: it stays on the `ToolCallCompleted`
+    /// events already emitted. For a composite agent, `partial_response`
+    /// mirrors what its `Complete` would have carried over the children that
+    /// completed before the cancellation.
+    Cancelled { partial_response: String },
+    /// A composite agent finished with only some children succeeding (#45).
+    ///
+    /// `responses` collects the completed children's responses in finish
+    /// order; `errors` describes each child that did not contribute one —
+    /// a child that hit its iteration cap is listed as
+    /// `<agent>: max iterations reached`. A nested `PartialComplete`
+    /// merges into its parent's `responses` and `errors`. Sequential and
+    /// Loop workflows treat a child's `PartialComplete` as progress and
+    /// continue.
+    PartialComplete {
+        /// Responses contributed by children that completed.
+        responses: Vec<String>,
+        /// One entry per child that did not contribute a response.
+        errors: Vec<String>,
+    },
 }
 
 /// Compact tag for agent kind, used in [`HiveEvent`](crate::event::HiveEvent) variants.

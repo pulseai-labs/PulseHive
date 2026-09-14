@@ -15,6 +15,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use pulsedb::SubstrateProvider;
+use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 
 use pulsehive_core::agent::{
@@ -45,6 +46,20 @@ pub(crate) struct WorkflowContext {
     pub event_emitter: EventBus,
     /// Optional embedding provider for computing embeddings before storage.
     pub embedding_provider: Option<Arc<dyn pulsehive_core::embedding::EmbeddingProvider>>,
+    /// This run's cancellation token (ADR-014). Nothing observes it yet —
+    /// w2–w4 add the checks; it only flows to children and tool contexts.
+    pub cancel: CancellationToken,
+}
+
+impl WorkflowContext {
+    /// The context a composite hands to each child it dispatches: identical
+    /// except `cancel` is a child of this run's token (ADR-014), so the run
+    /// cancels every descendant while each child keeps a distinct token.
+    fn for_child(&self) -> Self {
+        let mut ctx = self.clone();
+        ctx.cancel = self.cancel.child_token();
+        ctx
+    }
 }
 
 /// Dispatch an agent to the appropriate executor based on its kind.
@@ -126,12 +141,15 @@ async fn run_sequential(children: Vec<AgentDefinition>, ctx: &WorkflowContext) -
     let mut last_response = String::new();
     for (i, child) in children.into_iter().enumerate() {
         tracing::info!(child_index = i, child_name = %child.name, "Sequential: running child");
-        let outcome = dispatch_agent(child, ctx).await;
+        let outcome = dispatch_agent(child, &ctx.for_child()).await;
         match &outcome {
             AgentOutcome::Complete { response } => {
                 last_response = response.clone();
             }
-            AgentOutcome::Error { .. } | AgentOutcome::MaxIterationsReached => {
+            // Error and MaxIterationsReached stay terminal, and Cancelled /
+            // PartialComplete / any future variant pass through unchanged as
+            // terminal outcomes (w3 replaces this with D3 semantics).
+            _ => {
                 return outcome;
             }
         }
@@ -163,7 +181,7 @@ async fn run_parallel(children: Vec<AgentDefinition>, ctx: &WorkflowContext) -> 
 
     let mut join_set = tokio::task::JoinSet::new();
     for child in children {
-        let child_ctx = ctx.clone();
+        let child_ctx = ctx.for_child();
         join_set.spawn(async move { dispatch_agent(child, &child_ctx).await });
     }
 
@@ -229,7 +247,7 @@ async fn run_loop(
             max = max_iterations,
             "Loop: starting iteration"
         );
-        let outcome = dispatch_agent(child.clone(), ctx).await;
+        let outcome = dispatch_agent(child.clone(), &ctx.for_child()).await;
 
         match &outcome {
             AgentOutcome::Complete { response } if response.contains(LOOP_DONE_SIGNAL) => {
@@ -285,6 +303,7 @@ async fn run_llm_agent(
             event_emitter: ctx.event_emitter.clone(),
             max_iterations: DEFAULT_MAX_ITERATIONS,
             embedding_provider: ctx.embedding_provider.clone(),
+            cancel: ctx.cancel.clone(),
         },
     )
     .await
@@ -393,6 +412,7 @@ mod tests {
             approval_handler: Arc::new(pulsehive_core::approval::AutoApprove),
             event_emitter: EventBus::default(),
             embedding_provider: None,
+            cancel: CancellationToken::new(),
         }
     }
 
