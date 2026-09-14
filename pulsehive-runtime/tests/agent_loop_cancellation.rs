@@ -225,10 +225,7 @@ async fn in_flight_provider_call_aborts_to_cancelled() {
     let events = drain_cancelling_at_llm_start(stream, token).await;
 
     assert!(
-        matches!(
-            completed_outcome(&events),
-            AgentOutcome::Cancelled { .. }
-        ),
+        matches!(completed_outcome(&events), AgentOutcome::Cancelled { .. }),
         "expected AgentOutcome::Cancelled, got {:?}",
         completed_outcome(&events)
     );
@@ -294,10 +291,7 @@ async fn no_tool_call_starts_after_cancel() {
     let events = drain_until_completed(stream).await;
 
     assert!(
-        matches!(
-            completed_outcome(&events),
-            AgentOutcome::Cancelled { .. }
-        ),
+        matches!(completed_outcome(&events), AgentOutcome::Cancelled { .. }),
         "expected AgentOutcome::Cancelled, got {:?}",
         completed_outcome(&events)
     );
@@ -393,10 +387,7 @@ async fn caller_llm_config_token_still_cancels() {
     let events = drain_cancelling_at_llm_start(stream, caller_token).await;
 
     assert!(
-        matches!(
-            completed_outcome(&events),
-            AgentOutcome::Cancelled { .. }
-        ),
+        matches!(completed_outcome(&events), AgentOutcome::Cancelled { .. }),
         "expected AgentOutcome::Cancelled, got {:?}",
         completed_outcome(&events)
     );
@@ -458,8 +449,7 @@ async fn uncancelled_turn_is_unchanged() {
             .iter()
             .filter(|event| !matches!(event, HiveEvent::WatchNotification { .. }))
             .map(|event| {
-                serde_json::to_value(event)
-                    .expect("event serializes")["type"]
+                serde_json::to_value(event).expect("event serializes")["type"]
                     .as_str()
                     .expect("event has a type tag")
                     .to_string()

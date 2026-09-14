@@ -747,7 +747,9 @@ mod tests {
                 assert_eq!(errors.len(), 1);
                 assert!(errors[0].starts_with("will-error: "));
             }
-            other => panic!("Parallel with one error should return PartialComplete, got: {other:?}"),
+            other => {
+                panic!("Parallel with one error should return PartialComplete, got: {other:?}")
+            }
         }
     }
 

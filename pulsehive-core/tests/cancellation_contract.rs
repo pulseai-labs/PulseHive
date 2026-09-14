@@ -23,8 +23,8 @@ fn context_with_cancel(cancel: CancellationToken) -> ToolContext {
     #[cfg(feature = "substrate")]
     let substrate = {
         let dir = tempfile::tempdir().unwrap();
-        let db = pulsedb::PulseDB::open(dir.path().join("test.db"), pulsedb::Config::default())
-            .unwrap();
+        let db =
+            pulsedb::PulseDB::open(dir.path().join("test.db"), pulsedb::Config::default()).unwrap();
         // Leak the tempdir so its files outlive the context.
         Box::leak(Box::new(dir));
         std::sync::Arc::new(pulsedb::PulseDBSubstrate::from_db(db))

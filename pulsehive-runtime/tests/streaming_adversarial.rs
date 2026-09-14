@@ -92,7 +92,9 @@ fn progress_events<'a>(events: &'a [HiveEvent], tool: &str) -> Vec<&'a ToolProgr
         .iter()
         .filter_map(|event| match event {
             HiveEvent::ToolProgress {
-                tool_name, progress, ..
+                tool_name,
+                progress,
+                ..
             } if tool_name == tool => Some(progress),
             _ => None,
         })
@@ -557,7 +559,9 @@ async fn panic_after_progress_becomes_tool_error() {
         .then_text("survived the panic");
     let hive = scripted_hive(&dir, provider);
     let agent = scripted_agent(
-        vec![Arc::new(PanicTool { tool_name: "panicky" })],
+        vec![Arc::new(PanicTool {
+            tool_name: "panicky",
+        })],
         LlmConfig::new("scripted", "test-model"),
     );
 
