@@ -121,10 +121,17 @@ pub async fn run_agentic_loop(config: LlmAgentConfig, ctx: LoopContext<'_>) -> A
     )
     .await;
 
-    // 4. RECORD — extract experiences and store in substrate
-    record(&messages, &outcome, &ctx, experience_extractor.as_deref())
-        .instrument(tracing::info_span!("record", agent_id = %ctx.agent_id))
-        .await;
+    // 4. RECORD — extract experiences and store in substrate. A cancelled
+    // run records no experience: the extractor — default or custom — is
+    // never invoked, so a custom extractor (which receives no cancellation
+    // token) cannot start new work, e.g. its own LLM calls, after the run
+    // has already ended. An extraction underway for a non-cancelled
+    // outcome is awaited to completion — never aborted.
+    if !matches!(outcome, AgentOutcome::Cancelled { .. }) {
+        record(&messages, &outcome, &ctx, experience_extractor.as_deref())
+            .instrument(tracing::info_span!("record", agent_id = %ctx.agent_id))
+            .await;
+    }
 
     outcome
 }

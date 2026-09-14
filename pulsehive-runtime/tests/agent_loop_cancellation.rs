@@ -924,3 +924,99 @@ async fn cancel_ends_turn_while_approval_never_resolves() {
         "tool body ran after the run was cancelled mid-approval"
     );
 }
+
+/// An experience extractor that flags whether `extract` was ever entered.
+/// `block: true` pends forever after flagging — the probe for "a cancelled
+/// run must not start extraction": reaching `record` would hang the run
+/// inside `extract`, so `AgentCompleted` arriving at all proves the
+/// extractor was never invoked.
+struct FlaggedExtractor {
+    invoked: Arc<AtomicBool>,
+    block: bool,
+}
+
+#[async_trait]
+impl pulsehive_core::agent::ExperienceExtractor for FlaggedExtractor {
+    async fn extract(
+        &self,
+        _conversation: &[pulsehive_core::llm::Message],
+        _outcome: &AgentOutcome,
+        _context: &pulsehive_core::agent::ExtractionContext,
+    ) -> Vec<pulsedb::NewExperience> {
+        self.invoked.store(true, Ordering::SeqCst);
+        if self.block {
+            std::future::pending::<()>().await;
+        }
+        vec![]
+    }
+}
+
+/// r1.s2 review (P2 skip extraction on cancel): a `Cancelled` run records
+/// no experience — the extractor, default or custom, is never invoked.
+/// The blocking custom extractor proves the skip: if the loop entered
+/// `record`, the run would hang inside `extract` and no `AgentCompleted`
+/// would arrive. A second, uncancelled deploy on the same hive still
+/// records through a custom extractor — recording is unchanged for runs
+/// that finish normally.
+#[tokio::test]
+async fn cancelled_run_skips_experience_recording() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let cancelled_invoked = Arc::new(AtomicBool::new(false));
+    let normal_invoked = Arc::new(AtomicBool::new(false));
+
+    // One provider serves both deploys in order: the first call hangs
+    // until the run token fires; the second answers normally.
+    let provider = ScriptedProvider::new()
+        .then_hang()
+        .then_text("recorded normally");
+    let hive = scripted_hive(&dir, provider);
+
+    let mut cancelled_agent = scripted_agent(vec![], LlmConfig::new("scripted", "test-model"));
+    if let AgentKind::Llm(cfg) = &mut cancelled_agent.kind {
+        cfg.experience_extractor = Some(Arc::new(FlaggedExtractor {
+            invoked: cancelled_invoked.clone(),
+            block: true,
+        }));
+    }
+    let token = CancellationToken::new();
+    let task = Task::new("cancelled run records nothing").with_cancel(token.clone());
+    let stream = hive
+        .deploy(vec![cancelled_agent], vec![task])
+        .await
+        .expect("deploy agents");
+    let events = drain_cancelling_at_llm_start(stream, token).await;
+    assert!(
+        matches!(completed_outcome(&events), AgentOutcome::Cancelled { .. }),
+        "expected AgentOutcome::Cancelled, got {:?}",
+        completed_outcome(&events)
+    );
+    assert!(
+        !cancelled_invoked.load(Ordering::SeqCst),
+        "extractor invoked for a cancelled run"
+    );
+
+    let mut normal_agent = scripted_agent(vec![], LlmConfig::new("scripted", "test-model"));
+    if let AgentKind::Llm(cfg) = &mut normal_agent.kind {
+        cfg.experience_extractor = Some(Arc::new(FlaggedExtractor {
+            invoked: normal_invoked.clone(),
+            block: false,
+        }));
+    }
+    let stream = hive
+        .deploy(
+            vec![normal_agent],
+            vec![Task::new("uncancelled run records")],
+        )
+        .await
+        .expect("deploy agents");
+    let events = drain_until_completed(stream).await;
+    assert!(
+        matches!(completed_outcome(&events), AgentOutcome::Complete { .. }),
+        "expected AgentOutcome::Complete, got {:?}",
+        completed_outcome(&events)
+    );
+    assert!(
+        normal_invoked.load(Ordering::SeqCst),
+        "extractor not invoked for an uncancelled run"
+    );
+}
