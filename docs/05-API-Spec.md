@@ -972,8 +972,9 @@ pub enum AgentOutcome {
     Cancelled { partial_response: String },
 
     /// A composite agent finished with only some children succeeding:
-    /// `responses` collects the completed children's responses in finish
-    /// order and `errors` describes each child that did not contribute one.
+    /// `responses` collects the completed children's responses in child
+    /// declaration order and `errors` describes each child that did not
+    /// contribute one in the same order.
     PartialComplete { responses: Vec<String>, errors: Vec<String> },
 }
 ```
@@ -1106,7 +1107,7 @@ What a cancelled run does:
 - The agent loop checks the run token **before every LLM call and before every tool call** — a cancelled token ends the turn as `AgentOutcome::Cancelled { partial_response }` with the latest assistant text, and no `LlmCallStarted`/`ToolCallStarted` is emitted for work that never began.
 - Each provider call carries a child of the run token on `LlmConfig.cancel`, so an **in-flight provider request aborts mid-flight** (the provider returns a `Cancelled` transport error the loop maps to `AgentOutcome::Cancelled`). An agent definition's own `LlmConfig.cancel` is honored alongside the run token — either token aborts the call.
 - A **tool already executing is awaited, never force-aborted**. Its `ToolContext.cancel` fires so a cooperative tool can wind down and return partial results, which still reach `ToolCallCompleted`.
-- **Workflow agents** pass a child of the run token to every dispatched child, so cancelling the task cancels the whole tree. Sequential and Loop workflows treat a child's `PartialComplete` as progress and continue; a `Cancelled` child ends the workflow as `Cancelled`. When any child cancels, the composite returns `Cancelled` with the completed-child responses while sibling errors remain visible on each child's `AgentCompleted` event.
+- **Workflow agents** pass a child of the run token to every dispatched child, so cancelling the task cancels the whole tree. Sequential and Loop workflows treat a child's `PartialComplete` as progress and continue; a `Cancelled` child ends the workflow as `Cancelled`. When any child cancels, the composite returns `Cancelled` with the completed-child responses assembled in child declaration order, while sibling errors remain visible on each child's `AgentCompleted` event.
 
 HiveMind-level cancellation: `shutdown()` and `Drop` cancel an internal root token every run is linked to, stopping all running agents — `shutdown() cancels running agents` — in addition to ending the Watch background tasks. The HiveMind is terminal after `shutdown()`: the root token is one-shot, so agents deployed afterwards start cancelled and end at their first checkpoint. There is deliberately **no `HiveMind::abort_handle()` and no `CancellableTool` trait** — `deploy()`/`redeploy()` signatures are unchanged.
 

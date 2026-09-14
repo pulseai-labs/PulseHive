@@ -205,17 +205,19 @@ async fn run_sequential(children: Vec<AgentDefinition>, ctx: &WorkflowContext) -
 /// Cooperative drain (ADR-014 D5/A3): every spawned child is joined to
 /// completion — a child task is never aborted, even when the run token fires
 /// or a sibling fails. A child returning `Cancelled` makes the composite
-/// `Cancelled` carrying the completed children's responses joined by newline
-/// (A16); a `PartialComplete` child flattens its `responses` and `errors`
-/// into the parent's (A17). When any child cancels, the composite returns
-/// `Cancelled` with the completed-child responses while sibling errors
-/// remain visible on each child's own `AgentCompleted` event. Each
-/// non-`Complete` child contributes a named error — `<agent>: <error>`,
-/// `<agent>: max iterations reached`, `<agent>: task failed: <reason>` for a
-/// join failure — so every child's failure stays attributable (#45). Some
-/// responses plus some errors returns `PartialComplete`; no responses
-/// returns `Error` with the errors joined by `"; "`; no errors returns
-/// `Complete` as before.
+/// `Cancelled` carrying the completed children's responses joined by
+/// newline in declaration order (A16); a `PartialComplete` child flattens
+/// its `responses` and `errors` into the parent's (A17). When any child
+/// cancels, the composite returns `Cancelled` with the completed-child
+/// responses while sibling errors remain visible on each child's own
+/// `AgentCompleted` event. Each non-`Complete` child contributes a named
+/// error — `<agent>: <error>`, `<agent>: max iterations reached`,
+/// `<agent>: task failed: <reason>` for a join failure — so every
+/// child's failure stays attributable (#45). `responses` and `errors`
+/// are both assembled in child declaration order, never finish order.
+/// Some responses plus some errors returns `PartialComplete`; no
+/// responses returns `Error` with the errors joined by `"; "`; no errors
+/// returns `Complete` as before.
 async fn run_parallel(children: Vec<AgentDefinition>, ctx: &WorkflowContext) -> AgentOutcome {
     tracing::info!(child_count = children.len(), "Parallel workflow started");
 

@@ -169,13 +169,13 @@ pub enum AgentOutcome {
     Cancelled { partial_response: String },
     /// A composite agent finished with only some children succeeding (#45).
     ///
-    /// `responses` collects the completed children's responses in finish
-    /// order; `errors` describes each child that did not contribute one —
-    /// a child that hit its iteration cap is listed as
-    /// `<agent>: max iterations reached`. A nested `PartialComplete`
-    /// merges into its parent's `responses` and `errors`. Sequential and
-    /// Loop workflows treat a child's `PartialComplete` as progress and
-    /// continue.
+    /// `responses` collects the completed children's responses in child
+    /// declaration order; `errors` describes each child that did not
+    /// contribute one in the same order — a child that hit its iteration
+    /// cap is listed as `<agent>: max iterations reached`. A nested
+    /// `PartialComplete` merges into its parent's `responses` and
+    /// `errors`. Sequential and Loop workflows treat a child's
+    /// `PartialComplete` as progress and continue.
     PartialComplete {
         /// Responses contributed by children that completed.
         responses: Vec<String>,
