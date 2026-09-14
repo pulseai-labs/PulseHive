@@ -645,3 +645,52 @@ async fn cancel_during_approval_blocks_modified_tool() {
         "modified-approval tool body ran after the run was cancelled"
     );
 }
+
+/// r1.s2 review (provider pre-cancel): an agent definition whose
+/// `LlmConfig.cancel` is already cancelled must cancel the per-call token
+/// synchronously — a spawned bridge is only polled after the call is
+/// underway, so a fast provider would observe a still-live token and
+/// complete. The provider's own request log proves what it saw at call
+/// start.
+#[tokio::test]
+async fn pre_cancelled_definition_token_cancels_call_synchronously() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    // A ready scripted reply: without the synchronous cancel the call
+    // completes as `Complete` before the bridge task is ever polled.
+    let provider = ScriptedProvider::new().then_text("must not be returned");
+    let hive = scripted_hive(&dir, provider.clone());
+    let caller_token = CancellationToken::new();
+    caller_token.cancel();
+    let agent = scripted_agent(
+        vec![],
+        LlmConfig::new("scripted", "test-model").with_cancel(caller_token),
+    );
+
+    // The task carries no token — only the definition's token is fired.
+    let stream = hive
+        .deploy(vec![agent], vec![Task::new("pre-cancelled config")])
+        .await
+        .expect("deploy agents");
+    let events = drain_until_completed(stream).await;
+
+    assert!(
+        matches!(completed_outcome(&events), AgentOutcome::Cancelled { .. }),
+        "expected AgentOutcome::Cancelled, got {:?}",
+        completed_outcome(&events)
+    );
+    let requests = provider.requests();
+    assert_eq!(
+        requests.len(),
+        1,
+        "provider saw {} requests",
+        requests.len()
+    );
+    assert!(
+        requests[0]
+            .config
+            .cancel
+            .as_ref()
+            .is_some_and(CancellationToken::is_cancelled),
+        "call token was still live when the provider inspected it"
+    );
+}

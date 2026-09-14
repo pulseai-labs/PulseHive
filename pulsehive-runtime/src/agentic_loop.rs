@@ -139,14 +139,22 @@ impl CancelBridge {
     /// task that cancels `call_token` when the caller's token fires, so EITHER
     /// token aborts the in-flight call (ADR-014 A15 — the caller's token is
     /// never dropped or replaced by the loop's). `None` when the config has no
-    /// caller token: nothing to bridge.
+    /// caller token: nothing to bridge. A caller token that is ALREADY
+    /// cancelled cancels `call_token` synchronously instead — a spawned task
+    /// is only polled after the call is underway, so a fast provider would
+    /// inspect a still-live token and complete before the bridge ever ran.
     fn spawn(caller: Option<CancellationToken>, call_token: CancellationToken) -> Self {
-        Self(caller.map(|caller| {
-            tokio::spawn(async move {
-                caller.cancelled().await;
-                call_token.cancel();
-            })
-        }))
+        let Some(caller) = caller else {
+            return Self(None);
+        };
+        if caller.is_cancelled() {
+            call_token.cancel();
+            return Self(None);
+        }
+        Self(Some(tokio::spawn(async move {
+            caller.cancelled().await;
+            call_token.cancel();
+        })))
     }
 }
 
