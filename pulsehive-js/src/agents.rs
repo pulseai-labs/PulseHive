@@ -281,6 +281,26 @@ fn truncate(s: &str, max: usize) -> String {
     if s.len() <= max {
         s.to_string()
     } else {
-        format!("{}...", &s[..max])
+        // Cut on a UTF-8 character boundary — `&s[..max]` panics when
+        // `max` lands inside a multibyte character.
+        format!("{}...", crate::events::truncate_chars(s, max))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// r1.s2 review: a cancelled response whose byte 60 lands inside a
+    /// multibyte character must not panic `toString` — the preview cuts
+    /// on a UTF-8 boundary.
+    #[test]
+    fn cancelled_repr_truncates_on_char_boundary() {
+        // 59 ASCII bytes then four-byte emoji: byte 60 is mid-character.
+        let partial_response = format!("{}{}", "x".repeat(59), "😀".repeat(4));
+        let outcome = JsAgentOutcome::from(AgentOutcome::Cancelled { partial_response });
+        let rendered = outcome.to_string_js();
+        assert!(rendered.starts_with("AgentOutcome(cancelled, '"));
+        assert!(rendered.ends_with("...')"));
     }
 }
