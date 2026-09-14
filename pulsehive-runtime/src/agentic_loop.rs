@@ -4,6 +4,19 @@
 //! runs through: perceive substrate → think via LLM → act on tool calls → record experiences.
 //!
 //! The loop is driven by [`run_agentic_loop`], called from `HiveMind::deploy()`.
+//!
+//! ## Cancellation (ADR-014)
+//!
+//! [`LoopContext::cancel`] is the run's cancellation token. The loop checks it
+//! before every LLM call and before every tool call: a cancelled token ends
+//! the turn as [`AgentOutcome::Cancelled`] carrying the latest assistant text
+//! as `partial_response`, with no `LlmCallStarted` or `ToolCallStarted` for
+//! work that never began. Each provider call also carries a child of the run
+//! token on its `LlmConfig.cancel` — bridged to the agent's own
+//! `LlmConfig.cancel` when one is set, so either token aborts the in-flight
+//! request — and a provider `LlmTransport` error of kind `Cancelled` maps to
+//! the same outcome. Cancellation is cooperative: a tool already executing is
+//! always awaited, never force-aborted.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -16,10 +29,13 @@ use tracing::Instrument;
 
 use pulsehive_core::agent::{AgentOutcome, ExperienceExtractor, LlmAgentConfig};
 use pulsehive_core::approval::{ApprovalHandler, ApprovalResult, PendingAction};
+use pulsehive_core::error::PulseHiveError;
 use pulsehive_core::event::{EventEmitter, HiveEvent};
 use pulsehive_core::ids::CollectiveId;
 use pulsehive_core::lens::Lens;
-use pulsehive_core::llm::{LlmConfig, LlmProvider, Message, ToolCall, ToolDefinition};
+use pulsehive_core::llm::{
+    LlmConfig, LlmErrorKind, LlmProvider, Message, ToolCall, ToolDefinition,
+};
 use pulsehive_core::tool::{Tool, ToolContext, ToolProgress, ToolResult};
 
 use crate::hivemind::Task;
@@ -39,9 +55,12 @@ pub struct LoopContext<'a> {
     pub max_iterations: usize,
     /// Optional embedding provider for computing embeddings before storage.
     pub embedding_provider: Option<Arc<dyn pulsehive_core::embedding::EmbeddingProvider>>,
-    /// This run's cancellation token (ADR-014). The loop does not check it
-    /// yet — w2 adds the checkpoints; today it only flows into each tool
-    /// invocation's `ToolContext.cancel` as a child token.
+    /// This run's cancellation token (ADR-014). `think_act_loop` checks it
+    /// before each LLM call and each tool call — a cancelled token ends the
+    /// turn as `AgentOutcome::Cancelled` with the latest assistant text as
+    /// `partial_response` — and each provider call carries a child token on
+    /// its `LlmConfig.cancel` so an in-flight request aborts. Each tool
+    /// invocation still receives its own child via `ToolContext.cancel`.
     pub cancel: CancellationToken,
 }
 
@@ -107,6 +126,35 @@ pub async fn run_agentic_loop(config: LlmAgentConfig, ctx: LoopContext<'_>) -> A
     outcome
 }
 
+/// Aborts a caller-token bridge task on drop — the bridge must not outlive
+/// the provider call it serves, whichever path the call exits on (early
+/// return, error arm, or panic).
+struct CancelBridge(Option<tokio::task::JoinHandle<()>>);
+
+impl CancelBridge {
+    /// When the agent's `LlmConfig` carries its own `cancel` token, spawn the
+    /// task that cancels `call_token` when the caller's token fires, so EITHER
+    /// token aborts the in-flight call (ADR-014 A15 — the caller's token is
+    /// never dropped or replaced by the loop's). `None` when the config has no
+    /// caller token: nothing to bridge.
+    fn spawn(caller: Option<CancellationToken>, call_token: CancellationToken) -> Self {
+        Self(caller.map(|caller| {
+            tokio::spawn(async move {
+                caller.cancelled().await;
+                call_token.cancel();
+            })
+        }))
+    }
+}
+
+impl Drop for CancelBridge {
+    fn drop(&mut self) {
+        if let Some(handle) = self.0.take() {
+            handle.abort();
+        }
+    }
+}
+
 /// The core Think→Act loop. Returns when LLM produces a final response or max iterations hit.
 ///
 /// When `refresh_every` is `Some(n)`, re-runs the Perceive phase every `n` tool calls,
@@ -124,8 +172,18 @@ async fn think_act_loop(
     refresh_every: Option<usize>,
 ) -> AgentOutcome {
     let mut tool_calls_since_refresh: usize = 0;
+    // Latest assistant text produced this turn — the `partial_response` a
+    // `Cancelled` outcome carries; empty until the provider produces any.
+    let mut partial_response = String::new();
 
     for iteration in 1..=ctx.max_iterations {
+        // Cancellation checkpoint (ADR-014): a cancelled run token ends the
+        // turn before the next LLM call — no `LlmCallStarted`, no request sent.
+        if ctx.cancel.is_cancelled() {
+            tracing::info!(agent_id = %agent_id, "Run cancelled before LLM call");
+            return AgentOutcome::Cancelled { partial_response };
+        }
+
         let think_span = tracing::info_span!(
             "think",
             agent_id = %agent_id,
@@ -142,10 +200,21 @@ async fn think_act_loop(
             message_count: messages.len(),
         });
 
+        // Per-call cancellation (ADR-014 A2): every provider call carries a
+        // child of the run token on its `LlmConfig`, so cancelling the run
+        // aborts the in-flight request. When the agent definition already
+        // carries its own `LlmConfig.cancel`, the bridge cancels the call
+        // token when the caller's fires — either token aborts the call (A15).
+        // The guard aborts the bridge task on every exit path.
+        let mut call_config = llm_config.clone();
+        let call_token = ctx.cancel.child_token();
+        let _cancel_bridge = CancelBridge::spawn(call_config.cancel.take(), call_token.clone());
+        call_config.cancel = Some(call_token);
+
         let start = Instant::now();
         let response = ctx
             .provider
-            .chat(messages.clone(), tool_defs.to_vec(), llm_config)
+            .chat(messages.clone(), tool_defs.to_vec(), &call_config)
             .instrument(think_span)
             .await;
         let duration_ms = start.elapsed().as_millis() as u64;
@@ -165,6 +234,14 @@ async fn think_act_loop(
 
         let response = match response {
             Ok(r) => r,
+            // A provider-side cancellation (ADR-011's `LlmTransport` with kind
+            // `Cancelled`) ends the turn as `Cancelled`, not `Error`. The call
+            // follows the existing provider-error event path — `LlmCallCompleted`
+            // was already emitted above exactly as for any other failure.
+            Err(PulseHiveError::LlmTransport(e)) if e.kind == LlmErrorKind::Cancelled => {
+                tracing::info!(agent_id = %agent_id, "Provider call cancelled");
+                return AgentOutcome::Cancelled { partial_response };
+            }
             Err(e) => {
                 tracing::error!(agent_id = %agent_id, error = %e, "LLM call failed");
                 return AgentOutcome::Error {
@@ -172,6 +249,12 @@ async fn think_act_loop(
                 };
             }
         };
+
+        // Track the latest assistant text — a later `Cancelled` carries it as
+        // `partial_response`.
+        if let Some(text) = response.content.clone() {
+            partial_response = text;
+        }
 
         // ── ACT: handle response ─────────────────────────────────────
         if response.tool_calls.is_empty() {
@@ -192,6 +275,19 @@ async fn think_act_loop(
         ));
 
         for tool_call in &response.tool_calls {
+            // Cancellation checkpoint (ADR-014 A7): a cancelled run token
+            // means no further tool call starts — no `ToolCallStarted`, no
+            // execute. A tool already running is awaited above, never
+            // force-aborted (A3).
+            if ctx.cancel.is_cancelled() {
+                tracing::info!(
+                    agent_id = %agent_id,
+                    tool = %tool_call.name,
+                    "Run cancelled before tool call"
+                );
+                return AgentOutcome::Cancelled { partial_response };
+            }
+
             let result = execute_tool_call(
                 agent_id,
                 tool_call,
