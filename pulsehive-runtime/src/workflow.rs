@@ -216,29 +216,48 @@ async fn run_parallel(children: Vec<AgentDefinition>, ctx: &WorkflowContext) -> 
     tracing::info!(child_count, "Parallel: spawning children");
 
     let mut join_set = tokio::task::JoinSet::new();
-    // Task id → child name, so a join failure still names its child. Only the
-    // id is kept from each AbortHandle — nothing ever aborts a child task.
-    let mut names: HashMap<tokio::task::Id, String> = HashMap::new();
-    for child in children {
+    // Task id → (declaration index, child name), so a join failure still
+    // orders and names its child. Only the id is kept from each
+    // AbortHandle — nothing ever aborts a child task.
+    let mut names: HashMap<tokio::task::Id, (usize, String)> = HashMap::new();
+    for (index, child) in children.into_iter().enumerate() {
         let name = child.name.clone();
         let child_ctx = ctx.for_child();
         let handle = join_set.spawn(async move { dispatch_agent(child, &child_ctx).await });
-        names.insert(handle.id(), name);
+        names.insert(handle.id(), (index, name));
     }
 
-    let mut responses = Vec::new();
-    let mut errors = Vec::new();
-    let mut cancelled = false;
+    // Children finish in scheduler order — nondeterministic across runs and
+    // platforms. Each outcome therefore carries its declaration index
+    // through the drain and the composite is assembled in declaration
+    // order, so `Complete`, `PartialComplete`, `Error`, and the `Cancelled`
+    // partial response are identical regardless of which child won which
+    // await first.
+    let mut outcomes: Vec<(usize, String, AgentOutcome)> = Vec::with_capacity(child_count);
     while let Some(result) = join_set.join_next_with_id().await {
         let (id, outcome) = match result {
             Ok(joined) => joined,
             Err(join_err) => {
-                let name = names.remove(&join_err.id()).unwrap_or_default();
-                errors.push(format!("{name}: task failed: {join_err}"));
+                let (index, name) = names.remove(&join_err.id()).unwrap_or_default();
+                outcomes.push((
+                    index,
+                    name,
+                    AgentOutcome::Error {
+                        error: format!("task failed: {join_err}"),
+                    },
+                ));
                 continue;
             }
         };
-        let name = names.remove(&id).unwrap_or_default();
+        let (index, name) = names.remove(&id).unwrap_or_default();
+        outcomes.push((index, name, outcome));
+    }
+    outcomes.sort_by_key(|(index, _, _)| *index);
+
+    let mut responses = Vec::new();
+    let mut errors = Vec::new();
+    let mut cancelled = false;
+    for (_index, name, outcome) in outcomes {
         match outcome {
             AgentOutcome::Complete { response } => {
                 responses.push(response);
@@ -504,14 +523,19 @@ mod tests {
     }
 
     async fn test_workflow_ctx(provider: MockLlm) -> WorkflowContext {
+        let mut providers: HashMap<String, Arc<dyn LlmProvider>> = HashMap::new();
+        providers.insert("mock".into(), Arc::new(provider));
+        test_workflow_ctx_with_providers(providers).await
+    }
+
+    async fn test_workflow_ctx_with_providers(
+        providers: HashMap<String, Arc<dyn LlmProvider>>,
+    ) -> WorkflowContext {
         let substrate = test_substrate();
         let collective_id = substrate
             .get_or_create_collective("test-workflow")
             .await
             .unwrap();
-
-        let mut providers: HashMap<String, Arc<dyn LlmProvider>> = HashMap::new();
-        providers.insert("mock".into(), Arc::new(provider));
 
         WorkflowContext {
             task: Task::with_collective(
@@ -528,16 +552,68 @@ mod tests {
     }
 
     fn llm_agent_def(name: &str) -> AgentDefinition {
+        llm_agent_def_on(name, "mock")
+    }
+
+    fn llm_agent_def_on(name: &str, provider: &str) -> AgentDefinition {
         AgentDefinition {
             name: name.into(),
             kind: AgentKind::Llm(Box::new(LlmAgentConfig {
                 system_prompt: "You are a test agent.".into(),
                 tools: vec![],
                 lens: Lens::default(),
-                llm_config: LlmConfig::new("mock", "test-model"),
+                llm_config: LlmConfig::new(provider, "test-model"),
                 experience_extractor: None,
                 refresh_every_n_tool_calls: None,
             })),
+        }
+    }
+
+    // ── Sequenced provider ────────────────────────────────────────────
+
+    /// A provider whose `chat` optionally waits on `wait_for` before
+    /// answering, then replies with `text` or fails with `error`. Parallel
+    /// ordering tests use the gate to fix which child finishes first — a
+    /// shared response queue lets scheduler timing pick the winner instead.
+    struct SequencedProvider {
+        wait_for: Option<Arc<tokio::sync::Notify>>,
+        text: Option<&'static str>,
+        error: Option<&'static str>,
+    }
+
+    #[async_trait]
+    impl LlmProvider for SequencedProvider {
+        async fn chat(
+            &self,
+            _messages: Vec<Message>,
+            _tools: Vec<ToolDefinition>,
+            _config: &LlmConfig,
+        ) -> pulsehive_core::error::Result<LlmResponse> {
+            if let Some(notify) = &self.wait_for {
+                notify.notified().await;
+            }
+            if let Some(error) = self.error {
+                Err(pulsehive_core::error::PulseHiveError::llm(error))
+            } else {
+                Ok(LlmResponse::text(self.text.unwrap_or_default()))
+            }
+        }
+
+        async fn chat_stream(
+            &self,
+            _messages: Vec<Message>,
+            _tools: Vec<ToolDefinition>,
+            _config: &LlmConfig,
+        ) -> pulsehive_core::error::Result<
+            std::pin::Pin<
+                Box<
+                    dyn futures_core::Stream<Item = pulsehive_core::error::Result<LlmChunk>> + Send,
+                >,
+            >,
+        > {
+            Err(pulsehive_core::error::PulseHiveError::llm(
+                "Streaming not used in tests",
+            ))
         }
     }
 
@@ -730,15 +806,24 @@ mod tests {
 
     #[tokio::test]
     async fn test_parallel_one_error_reports_all() {
-        // Only one response — one child succeeds, other errors
-        let provider = MockLlm::new(vec![MockLlm::text_response("I succeeded")]);
-        let ctx = test_workflow_ctx(provider).await;
+        // Per-child providers keep the outcome deterministic: a shared
+        // response queue lets whichever child is scheduled first grab the
+        // one reply, so either name could land in `errors`. With its own
+        // provider, "will-error" always errors and "will-succeed" always
+        // gets the reply.
+        let mut providers: HashMap<String, Arc<dyn LlmProvider>> = HashMap::new();
+        providers.insert(
+            "mock".into(),
+            Arc::new(MockLlm::new(vec![MockLlm::text_response("I succeeded")])),
+        );
+        providers.insert("mock-fail".into(), Arc::new(MockLlm::new(vec![])));
+        let ctx = test_workflow_ctx_with_providers(providers).await;
 
         let agent = AgentDefinition {
             name: "par-err".into(),
             kind: AgentKind::Parallel(vec![
-                llm_agent_def("will-succeed"),
-                llm_agent_def("will-error"),
+                llm_agent_def_on("will-succeed", "mock"),
+                llm_agent_def_on("will-error", "mock-fail"),
             ]),
         };
 
@@ -753,6 +838,142 @@ mod tests {
             other => {
                 panic!("Parallel with one error should return PartialComplete, got: {other:?}")
             }
+        }
+    }
+
+    /// Watches the event bus until `AgentCompleted` arrives for the child
+    /// named `name` (its `AgentStarted` supplies the agent_id), then fires
+    /// `gate`. Runs as the release half of a `tokio::join!` with the
+    /// dispatch under test.
+    async fn release_after_child_completes(
+        rx: &mut tokio::sync::broadcast::Receiver<HiveEvent>,
+        name: &str,
+        gate: Arc<tokio::sync::Notify>,
+    ) {
+        let mut watched_id: Option<String> = None;
+        loop {
+            match rx.recv().await {
+                Ok(HiveEvent::AgentStarted {
+                    agent_id,
+                    name: started,
+                    ..
+                }) if started == name => watched_id = Some(agent_id),
+                Ok(HiveEvent::AgentCompleted { agent_id, .. })
+                    if watched_id.as_ref() == Some(&agent_id) =>
+                {
+                    gate.notify_one();
+                    return;
+                }
+                Ok(_) => {}
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+            }
+        }
+    }
+
+    /// r1.s2 round 2 (Ubuntu CI flake): the parallel drain must assemble
+    /// the composite in declaration order, not completion order. `second`
+    /// finishes strictly before `first` — its provider answers instantly
+    /// while `first`'s is gated until `second`'s `AgentCompleted` — yet the
+    /// composite response must still join them as declared.
+    #[tokio::test]
+    async fn test_parallel_responses_follow_declaration_order() {
+        let first_gate = Arc::new(tokio::sync::Notify::new());
+        let mut providers: HashMap<String, Arc<dyn LlmProvider>> = HashMap::new();
+        providers.insert(
+            "gated".into(),
+            Arc::new(SequencedProvider {
+                wait_for: Some(first_gate.clone()),
+                text: Some("first response"),
+                error: None,
+            }),
+        );
+        providers.insert(
+            "instant".into(),
+            Arc::new(SequencedProvider {
+                wait_for: None,
+                text: Some("second response"),
+                error: None,
+            }),
+        );
+        let ctx = test_workflow_ctx_with_providers(providers).await;
+        let mut rx = ctx.event_emitter.subscribe();
+
+        let agent = AgentDefinition {
+            name: "par-order".into(),
+            kind: AgentKind::Parallel(vec![
+                llm_agent_def_on("first", "gated"),
+                llm_agent_def_on("second", "instant"),
+            ]),
+        };
+
+        let (outcome, ()) = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            tokio::join!(
+                dispatch_agent(agent, &ctx),
+                release_after_child_completes(&mut rx, "second", first_gate),
+            )
+        })
+        .await
+        .expect("dispatch timed out waiting on the child-completion gate");
+
+        match &outcome {
+            AgentOutcome::Complete { response } => assert_eq!(
+                response, "first response\nsecond response",
+                "composite response must join children in declaration order"
+            ),
+            other => panic!("Expected Complete, got: {other:?}"),
+        }
+    }
+
+    /// Same ordering contract on the error path: both children fail and
+    /// `second` finishes first, but the joined error still names them in
+    /// declaration order.
+    #[tokio::test]
+    async fn test_parallel_errors_follow_declaration_order() {
+        let first_gate = Arc::new(tokio::sync::Notify::new());
+        let mut providers: HashMap<String, Arc<dyn LlmProvider>> = HashMap::new();
+        providers.insert(
+            "gated".into(),
+            Arc::new(SequencedProvider {
+                wait_for: Some(first_gate.clone()),
+                text: None,
+                error: Some("first exploded"),
+            }),
+        );
+        providers.insert(
+            "instant".into(),
+            Arc::new(SequencedProvider {
+                wait_for: None,
+                text: None,
+                error: Some("second exploded"),
+            }),
+        );
+        let ctx = test_workflow_ctx_with_providers(providers).await;
+        let mut rx = ctx.event_emitter.subscribe();
+
+        let agent = AgentDefinition {
+            name: "par-err-order".into(),
+            kind: AgentKind::Parallel(vec![
+                llm_agent_def_on("first", "gated"),
+                llm_agent_def_on("second", "instant"),
+            ]),
+        };
+
+        let (outcome, ()) = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            tokio::join!(
+                dispatch_agent(agent, &ctx),
+                release_after_child_completes(&mut rx, "second", first_gate),
+            )
+        })
+        .await
+        .expect("dispatch timed out waiting on the child-completion gate");
+
+        match &outcome {
+            AgentOutcome::Error { error } => assert_eq!(
+                error, "first: LLM error: first exploded; second: LLM error: second exploded",
+                "composite error must join children in declaration order"
+            ),
+            other => panic!("Expected Error, got: {other:?}"),
         }
     }
 
