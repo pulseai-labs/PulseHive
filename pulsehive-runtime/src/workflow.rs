@@ -98,14 +98,27 @@ pub(crate) fn dispatch_agent(
                 task_description: ctx.task.description.clone(),
             });
 
-            let outcome = match agent.kind {
-                AgentKind::Llm(config) => run_llm_agent(&agent_id, *config, ctx).await,
-                AgentKind::Sequential(children) => run_sequential(children, ctx).await,
-                AgentKind::Parallel(children) => run_parallel(children, ctx).await,
-                AgentKind::Loop {
-                    agent,
-                    max_iterations,
-                } => run_loop(*agent, max_iterations, ctx).await,
+            // Cancellation checkpoint at dispatch entry (ADR-014): a run
+            // whose token already fired — a task cancelled before dispatch,
+            // or an agent deployed after shutdown — ends as `Cancelled`
+            // here, before any executor's fast path (empty Sequential,
+            // empty Parallel, zero-iteration Loop) can return `Complete`
+            // or `MaxIterationsReached`.
+            let outcome = if ctx.cancel.is_cancelled() {
+                tracing::info!(agent = %agent_name, "Run cancelled at dispatch entry");
+                AgentOutcome::Cancelled {
+                    partial_response: String::new(),
+                }
+            } else {
+                match agent.kind {
+                    AgentKind::Llm(config) => run_llm_agent(&agent_id, *config, ctx).await,
+                    AgentKind::Sequential(children) => run_sequential(children, ctx).await,
+                    AgentKind::Parallel(children) => run_parallel(children, ctx).await,
+                    AgentKind::Loop {
+                        agent,
+                        max_iterations,
+                    } => run_loop(*agent, max_iterations, ctx).await,
+                }
             };
 
             // Emit lifecycle completion event with the same task identity.
@@ -692,6 +705,67 @@ mod tests {
         assert!(
             matches!(&outcome, AgentOutcome::Error { error } if error.contains("nonexistent")),
             "Expected provider error, got: {outcome:?}"
+        );
+    }
+
+    /// r1.s2 round 2: an already-cancelled run — a pre-cancelled task or a
+    /// post-shutdown deploy — must observe cancellation before the empty
+    /// fast paths can return `Complete`/`MaxIterationsReached`. The check
+    /// lives at dispatch entry so every executor's early return honors it.
+    #[tokio::test]
+    async fn test_cancelled_dispatch_empty_sequential() {
+        let provider = MockLlm::new(vec![]);
+        let ctx = test_workflow_ctx(provider).await;
+        ctx.cancel.cancel();
+
+        let agent = AgentDefinition {
+            name: "seq-empty".into(),
+            kind: AgentKind::Sequential(vec![]),
+        };
+
+        let outcome = dispatch_agent(agent, &ctx).await;
+        assert!(
+            matches!(&outcome, AgentOutcome::Cancelled { partial_response } if partial_response.is_empty()),
+            "Cancelled dispatch of an empty Sequential must return Cancelled with empty partial, got: {outcome:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cancelled_dispatch_empty_parallel() {
+        let provider = MockLlm::new(vec![]);
+        let ctx = test_workflow_ctx(provider).await;
+        ctx.cancel.cancel();
+
+        let agent = AgentDefinition {
+            name: "par-empty".into(),
+            kind: AgentKind::Parallel(vec![]),
+        };
+
+        let outcome = dispatch_agent(agent, &ctx).await;
+        assert!(
+            matches!(&outcome, AgentOutcome::Cancelled { partial_response } if partial_response.is_empty()),
+            "Cancelled dispatch of an empty Parallel must return Cancelled with empty partial, got: {outcome:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cancelled_dispatch_zero_iteration_loop() {
+        let provider = MockLlm::new(vec![]);
+        let ctx = test_workflow_ctx(provider).await;
+        ctx.cancel.cancel();
+
+        let agent = AgentDefinition {
+            name: "loop-0".into(),
+            kind: AgentKind::Loop {
+                agent: Box::new(llm_agent_def("child")),
+                max_iterations: 0,
+            },
+        };
+
+        let outcome = dispatch_agent(agent, &ctx).await;
+        assert!(
+            matches!(&outcome, AgentOutcome::Cancelled { partial_response } if partial_response.is_empty()),
+            "Cancelled dispatch of a zero-iteration Loop must return Cancelled with empty partial, got: {outcome:?}"
         );
     }
 
