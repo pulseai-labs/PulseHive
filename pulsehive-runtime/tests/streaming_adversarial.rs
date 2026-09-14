@@ -709,3 +709,141 @@ async fn dropped_deploy_stream_does_not_wedge_run() {
     .await
     .expect("run never reached its terminal LLM call after the stream was dropped");
 }
+
+/// A streaming tool that leaks its sender into a task flooding progress
+/// forever — the channel never closes, so the forwarder is aborted at the
+/// drain grace. The regression: without awaiting the aborted handle, a
+/// forwarder mid-emit on another worker could land a progress event after
+/// the runtime's `Completed` bookend.
+struct FloodLeakerTool {
+    tool_name: &'static str,
+}
+
+#[async_trait]
+impl Tool for FloodLeakerTool {
+    fn name(&self) -> &str {
+        self.tool_name
+    }
+
+    fn description(&self) -> &str {
+        "Leaks a sender that floods progress forever"
+    }
+
+    fn parameters(&self) -> Value {
+        json!({"type": "object"})
+    }
+
+    async fn execute(&self, _params: Value, _ctx: &ToolContext) -> Result<ToolResult> {
+        Ok(ToolResult::text("floodleaker done"))
+    }
+
+    fn as_streaming(&self) -> Option<&dyn StreamingTool> {
+        Some(self)
+    }
+}
+
+#[async_trait]
+impl StreamingTool for FloodLeakerTool {
+    async fn execute_streaming(
+        &self,
+        _params: Value,
+        _ctx: &ToolContext,
+        progress_tx: mpsc::Sender<ToolProgress>,
+    ) -> Result<ToolResult> {
+        let leaked = progress_tx.clone();
+        // The clone is never dropped: it floods until the channel is torn
+        // down — i.e. until the forwarder is aborted at the drain grace and
+        // its receiver dies. The loop must outlive the 5s grace, so there
+        // is no count cap: a bounded flood could finish inside the grace
+        // and leave the abort path unexercised.
+        tokio::spawn(async move {
+            let mut i = 0f32;
+            loop {
+                if leaked
+                    .send(ToolProgress::Progress {
+                        fraction: i,
+                        message: None,
+                    })
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+                i += 1.0;
+            }
+        });
+        Ok(ToolResult::text("floodleaker done"))
+    }
+}
+
+#[tokio::test]
+async fn aborted_forwarder_emits_nothing_after_completed_bookend() {
+    // Real-time test: the drain grace is 5s. Once the forwarder is aborted
+    // AND awaited, its last emit is guaranteed to precede `Completed`.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let provider = ScriptedProvider::new()
+        .then_tool_call("floodleaker", json!({}))
+        .then_text("survived the flood leak");
+    let hive = scripted_hive(&dir, provider);
+    let agent = scripted_agent(
+        vec![Arc::new(FloodLeakerTool {
+            tool_name: "floodleaker",
+        })],
+        LlmConfig::new("scripted", "test-model"),
+    );
+
+    let mut stream = hive
+        .deploy(
+            vec![agent],
+            vec![Task::new("flood through a leaked sender")],
+        )
+        .await
+        .expect("deploy agents");
+
+    // Drain past AgentCompleted, then keep watching briefly: a not-quite-
+    // dead forwarder would leak one more event into that window.
+    let mut events = Vec::new();
+    tokio::time::timeout(BOUND, async {
+        while let Some(event) = stream.next().await {
+            let done = matches!(event, HiveEvent::AgentCompleted { .. });
+            events.push(event);
+            if done {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("drain timed out before AgentCompleted");
+    let tail = tokio::time::timeout(Duration::from_millis(500), async {
+        while let Some(event) = stream.next().await {
+            events.push(event);
+        }
+    })
+    .await;
+    drop(tail); // timed-out tail is the expected end — the stream stays open
+
+    // The runtime's Completed bookend must be the last progress event this
+    // tool ever produces.
+    let bookend = events.iter().rposition(|event| {
+        matches!(
+            event,
+            HiveEvent::ToolProgress {
+                tool_name,
+                progress: ToolProgress::Completed { .. },
+                ..
+            } if tool_name == "floodleaker"
+        )
+    });
+    let bookend = bookend.expect("floodleaker's Completed bookend was not emitted");
+    assert!(
+        !events[bookend + 1..].iter().any(|event| matches!(
+            event,
+            HiveEvent::ToolProgress { tool_name, .. } if tool_name == "floodleaker"
+        )),
+        "a progress event followed the Completed bookend — the aborted forwarder was still emitting"
+    );
+    match completed_outcome(&events) {
+        AgentOutcome::Complete { response } => assert_eq!(response, "survived the flood leak"),
+        other => panic!("expected AgentOutcome::Complete, got {other:?}"),
+    }
+}

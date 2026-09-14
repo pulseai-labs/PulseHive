@@ -644,6 +644,10 @@ async fn execute_streaming_body(
              stopping the progress forwarder after the drain grace period"
         );
         forwarder.abort();
+        // `abort()` only requests the stop — on a multi-thread runtime the
+        // forwarder can still be mid-emit. Await the handle so no progress
+        // event can land after the `Completed` bookend emitted next.
+        let _ = forwarder.await;
     }
     result
 }
