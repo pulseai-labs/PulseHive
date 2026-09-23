@@ -3,6 +3,10 @@
 index.js
 index.d.ts
 
+# Generated at pack time by scripts/pack-npm.sh — generated, never committed (L4)
+npm/
+artifacts/
+dist-npm/
+
 # Node.js
 node_modules/
-package-lock.json
