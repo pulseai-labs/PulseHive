@@ -45,7 +45,7 @@ jobs:
 
       - uses: actions/setup-node@v6
         with:
-          node-version: "20"
+          node-version: "22"
 
       # Install OpenSSL dev headers on Linux (needed by reqwest/native-tls)
       - name: Install OpenSSL (Linux)
@@ -54,7 +54,7 @@ jobs:
 
       - name: Install npm deps
         working-directory: pulsehive-js
-        run: npm install
+        run: npm ci
 
       # Pin the compiler to a pre-26 Xcode via DEVELOPER_DIR (which OVERRIDES
       # xcode-select). Xcode 26 relocated clang_rt.osx and breaks rustc linking.
@@ -121,21 +121,23 @@ jobs:
 
       - uses: actions/setup-node@v6
         with:
-          node-version: "20"
+          node-version: "22"
           registry-url: "https://registry.npmjs.org"
 
+      # One directory per artifact, so a binary can never be silently replaced by
+      # another platform's upload. pack-npm.sh searches this tree recursively and
+      # refuses a set that does not match the advertised targets exactly.
       - name: Download all binary artifacts
         uses: actions/download-artifact@v4
         with:
-          path: pulsehive-js
+          path: pulsehive-js/artifacts
           pattern: binary-*
-          merge-multiple: true
 
-      - name: Install deps and prepare
+      - name: Install deps and pack publishable tarballs
         working-directory: pulsehive-js
         run: |
-          npm install
-          npx napi prepublish
+          npm ci
+          bash scripts/pack-npm.sh --artifacts artifacts --targets all
 
       - name: Publish to npm
         working-directory: pulsehive-js
@@ -146,6 +148,27 @@ jobs:
             echo "Add the NPM_TOKEN repository secret to enable @pulsehive/sdk publishing."
             exit 0
           fi
-          npm publish --access public
+          # Platform packages first: the main package's optionalDependencies pin
+          # them by exact version, so an install that resolves the main tarball
+          # needs them to already exist.
+          published=0
+          for tarball in dist-npm/*.tgz; do
+            case "${tarball##*/}" in
+              pulsehive-sdk-[0-9]*) continue ;;   # the main package goes last
+            esac
+            npm publish --access public "$tarball"
+            published=$((published + 1))
+          done
+          if [ "$published" -eq 0 ]; then
+            echo "::error::no platform tarballs found in dist-npm/ — refusing to publish the main package alone"
+            exit 1
+          fi
+
+          main_tarball="$(ls dist-npm/pulsehive-sdk-[0-9]*.tgz 2>/dev/null | head -n1 || true)"
+          if [ -z "$main_tarball" ]; then
+            echo "::error::no main @pulsehive/sdk tarball in dist-npm/"
+            exit 1
+          fi
+          npm publish --access public "$main_tarball"
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
