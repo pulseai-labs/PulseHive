@@ -441,6 +441,42 @@ napi() {
   ( cd -- "$PKG_DIR" && npx --no-install napi "$@" )
 }
 
+# The generated loader has to be at the package root before the main package is
+# packed. `files` advertises both index.js and index.d.ts, and wrapper.js requires
+# the former, but both are napi-generated and gitignored — so a tree that only
+# downloaded artifacts (the `pack` job, which never runs `napi build`) has
+# neither, and an `npm pack` of such a tree exits 0 while silently omitting a
+# missing `files` entry. `napi artifacts` restores index.js from --artifacts but
+# not index.d.ts, so the guarantee is made here, explicitly, for both files: take
+# it from the package root when it is already there — the local `--targets host`
+# path, where a built tree has both — otherwise from the recursive search under
+# --artifacts. When it is in neither, fail closed: `npm pack` would exit 0 and ship
+# a main package missing an advertised entry, so the load-bearing behaviour here is
+# the refusal, not the copy. Idempotent on the paths where both are already present.
+ensure_generated_loader() {
+  local name src m
+  local -a missing=()
+  for name in index.js index.d.ts; do
+    if [ -f "$PKG_DIR/$name" ]; then
+      continue
+    fi
+    src="$(find "$ARTIFACTS_DIR" -type f -name "$name" | sort | head -n1)"
+    if [ -n "$src" ]; then
+      cp -- "$src" "$PKG_DIR/$name"
+      say "pack-npm: placed generated $name from $src"
+    else
+      missing+=("$name")
+    fi
+  done
+  if [ "${#missing[@]}" -gt 0 ]; then
+    for m in "${missing[@]}"; do
+      printf 'pack-npm: missing generated %s (not at %s and not under %s)\n' \
+        "$m" "$PKG_DIR" "$ARTIFACTS_DIR" >&2
+    done
+    die "the main package would omit advertised 'files' entries; refusing to pack"
+  fi
+}
+
 sync_npm_package_versions() {
   local version="$1" f
   for f in "$PKG_DIR"/npm/*/package.json; do
@@ -630,6 +666,9 @@ for t in "${EXPECTED[@]}"; do
   [ -d "$NPM_DIR/$p" ] || die "expected platform package directory $NPM_DIR/$p was not created"
   pack_dir "$NPM_DIR/$p"
 done
+# The main package carries the generated loader; platform packages do not, which
+# is why this runs once, immediately before the main package is packed.
+ensure_generated_loader
 pack_dir "$PKG_DIR"
 
 cleanup
