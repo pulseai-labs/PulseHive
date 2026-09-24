@@ -139,7 +139,7 @@ jobs:
       # another platform's upload. pack-npm.sh searches this tree recursively and
       # refuses a set that does not match the advertised targets exactly.
       - name: Download all binary artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: pulsehive-js/artifacts
           pattern: binary-*
