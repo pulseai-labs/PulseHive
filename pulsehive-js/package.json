@@ -7,7 +7,8 @@
   "scripts": {
     "build": "napi build --platform --release --features napi",
     "build:debug": "napi build --platform --features napi",
-    "test": "vitest run"
+    "test": "vitest run",
+    "pack:npm": "bash scripts/pack-npm.sh"
   },
   "napi": {
     "binaryName": "pulsehive-js",
@@ -23,14 +24,13 @@
     "url": "https://github.com/pulseai-labs/PulseHive"
   },
   "engines": {
-    "node": ">= 20"
+    "node": ">=22"
   },
   "files": [
     "wrapper.js",
     "wrapper.d.ts",
     "index.js",
-    "index.d.ts",
-    "*.node"
+    "index.d.ts"
   ],
   "devDependencies": {
     "@napi-rs/cli": "^3.0.0",

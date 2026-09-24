@@ -24,6 +24,7 @@ ADRs follow numbered naming convention: `NNN-decision-title.md`
 | 012 | 2026-09-12 | PulseDB 0.7 Migration & Embedding Identity | Accepted |
 | 013 | 2026-09-13 | Transport & Substrate Boundary Contract | Accepted |
 | 014 | 2026-09-14 | Cancellation Semantics | Accepted |
+| 015 | 2026-09-23 | npm Installation Contract | Accepted |
 
 ---
 

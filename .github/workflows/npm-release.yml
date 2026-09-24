@@ -4,6 +4,13 @@ on:
   push:
     tags:
       - "v*"
+  # The spine's pull request carries per-target install evidence: build and
+  # verify-install run on PRs that touch the JS package or this workflow, while
+  # publish stays tag-only by its own `if:`.
+  pull_request:
+    paths:
+      - "pulsehive-js/**"
+      - ".github/workflows/npm-release.yml"
   workflow_dispatch:
 
 permissions:
@@ -45,7 +52,7 @@ jobs:
 
       - uses: actions/setup-node@v6
         with:
-          node-version: "20"
+          node-version: "22"
 
       # Install OpenSSL dev headers on Linux (needed by reqwest/native-tls)
       - name: Install OpenSSL (Linux)
@@ -54,7 +61,7 @@ jobs:
 
       - name: Install npm deps
         working-directory: pulsehive-js
-        run: npm install
+        run: npm ci
 
       # Pin the compiler to a pre-26 Xcode via DEVELOPER_DIR (which OVERRIDES
       # xcode-select). Xcode 26 relocated clang_rt.osx and breaks rustc linking.
@@ -100,15 +107,128 @@ jobs:
           echo "::error::napi build failed after $max attempts"
           exit 1
 
-      - name: Upload binary
+      - name: Upload binary and generated loader
         uses: actions/upload-artifact@v7
         with:
           name: binary-${{ matrix.platform }}
-          path: pulsehive-js/pulsehive-js.*.node
+          # Both entries of `files` that only `napi build` produces travel with the
+          # artifact. They are platform-independent, so any of the three legs may
+          # supply them, and `pack` — which never runs `napi build` — needs them:
+          # `npm pack` exits 0 while silently omitting a missing `files` entry, so
+          # without this the published main tarball would have no loader at all.
+          path: |
+            pulsehive-js/pulsehive-js.*.node
+            pulsehive-js/index.js
+            pulsehive-js/index.d.ts
+
+  # The only place npm tarballs are produced. The publish job downloads what this
+  # job uploaded, so the bytes that reach the registry are the bytes `verify-install`
+  # installed and executed — the artifact-identity rule in RELEASE.md.
+  pack:
+    name: Pack npm tarballs
+    needs: [build-binaries]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "22"
+
+      # One directory per artifact, so a binary can never be silently replaced by
+      # another platform's upload. pack-npm.sh searches this tree recursively and
+      # refuses a set that does not match the advertised targets exactly.
+      - name: Download all binary artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: pulsehive-js/artifacts
+          pattern: binary-*
+
+      - name: Install deps and pack publishable tarballs
+        working-directory: pulsehive-js
+        run: |
+          npm ci
+          bash scripts/pack-npm.sh --artifacts artifacts --targets all --out dist-npm
+
+      - name: Upload packed tarballs
+        uses: actions/upload-artifact@v7
+        with:
+          name: npm-tarballs
+          path: pulsehive-js/dist-npm/*.tgz
+          if-no-files-found: error
+
+  # Every advertised target installs the packed tarballs on its own runner, on every
+  # advertised Node line, and calls a binding. "Installed and executed, not merely
+  # counted" (RELEASE.md): matching artifact names against target names would bless a
+  # mislabelled or unloadable binary.
+  verify-install:
+    name: Verify install (${{ matrix.platform }} · node ${{ matrix.node }})
+    needs: pack
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # The advertised matrix (ADR-015 A1) is exactly napi.targets: each of the
+        # three targets that gets a platform package is installed and executed on
+        # its own runner, on both advertised Node lines.
+        os: [macos-15, ubuntu-latest, windows-latest]
+        node: ["22", "24"]
+        include:
+          - os: macos-15
+            platform: darwin-arm64
+          - os: ubuntu-latest
+            platform: linux-x64-gnu
+          - os: windows-latest
+            platform: win32-x64-msvc
+    steps:
+      - uses: actions/setup-node@v6
+        with:
+          node-version: ${{ matrix.node }}
+
+      - name: Download the packed tarballs
+        uses: actions/download-artifact@v4
+        with:
+          name: npm-tarballs
+          path: tarballs
+
+      # The consumer tree is deliberately outside the package tree and has no
+      # checkout: this proves the tarballs are installable on their own, with no
+      # Rust toolchain and no source build. `--omit=optional` keeps the install
+      # hermetic — the host platform package arrives as an explicit local tarball
+      # rather than being resolved against a registry that, on the first publish,
+      # does not have it yet. The registry-resolution proof is w3's.
+      - name: Install the host platform + main tarballs and call a binding
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf consumer
+          mkdir -p consumer
+          cd consumer
+          npm init -y >/dev/null
+          platform_tarball="$(ls ../tarballs/pulsehive-sdk-${{ matrix.platform }}-[0-9]*.tgz | head -n1)"
+          main_tarball="$(ls ../tarballs/pulsehive-sdk-[0-9]*.tgz | head -n1)"
+          npm install --no-audit --no-fund --omit=optional "$platform_tarball" "$main_tarball"
+          node -e '
+            const os = require("os");
+            const path = require("path");
+            const sdk = require("@pulsehive/sdk");
+            if (typeof sdk.version !== "function" || sdk.version().length === 0) {
+              throw new Error("@pulsehive/sdk exposed no version() binding");
+            }
+            const substrate = path.join(
+              os.tmpdir(),
+              `pulsehive-verify-install-${process.pid}.db`,
+            );
+            const hive = sdk.HiveMind.builder().substratePath(substrate).build();
+            hive.shutdown();
+            console.log(
+              `per-target install: ok ${{ matrix.platform }} node ${process.version}`,
+            );
+          '
 
   publish:
     name: Publish to npm
-    needs: [build-binaries]
+    needs: [verify-install]
     runs-on: ubuntu-latest
     environment: npm
     # Only publish on tag push (not workflow_dispatch)
@@ -117,28 +237,21 @@ jobs:
     # reviewer — publish waits for manual approval. NPM_TOKEN is provisioned
     # as a repository secret (see release-ops handoff).
     steps:
-      - uses: actions/checkout@v7
-
       - uses: actions/setup-node@v6
         with:
-          node-version: "20"
+          node-version: "22"
           registry-url: "https://registry.npmjs.org"
 
-      - name: Download all binary artifacts
+      # The published bytes are the verified bytes: the tarballs `pack` produced and
+      # `verify-install` installed and executed on every advertised target. Nothing
+      # is re-packed and nothing is built in this job.
+      - name: Download the verified tarballs
         uses: actions/download-artifact@v4
         with:
-          path: pulsehive-js
-          pattern: binary-*
-          merge-multiple: true
-
-      - name: Install deps and prepare
-        working-directory: pulsehive-js
-        run: |
-          npm install
-          npx napi prepublish
+          name: npm-tarballs
+          path: dist-npm
 
       - name: Publish to npm
-        working-directory: pulsehive-js
         shell: bash
         run: |
           if [ -z "${NODE_AUTH_TOKEN:-}" ]; then
@@ -146,6 +259,27 @@ jobs:
             echo "Add the NPM_TOKEN repository secret to enable @pulsehive/sdk publishing."
             exit 0
           fi
-          npm publish --access public
+          # Platform packages first: the main package's optionalDependencies pin
+          # them by exact version, so an install that resolves the main tarball
+          # needs them to already exist.
+          published=0
+          for tarball in dist-npm/*.tgz; do
+            case "${tarball##*/}" in
+              pulsehive-sdk-[0-9]*) continue ;;   # the main package goes last
+            esac
+            npm publish --access public "$tarball"
+            published=$((published + 1))
+          done
+          if [ "$published" -eq 0 ]; then
+            echo "::error::no platform tarballs found in dist-npm/ — refusing to publish the main package alone"
+            exit 1
+          fi
+
+          main_tarball="$(ls dist-npm/pulsehive-sdk-[0-9]*.tgz 2>/dev/null | head -n1 || true)"
+          if [ -z "$main_tarball" ]; then
+            echo "::error::no main @pulsehive/sdk tarball in dist-npm/"
+            exit 1
+          fi
+          npm publish --access public "$main_tarball"
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
