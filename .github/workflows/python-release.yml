@@ -76,14 +76,46 @@ jobs:
               apt-get update && apt-get install -y libssl-dev pkg-config
             fi
 
-      # r2.s2.w4: prove the wheel this leg just built installs and imports on
-      # this leg's own runner before it can be uploaded. The step lives inside
-      # the matrix job body, so it runs once per advertised target against that
-      # target's own wheel from dist/. PYTHON=python pins the setup-python 3.12
-      # interpreter (the smoke needs >=3.11; `python3` is not a reliable name on
-      # the Windows runner). A leg whose wheel fails install/import fails the
-      # matrix job, which the publish job's needs: already blocks on.
-      - name: Smoke the wheel (install + import, this target)
+      # r2.s2.w4 / ADR-016 (L2): the wheel this leg just built must install and
+      # import under EVERY advertised Python minor — 3.11, 3.12 and 3.13 are
+      # the advertised and tested lines, so a wheel (or a Python-level
+      # regression) that only works on the single minor that happened to be on
+      # PATH could otherwise still be published. These steps live inside the
+      # matrix job body, so they run once per advertised target against that
+      # target's own wheel from dist/. Because pyo3 builds it as cp311-abi3,
+      # one build serves all three minors: each setup-python call below
+      # prepends the minor it installs to PATH for the steps that follow, so
+      # every pair re-points `python` at one advertised minor and runs the same
+      # install-and-import path against it. PYTHON=python pins the interpreter
+      # the pair just installed (the smoke needs >=3.11, and `python3` is not a
+      # reliable name on the Windows runner). A leg whose wheel fails
+      # install/import under any advertised minor fails the matrix job, which
+      # the publish job's needs: already blocks on.
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - name: Smoke the wheel under Python 3.11 (install + import, this target)
+        shell: bash
+        run: |
+          export PYTHON=python
+          bash pulsehive-py/scripts/py-wheel-smoke.sh --wheel dist/*.whl
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Smoke the wheel under Python 3.12 (install + import, this target)
+        shell: bash
+        run: |
+          export PYTHON=python
+          bash pulsehive-py/scripts/py-wheel-smoke.sh --wheel dist/*.whl
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+
+      - name: Smoke the wheel under Python 3.13 (install + import, this target)
         shell: bash
         run: |
           export PYTHON=python
