@@ -106,11 +106,24 @@ check_dist() {
   local dist_dir="$1" expect_version="$2"
   [ -d "$dist_dir" ] || fail "dist directory '$dist_dir' not found"
 
-  local wheels=()
-  shopt -s nullglob
+  # The release publishes wheels only, and the publish action uploads whatever
+  # is in dist/ — with the sdist build gone, nothing else rejects a stray file
+  # (a leftover tarball, a zip, an editor backup, a build log), which would
+  # otherwise be uploaded as an artifact no check ever looked at.
+  local wheels=() others=() entry
+  shopt -s nullglob dotglob
   wheels=("$dist_dir"/*.whl)
-  shopt -u nullglob
+  for entry in "$dist_dir"/*; do
+    [ -f "$entry" ] || continue
+    case "${entry##*/}" in
+      *.whl) : ;;
+      *) others+=("${entry##*/}") ;;
+    esac
+  done
+  shopt -u nullglob dotglob
   [ "${#wheels[@]}" -gt 0 ] || fail "no wheels (*.whl) found in '$dist_dir'"
+  [ "${#others[@]}" -eq 0 ] ||
+    fail "non-wheel artifact(s) in '$dist_dir': ${others[*]} — the release publishes wheels (*.whl) only"
 
   local wheel base version platform name="" matched_target target pattern
   local seen=" "
@@ -357,6 +370,20 @@ self_test() {
   # same version: `3.0.0b1` wheels are not `3.0.0-beta.2`.
   expect_reject "prerelease set against a different prerelease" "$d" "3.0.0-beta.2" \
     "carries version '$wheel_pre' but --expect-version is '3.0.0-beta.2'"
+
+  # 8. Wheels only: any other file in dist/ is a named rejection rather than
+  # something the uploader has to notice — including a dotfile, which is
+  # exactly the kind of stray a macOS build agent leaves behind.
+  SELFTEST_HTTP_CODE="404"
+  d="$tmp/stray"
+  make_set "$d"
+  : > "$d/pulsehive-$ver.tar.gz"
+  expect_reject "stray tarball in dist" "$d" "$ver" "non-wheel artifact(s) in '$d': pulsehive-$ver.tar.gz"
+
+  d="$tmp/stray-hidden"
+  make_set "$d"
+  : > "$d/.DS_Store"
+  expect_reject "stray dotfile in dist" "$d" "$ver" "non-wheel artifact(s) in '$d': .DS_Store"
 
   echo "self-test: ok"
 }
