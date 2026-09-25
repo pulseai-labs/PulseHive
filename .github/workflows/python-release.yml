@@ -56,11 +56,11 @@ jobs:
           echo "DEVELOPER_DIR=$sel" >> "$GITHUB_ENV"
           echo "Using Xcode: $sel"
 
-      # Because pyo3 enables the abi3-py39 feature, maturin produces a single
-      # forward-compatible cp39-abi3 wheel per platform that runs on CPython
-      # 3.9+ (via the stable ABI) — instead of a cp312-only wheel that forced
-      # 3.9-3.11 users onto an sdist -> local Rust build. Fixes #24.
-      - name: Build abi3 wheel (cp39-abi3, CPython 3.9+)
+      # Because pyo3 enables the abi3-py311 feature, maturin produces a single
+      # forward-compatible cp311-abi3 wheel per platform that runs on CPython
+      # 3.11+ (via the stable ABI) — one wheel per platform across the whole
+      # advertised 3.11/3.12/3.13 line.
+      - name: Build abi3 wheel (cp311-abi3, CPython 3.11+)
         uses: PyO3/maturin-action@v1
         with:
           target: ${{ matrix.target }}
@@ -82,27 +82,32 @@ jobs:
           name: wheel-${{ matrix.platform }}
           path: dist/*.whl
 
-  build-sdist:
-    name: Build sdist
+  verify-artifacts:
+    name: Verify artifacts before publish
     runs-on: ubuntu-latest
+    # Gate only on tag push (not workflow_dispatch) — mirrors the publish gate
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: build-wheels
     steps:
       - uses: actions/checkout@v7
 
-      - name: Build sdist
-        uses: PyO3/maturin-action@v1
+      - name: Download all wheel artifacts
+        uses: actions/download-artifact@v4
         with:
-          command: sdist
-          args: --out dist --manifest-path pulsehive-py/Cargo.toml
+          pattern: wheel-*
+          path: dist
+          merge-multiple: true
 
-      - name: Upload sdist
-        uses: actions/upload-artifact@v7
-        with:
-          name: sdist
-          path: dist/*.tar.gz
+      # Prove the gate is live in CI before trusting it on the real artifact set
+      - name: Self-test the publish gate (hermetic, no network)
+        run: bash pulsehive-py/scripts/py-publish-check.sh --self-test
+
+      - name: Verify wheels match the tag and are unpublished
+        run: bash pulsehive-py/scripts/py-publish-check.sh --dist dist --expect-version "${GITHUB_REF_NAME#v}"
 
   publish:
     name: Publish to PyPI
-    needs: [build-wheels, build-sdist]
+    needs: [build-wheels, verify-artifacts]
     runs-on: ubuntu-latest
     # Only publish on tag push (not workflow_dispatch)
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
