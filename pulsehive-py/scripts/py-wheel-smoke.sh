@@ -24,18 +24,23 @@
 #
 # Build profile (implementer's choice, sized for the warm < 240 s bound against
 # RELEASE.md's 600 s budget): maturin itself is installed into a throwaway venv
-# under the run's mktemp dir; cargo compilation lands in the persistent target
-# dir $PULSEHIVE_WHEEL_SMOKE_TARGET_DIR — by default
-# ~/.cache/pulsehive/py-wheel-smoke/target, outside the worktree so a local run
-# leaves nothing behind, and in CI the workspace target/ that the job's
-# rust-cache step already caches, so no PR run compiles the release tree a
-# second time. The default dir is also what keeps the cold
-# ort-sys/onnxruntime fetch to one payment. The wheel, the virtualenvs and
-# every other temp file live under one mktemp -d dir that the EXIT trap removes.
-# Nothing this script creates is ever written inside the worktree; a workspace
-# Cargo.lock the build generates (gitignored in this repo) is removed again on
-# exit. The asserted version is read from pulsehive-py/Cargo.toml — never a
-# restated copy (r2.s1 L4). This item proves an artifact; it never uploads one.
+# under the run's mktemp dir, and cargo compilation lands in the persistent
+# target dir $PULSEHIVE_WHEEL_SMOKE_TARGET_DIR. That dir is the caller's, never
+# this script's: the default is
+# ${XDG_CACHE_HOME:-$HOME/.cache}/pulsehive/py-wheel-smoke/target, outside the
+# worktree so a local run leaves no build artifacts behind, and CI names a path
+# of its own outside the checkout and caches that path — which is how the
+# release dependency tree this half compiles survives to the next run instead
+# of being compiled again. A persistent dir is also what keeps the cold
+# ort-sys/onnxruntime fetch to one payment.
+#
+# Everything else this script creates — the wheel, the virtualenvs, the planted
+# wheels — lives under one mktemp -d dir outside the worktree that the EXIT
+# trap removes, so no build artifact of a run ends up inside the tree. The one
+# file-shaped exception is a workspace Cargo.lock the build generates
+# (gitignored in this repo), which is removed again on exit. The asserted
+# version is read from pulsehive-py/Cargo.toml — never a restated copy (r2.s1
+# L4). This item proves an artifact; it never uploads one.
 #
 # Interpreter rule (every mode): $PYTHON if set, else python3, else python, and
 # it must be >= 3.11 (ADR-016 requires-python) or the script fails with a named

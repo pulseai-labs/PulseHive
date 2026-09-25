@@ -128,17 +128,37 @@ jobs:
       # it, and asserts the manifest version and the cp311-abi3 tag. Nothing it
       # creates stays in the tree.
       #
-      # Its cargo target dir is pointed at the workspace target/ that
-      # Swatinem/rust-cache (above) already caches, rather than the script's
-      # private ~/.cache default — which is never cached, so every PR run
-      # recompiled the whole release dependency tree a second time. Reusing the
-      # one cached dir is the cheaper of the two possible fixes here: it needs
-      # no second actions/cache entry to keep warm, and the release artifacts
-      # it leaves behind are then cached along with the debug ones the step
-      # above builds.
+      # Its cargo target dir is the one heavy thing a run leaves behind, so this
+      # job caches it separately, outside the checkout: the smoke's
+      # `maturin build --release` compiles the release dependency tree, which
+      # the debug build above cannot satisfy. Caching the smoke's own dir — with
+      # the dir named here rather than inferred from the script's XDG default,
+      # so the path the build uses and the path the cache stores are the same by
+      # construction — is what makes that compile survive to the next run.
+      #
+      # This replaces pointing the smoke at the workspace target/ that
+      # Swatinem/rust-cache (above) caches. That did not make the compile
+      # survive: every run of this job restored the same cache entry byte for
+      # byte (436 MB, 457665885 B — the runs for ac64a678 and 3212c5e7) and
+      # then recompiled 2m44s of release dependencies on top of it, because the
+      # entry had been written before the smoke ever built into that dir and an
+      # existing cache key cannot be rewritten. It also put cargo artifacts
+      # inside the checkout, which the script's own header promises it never
+      # does.
+      - name: Cache the wheel smoke's cargo target dir
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/py-wheel-smoke-target
+          # Content-based, so the entry is rewritten when the manifests or the
+          # smoke itself change, and reused (by prefix) while they do not.
+          key: ${{ runner.os }}-wheel-smoke-${{ hashFiles('Cargo.toml', 'Cargo.lock', 'pulsehive-py/Cargo.toml', 'pulsehive-py/scripts/py-wheel-smoke.sh', 'pulsehive-py/scripts/lib/pep440.sh') }}
+          restore-keys: |
+            ${{ runner.os }}-wheel-smoke-
+
       - name: Wheel smoke (build, install, import)
         env:
-          PULSEHIVE_WHEEL_SMOKE_TARGET_DIR: ${{ github.workspace }}/target
+          # Outside the checkout on purpose: see the script's header, and above.
+          PULSEHIVE_WHEEL_SMOKE_TARGET_DIR: ${{ runner.temp }}/py-wheel-smoke-target
         run: bash pulsehive-py/scripts/py-wheel-smoke.sh
 
       - name: Run Python tests
