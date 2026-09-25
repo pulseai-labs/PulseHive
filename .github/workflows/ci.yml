@@ -124,10 +124,21 @@ jobs:
       # r2.s2.w4: every PR proves a freshly built wheel installs and imports —
       # the same single install path the release matrix legs run. Default build
       # mode: the script builds the wheel with maturin (its own throwaway
-      # maturin venv, cargo target dir outside the checkout), installs it into
-      # a fresh venv with --no-index, imports it, and asserts the manifest
-      # version and the cp311-abi3 tag. Nothing it creates stays in the tree.
+      # maturin venv), installs it into a fresh venv with --no-index, imports
+      # it, and asserts the manifest version and the cp311-abi3 tag. Nothing it
+      # creates stays in the tree.
+      #
+      # Its cargo target dir is pointed at the workspace target/ that
+      # Swatinem/rust-cache (above) already caches, rather than the script's
+      # private ~/.cache default — which is never cached, so every PR run
+      # recompiled the whole release dependency tree a second time. Reusing the
+      # one cached dir is the cheaper of the two possible fixes here: it needs
+      # no second actions/cache entry to keep warm, and the release artifacts
+      # it leaves behind are then cached along with the debug ones the step
+      # above builds.
       - name: Wheel smoke (build, install, import)
+        env:
+          PULSEHIVE_WHEEL_SMOKE_TARGET_DIR: ${{ github.workspace }}/target
         run: bash pulsehive-py/scripts/py-wheel-smoke.sh
 
       - name: Run Python tests
