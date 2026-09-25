@@ -112,18 +112,24 @@ check_dist() {
   [ -d "$dist_dir" ] || fail "dist directory '$dist_dir' not found"
 
   # The release publishes wheels only, and the publish action uploads whatever
-  # is in dist/ — with the sdist build gone, nothing else rejects a stray file
-  # (a leftover tarball, a zip, an editor backup, a build log), which would
-  # otherwise be uploaded as an artifact no check ever looked at.
-  local wheels=() others=() entry
+  # is in dist/ — with the sdist build gone, nothing else rejects a stray entry
+  # (a leftover tarball, a zip, an editor backup, a build log, a directory a
+  # tool left behind), which would otherwise be uploaded as an artifact no check
+  # ever looked at. The test is on the entry itself, not only on its name: a
+  # directory called `pulsehive-3.0.0-cp311-abi3-win_amd64.whl` is a directory.
+  local wheels=() others=() entry entry_name
   shopt -s nullglob dotglob
   wheels=("$dist_dir"/*.whl)
   for entry in "$dist_dir"/*; do
-    [ -f "$entry" ] || continue
-    case "${entry##*/}" in
-      *.whl) : ;;
-      *) others+=("${entry##*/}") ;;
-    esac
+    entry_name="${entry##*/}"
+    if [ -f "$entry" ] && [ ! -L "$entry" ] && [ "${entry_name%.whl}" != "$entry_name" ]; then
+      continue # a regular *.whl file: the only thing dist/ may hold
+    fi
+    if [ -d "$entry" ]; then
+      others+=("$entry_name/") # a directory (or a link to one)
+    else
+      others+=("$entry_name")
+    fi
   done
   shopt -u nullglob dotglob
   [ "${#wheels[@]}" -gt 0 ] || fail "no wheels (*.whl) found in '$dist_dir'"
@@ -397,6 +403,37 @@ self_test() {
   make_set "$d"
   : > "$d/.DS_Store"
   expect_reject "stray dotfile in dist" "$d" "$ver" "non-wheel artifact(s) in '$d': .DS_Store"
+
+  # 8b. An entry that is not a regular file is rejected too, not skipped: a
+  # directory in dist/ is what the old `[ -f "$entry" ] || continue` walked
+  # past, and a directory whose name is a perfectly good wheel filename is what
+  # a name-only test would let through. Both are proven, and the fixtures are
+  # checked so a planting failure can never read as an acceptance.
+  d="$tmp/stray-dir"
+  make_set "$d"
+  mkdir -p "$d/leftover-dir" || fail "self-test: cannot plant a directory in dist"
+  expect_reject "directory in dist" "$d" "$ver" "non-wheel artifact(s) in '$d': leftover-dir/"
+
+  d="$tmp/stray-dir-named-whl"
+  make_set "$d"
+  rm "$d/pulsehive-$ver-cp311-abi3-win_amd64.whl"
+  mkdir -p "$d/pulsehive-$ver-cp311-abi3-win_amd64.whl" ||
+    fail "self-test: cannot plant a wheel-named directory in dist"
+  expect_reject "directory named like a wheel" "$d" "$ver" \
+    "non-wheel artifact(s) in '$d': pulsehive-$ver-cp311-abi3-win_amd64.whl/"
+
+  # ...and a symlink is not a regular file either. Only run where the host
+  # really makes symlinks (Git Bash on Windows may copy instead), so the case
+  # proves the rule rather than the filesystem's mood.
+  d="$tmp/stray-symlink"
+  make_set "$d"
+  mv "$d/pulsehive-$ver-cp311-abi3-macosx_11_0_arm64.whl" "$tmp/real-wheel.whl" ||
+    fail "self-test: cannot move a wheel aside for the symlink case"
+  if ln -s "$tmp/real-wheel.whl" "$d/pulsehive-$ver-cp311-abi3-macosx_11_0_arm64.whl" 2>/dev/null &&
+    [ -L "$d/pulsehive-$ver-cp311-abi3-macosx_11_0_arm64.whl" ]; then
+    expect_reject "symlink in dist" "$d" "$ver" \
+      "non-wheel artifact(s) in '$d': pulsehive-$ver-cp311-abi3-macosx_11_0_arm64.whl"
+  fi
 
   echo "self-test: ok"
 }

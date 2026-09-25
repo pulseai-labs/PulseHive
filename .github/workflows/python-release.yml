@@ -178,9 +178,14 @@ jobs:
     permissions:
       id-token: write # trusted publishing (OIDC)
     steps:
-      - name: Download all artifacts
+      # pattern: wheel-* — the same artifact set verify-artifacts proved. Without
+      # it this job downloads every artifact of the run, not only the wheels the
+      # gate judged, so anything else a matrix leg uploads would reach the
+      # publish step as part of dist/.
+      - name: Download all wheel artifacts
         uses: actions/download-artifact@v4
         with:
+          pattern: wheel-*
           path: dist
           merge-multiple: true
 
