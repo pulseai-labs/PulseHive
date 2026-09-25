@@ -56,11 +56,11 @@ jobs:
           echo "DEVELOPER_DIR=$sel" >> "$GITHUB_ENV"
           echo "Using Xcode: $sel"
 
-      # Because pyo3 enables the abi3-py39 feature, maturin produces a single
-      # forward-compatible cp39-abi3 wheel per platform that runs on CPython
-      # 3.9+ (via the stable ABI) — instead of a cp312-only wheel that forced
-      # 3.9-3.11 users onto an sdist -> local Rust build. Fixes #24.
-      - name: Build abi3 wheel (cp39-abi3, CPython 3.9+)
+      # Because pyo3 enables the abi3-py311 feature, maturin produces a single
+      # forward-compatible cp311-abi3 wheel per platform that runs on CPython
+      # 3.11+ (via the stable ABI) — one wheel per platform across the whole
+      # advertised 3.11/3.12/3.13 line.
+      - name: Build abi3 wheel (cp311-abi3, CPython 3.11+)
         uses: PyO3/maturin-action@v1
         with:
           target: ${{ matrix.target }}
@@ -76,33 +76,101 @@ jobs:
               apt-get update && apt-get install -y libssl-dev pkg-config
             fi
 
+      # r2.s2.w4 / ADR-016 (L2): the wheel this leg just built must install and
+      # import under EVERY advertised Python minor — 3.11, 3.12 and 3.13 are
+      # the advertised and tested lines, so a wheel (or a Python-level
+      # regression) that only works on the single minor that happened to be on
+      # PATH could otherwise still be published. These steps live inside the
+      # matrix job body, so they run once per advertised target against that
+      # target's own wheel from dist/. Because pyo3 builds it as cp311-abi3,
+      # one build serves all three minors: each setup-python call below
+      # prepends the minor it installs to PATH for the steps that follow, so
+      # every pair re-points `python` at one advertised minor and runs the same
+      # install-and-import path against it. PYTHON=python pins the interpreter
+      # the pair just installed (the smoke needs >=3.11, and `python3` is not a
+      # reliable name on the Windows runner).
+      #
+      # Each pair also asserts the minor it claims, because PATH is what
+      # decides, not the step name: the smoke's own floor is >=3.11, so a
+      # `python` this leg never set up (an earlier PATH entry winning on the
+      # runner) would let all three pairs pass while covering one minor three
+      # times and leaving the advertised ones untested. The assertion prints
+      # the interpreter and fails the step if its major.minor is not the one
+      # setup-python was asked for — so a drift between the two also fails
+      # here, loudly, instead of passing quietly. A leg whose wheel fails
+      # install/import under any advertised minor fails the matrix job, which
+      # the publish job's needs: already blocks on.
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - name: Smoke the wheel under Python 3.11 (install + import, this target)
+        shell: bash
+        env:
+          EXPECT_MINOR: "3.11"
+        run: |
+          export PYTHON=python
+          python -c 'import os, sys; want = os.environ["EXPECT_MINOR"]; got = "%d.%d" % sys.version_info[:2]; print("smoke interpreter: Python " + sys.version.split()[0]); raise SystemExit(0 if got == want else "expected Python " + want + ", got " + got)'
+          bash pulsehive-py/scripts/py-wheel-smoke.sh --wheel dist/*.whl
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Smoke the wheel under Python 3.12 (install + import, this target)
+        shell: bash
+        env:
+          EXPECT_MINOR: "3.12"
+        run: |
+          export PYTHON=python
+          python -c 'import os, sys; want = os.environ["EXPECT_MINOR"]; got = "%d.%d" % sys.version_info[:2]; print("smoke interpreter: Python " + sys.version.split()[0]); raise SystemExit(0 if got == want else "expected Python " + want + ", got " + got)'
+          bash pulsehive-py/scripts/py-wheel-smoke.sh --wheel dist/*.whl
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+
+      - name: Smoke the wheel under Python 3.13 (install + import, this target)
+        shell: bash
+        env:
+          EXPECT_MINOR: "3.13"
+        run: |
+          export PYTHON=python
+          python -c 'import os, sys; want = os.environ["EXPECT_MINOR"]; got = "%d.%d" % sys.version_info[:2]; print("smoke interpreter: Python " + sys.version.split()[0]); raise SystemExit(0 if got == want else "expected Python " + want + ", got " + got)'
+          bash pulsehive-py/scripts/py-wheel-smoke.sh --wheel dist/*.whl
+
       - name: Upload wheel
         uses: actions/upload-artifact@v7
         with:
           name: wheel-${{ matrix.platform }}
           path: dist/*.whl
 
-  build-sdist:
-    name: Build sdist
+  verify-artifacts:
+    name: Verify artifacts before publish
     runs-on: ubuntu-latest
+    # Gate only on tag push (not workflow_dispatch) — mirrors the publish gate
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: build-wheels
     steps:
       - uses: actions/checkout@v7
 
-      - name: Build sdist
-        uses: PyO3/maturin-action@v1
+      - name: Download all wheel artifacts
+        uses: actions/download-artifact@v4
         with:
-          command: sdist
-          args: --out dist --manifest-path pulsehive-py/Cargo.toml
+          pattern: wheel-*
+          path: dist
+          merge-multiple: true
 
-      - name: Upload sdist
-        uses: actions/upload-artifact@v7
-        with:
-          name: sdist
-          path: dist/*.tar.gz
+      # Prove the gate is live in CI before trusting it on the real artifact set
+      - name: Self-test the publish gate (hermetic, no network)
+        run: bash pulsehive-py/scripts/py-publish-check.sh --self-test
+
+      - name: Verify wheels match the tag and are unpublished
+        run: bash pulsehive-py/scripts/py-publish-check.sh --dist dist --expect-version "${GITHUB_REF_NAME#v}"
 
   publish:
     name: Publish to PyPI
-    needs: [build-wheels, build-sdist]
+    needs: [build-wheels, verify-artifacts]
     runs-on: ubuntu-latest
     # Only publish on tag push (not workflow_dispatch)
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
@@ -110,9 +178,14 @@ jobs:
     permissions:
       id-token: write # trusted publishing (OIDC)
     steps:
-      - name: Download all artifacts
+      # pattern: wheel-* — the same artifact set verify-artifacts proved. Without
+      # it this job downloads every artifact of the run, not only the wheels the
+      # gate judged, so anything else a matrix leg uploads would reach the
+      # publish step as part of dist/.
+      - name: Download all wheel artifacts
         uses: actions/download-artifact@v4
         with:
+          pattern: wheel-*
           path: dist
           merge-multiple: true
 

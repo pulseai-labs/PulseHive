@@ -54,9 +54,10 @@ tempfile = "3"
 criterion = { version = "0.8", features = ["html_reports"] }
 
 # Python bindings (PyO3)
-# abi3-py39: build one forward-compatible wheel (cp39-abi3) that runs on
-# CPython 3.9+ via the stable ABI, instead of a per-minor-version wheel.
-pyo3 = { version = "0.29", features = ["macros", "abi3-py39"] }
+# abi3-py311: build one forward-compatible wheel (cp311-abi3) that runs on
+# CPython 3.11+ via the stable ABI — one wheel per platform covering the
+# whole advertised 3.11/3.12/3.13 line.
+pyo3 = { version = "0.29", features = ["macros", "abi3-py311"] }
 
 # Node.js bindings (napi-rs)
 napi = { version = "3", default-features = false }

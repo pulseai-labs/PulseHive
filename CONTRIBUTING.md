@@ -24,7 +24,7 @@ cargo doc --no-deps --workspace --open
 ### Prerequisites
 
 - **Rust**: stable toolchain (install via [rustup](https://rustup.rs/))
-- **Python 3.9+** (for pulsehive-py development): `pip install maturin pytest pytest-asyncio`
+- **Python 3.11+** (for pulsehive-py development): `pip install maturin pytest pytest-asyncio`
 - **Node.js 18+** (for pulsehive-js development): `npm install` in `pulsehive-js/`
 
 ## Code Quality

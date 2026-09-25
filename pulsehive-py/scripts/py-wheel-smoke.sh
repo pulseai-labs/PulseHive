@@ -1,0 +1,621 @@
+#!/usr/bin/env bash
+# py-wheel-smoke.sh — hermetic wheel proof for the `pulsehive` Python
+# distribution (r2.s2.w3). Builds the wheel this tree would publish, installs it
+# into a fresh virtualenv with --no-index (offline, no dependency resolution —
+# installing a wheel never needs a build toolchain), imports `pulsehive`, and
+# asserts the version and the cp311-abi3 tag that ADR-016 promises. Demo line
+# d23; the single install path w4 wires into CI.
+#
+# Modes:
+#   (default)           build the wheel from pulsehive-py/ with maturin, then run
+#                       the install-and-assert half. Prints `py wheel smoke: ok`
+#                       as its last line on success.
+#   --wheel <path>      the same install-and-assert half against an already-built
+#                       wheel — no build step (w4's CI matrix legs call this).
+#   --self-test         hermetic (no network): proves the checks are live —
+#                       both venv layouts resolve and make_venv is driven on
+#                       the Windows one, the version rule reads a Cargo
+#                       prerelease as the version maturin spells on the wheel,
+#                       tampered wheels whose metadata version and tags
+#                       disagree are rejected, a different prerelease is still
+#                       rejected, and the import-path control fires on the
+#                       tampered wheel and passes on the truthful one. Prints
+#                       `self-test: ok` as its last line.
+#
+# Build profile (implementer's choice, sized for the warm < 240 s bound against
+# RELEASE.md's 600 s budget): maturin itself is installed into a throwaway venv
+# under the run's mktemp dir, and cargo compilation lands in the persistent
+# target dir $PULSEHIVE_WHEEL_SMOKE_TARGET_DIR. That dir is the caller's, never
+# this script's: the default is
+# ${XDG_CACHE_HOME:-$HOME/.cache}/pulsehive/py-wheel-smoke/target, outside the
+# worktree so a local run leaves no build artifacts behind, and CI names a path
+# of its own outside the checkout and caches that path — which is how the
+# release dependency tree this half compiles survives to the next run instead
+# of being compiled again. A persistent dir is also what keeps the cold
+# ort-sys/onnxruntime fetch to one payment.
+#
+# Everything else this script creates — the wheel, the virtualenvs, the planted
+# wheels — lives under one mktemp -d dir outside the worktree that the EXIT
+# trap removes, so no build artifact of a run ends up inside the tree. The one
+# file-shaped exception is a workspace Cargo.lock the build generates
+# (gitignored in this repo), which is removed again on exit. The asserted
+# version is read from pulsehive-py/Cargo.toml — never a restated copy (r2.s1
+# L4). This item proves an artifact; it never uploads one.
+#
+# Interpreter rule (every mode): $PYTHON if set, else python3, else python, and
+# it must be >= 3.11 (ADR-016 requires-python) or the script fails with a named
+# error.
+#
+# venv rule (every mode): a virtualenv is resolved where the interpreter that
+# created it puts it — `bin/python` and `bin/<script>` on POSIX, `Scripts/
+# python.exe` and `Scripts/<script>.exe` on Windows (both the release matrix's
+# windows-latest leg and the local Git Bash there). Nothing here assumes the
+# POSIX layout: a layout this host does not have is simply not the one that is
+# used, so the same script proves the same wheel on all three advertised
+# targets.
+#
+# Version rule (every mode): the expected version is the literal `version` under
+# [package] in pulsehive-py/Cargo.toml, while the versions this script reads off
+# the artifact are the ones maturin wrote — PEP 440's canonical spelling. The
+# two are compared as versions through lib/pep440.sh, at every site (the wheel
+# filename, the wheel METADATA, and the imported distribution), so a Cargo
+# prerelease like `3.0.0-beta.1`, which maturin spells `3.0.0b1` on the wheel,
+# is accepted as the version it is.
+
+set -u
+
+PROG="py-wheel-smoke"
+PY_TAG="cp311"      # ADR-016: requires-python >=3.11 on the stable ABI
+ABI_TAG="abi3"
+MIN_MAJOR=3
+MIN_MINOR=11
+STALE_VER="0.3.0b2" # the stale version issue #92 forbids; a fixture, never asserted
+PRE_CARGO="3.0.0-beta.1" # a Cargo prerelease the way the manifest or a tag spells it
+PRE_PEP="3.0.0b1"        # ...and the way maturin spells it on the wheel (a fixture too)
+
+PY=""
+ROOT=""
+MANIFEST=""
+PYPROJECT=""
+TARGET_DIR=""
+SMOKE_TMP=""
+VENV_PY=""
+LOCK_GENERATED=0
+
+usage() {
+  cat <<EOF
+usage:
+  $PROG                  build the wheel, then install-and-assert it in a fresh venv
+  $PROG --wheel <path>   install-and-assert an already-built wheel (no build)
+  $PROG --self-test      hermetic proof that the assertions are live
+EOF
+}
+
+fail() {
+  echo "$PROG: ERROR: $*" >&2
+  exit 1
+}
+
+# resolve_py — set PY to $PYTHON, else python3, else python; named error if none
+resolve_py() {
+  if [ -n "${PYTHON:-}" ]; then
+    command -v "$PYTHON" >/dev/null 2>&1 ||
+      fail "\$PYTHON='$PYTHON' is set but is not a runnable interpreter"
+    PY="$PYTHON"
+    return 0
+  fi
+  if command -v python3 >/dev/null 2>&1; then
+    PY="python3"
+  elif command -v python >/dev/null 2>&1; then
+    PY="python"
+  else
+    fail "no Python interpreter found (looked for \$PYTHON, python3, python)"
+  fi
+}
+
+# check_py_version — the resolved interpreter must be >= 3.11 (ADR-016)
+check_py_version() {
+  local v major minor
+  v=$("$PY" -c 'import sys; print("%d.%d" % sys.version_info[:2])') ||
+    fail "cannot query the Python version of interpreter '$PY'"
+  major=${v%%.*}
+  minor=${v#*.}
+  minor=${minor%%.*}
+  case "${major}${minor}" in
+    *[!0-9]*) fail "interpreter '$PY' reported a non-numeric version '$v'" ;;
+  esac
+  if [ "$major" -lt "$MIN_MAJOR" ] ||
+    { [ "$major" -eq "$MIN_MAJOR" ] && [ "$minor" -lt "$MIN_MINOR" ]; }; then
+    fail "interpreter '$PY' is Python $v — the distribution requires >= ${MIN_MAJOR}.${MIN_MINOR} (ADR-016 requires-python)"
+  fi
+}
+
+# manifest_version — the literal version under [package] in the crate manifest
+manifest_version() {
+  local v
+  v=$(awk -F= '/^\[/{inpkg=($0=="[package]"); next} inpkg && $1 ~ /^version[[:space:]]*$/ {gsub(/[[:space:]"]/, "", $2); print $2; exit}' "$MANIFEST")
+  [ -n "$v" ] || fail "cannot read the version from $MANIFEST — expected a literal version under [package]"
+  printf '%s' "$v"
+}
+
+# project_name — the distribution name from pyproject [project] (not restated)
+project_name() {
+  local v
+  v=$(awk -F= '/^\[/{inp=($0=="[project]"); next} inp && $1 ~ /^name[[:space:]]*$/ {gsub(/[[:space:]"]/, "", $2); print $2; exit}' "$PYPROJECT")
+  [ -n "$v" ] || fail "cannot read the distribution name from $PYPROJECT — expected a name under [project]"
+  printf '%s' "$v"
+}
+
+# wheel_file_faults — judge a wheel file against the manifest version and the
+# ADR-016 tags: filename shape, name, version, python/abi tag, and the versions
+# and tags the wheel's own metadata claims. Prints fault lines; rc 0 iff none.
+wheel_file_faults() { # <wheel> <expect-version> <name>
+  local wheel="$1" ver="$2" name="$3" base meta wheel_tags
+  [ -f "$wheel" ] || { echo "wheel file not found: '$wheel'"; return 1; }
+  base=${wheel##*/}
+  base=${base%.whl}
+  local fields=()
+  IFS='-' read -r -a fields <<< "$base"
+  if [ "${#fields[@]}" -ne 5 ]; then
+    echo "wheel filename is not <name>-<version>-<python>-<abi>-<platform>: '$base'"
+    return 1
+  fi
+  [ "${fields[0]}" = "$name" ] ||
+    { echo "wheel distribution name '${fields[0]}' != '$name' (pyproject [project] name)"; return 1; }
+  version_eq "${fields[1]}" "$ver" ||
+    { echo "wheel filename carries version '${fields[1]}' but $MANIFEST declares '$ver' (compared as PEP 440 versions)"; return 1; }
+  [ "${fields[2]}" = "$PY_TAG" ] ||
+    { echo "wheel python tag '${fields[2]}' != '$PY_TAG' (ADR-016: >=3.11 on the stable ABI)"; return 1; }
+  [ "${fields[3]}" = "$ABI_TAG" ] ||
+    { echo "wheel abi tag '${fields[3]}' != '$ABI_TAG'"; return 1; }
+  meta=$(unzip -p "$wheel" '*.dist-info/METADATA' 2>/dev/null | awk '/^Version:/{print $2; exit}')
+  version_eq "$meta" "$ver" ||
+    { echo "wheel METADATA version '${meta:-<missing>}' != '$ver' declared by $MANIFEST (compared as PEP 440 versions)"; return 1; }
+  wheel_tags=$(unzip -p "$wheel" '*.dist-info/WHEEL' 2>/dev/null | grep -c "^Tag: ${PY_TAG}-${ABI_TAG}-")
+  [ "${wheel_tags:-0}" -ge 1 ] ||
+    { echo "wheel metadata carries no 'Tag: ${PY_TAG}-${ABI_TAG}-' entry"; return 1; }
+  return 0
+}
+
+# venv_python — the interpreter a virtualenv created under <dir> exposes:
+# `Scripts/python.exe` on Windows, `bin/python` elsewhere. Prints the path; rc 1
+# when the dir holds neither layout.
+venv_python() { # <venv-dir>
+  if [ -f "$1/Scripts/python.exe" ]; then
+    printf '%s\n' "$1/Scripts/python.exe"
+  elif [ -x "$1/bin/python" ] || [ -f "$1/bin/python" ]; then
+    printf '%s\n' "$1/bin/python"
+  else
+    return 1
+  fi
+}
+
+# venv_script — a console script that the venv's pip installed for <name>:
+# `Scripts/<name>.exe` on Windows, `bin/<name>` elsewhere. Prints the path; rc 1
+# when the venv holds neither layout (maturin is the caller that matters).
+venv_script() { # <venv-dir> <name>
+  if [ -f "$1/Scripts/$2.exe" ]; then
+    printf '%s\n' "$1/Scripts/$2.exe"
+  elif [ -x "$1/bin/$2" ] || [ -f "$1/bin/$2" ]; then
+    printf '%s\n' "$1/bin/$2"
+  else
+    return 1
+  fi
+}
+
+# make_venv — create a virtualenv under <dir>; works with or without ensurepip
+# (Debian images ship python3 without it) by falling back to --without-pip with
+# the system pip left visible. Sets VENV_PY to the venv's interpreter, resolved
+# from whichever layout this host's venv uses.
+make_venv() { # <dir>
+  local vp
+  if "$PY" -m venv "$1" >/dev/null 2>&1 &&
+    vp=$(venv_python "$1") &&
+    "$vp" -m pip --version >/dev/null 2>&1; then
+    VENV_PY="$vp"
+    return 0
+  fi
+  rm -rf "$1"
+  if ! "$PY" -m venv --without-pip --system-site-packages "$1" >/dev/null 2>&1; then
+    return 1
+  fi
+  vp=$(venv_python "$1") || return 1
+  if ! "$vp" -m pip --version >/dev/null 2>&1; then
+    return 1
+  fi
+  VENV_PY="$vp"
+  return 0
+}
+
+# pip_install_offline — install one wheel into the venv with --no-index (no
+# network, no dependency resolution, no toolchain). Prefers the venv's own pip;
+# falls back to the driver interpreter's pip via pip's --python (pip >= 22.3)
+# when the venv was created --without-pip.
+pip_install_offline() { # <venv-python> <wheel> [extra pip args...]
+  local py="$1" wheel="$2"
+  shift 2
+  if "$py" -m pip --version >/dev/null 2>&1; then
+    "$py" -m pip install "$@" --no-index --no-deps --disable-pip-version-check --quiet "$wheel"
+  else
+    "$PY" -m pip --python "$py" install "$@" --no-index --no-deps --disable-pip-version-check --quiet "$wheel"
+  fi
+}
+
+# import_version_matches — import pulsehive in the venv and require the imported
+# distribution to report <expect-version>. Fault text on stdout; rc 0 iff the
+# reported version is that version (PEP 440 comparison — the wheel's metadata
+# carries maturin's spelling, <expect-version> may carry the manifest's).
+import_version_matches() { # <venv-python> <expect-version>
+  local got
+  got=$("$1" -c 'import pulsehive, importlib.metadata as m; print(m.version("pulsehive"))' 2>&1) ||
+    { echo "importing 'pulsehive' in the fresh virtualenv failed: $got"; return 1; }
+  version_eq "$got" "$2" ||
+    { echo "imported 'pulsehive' reports version '$got', expected '$2' (compared as PEP 440 versions)"; return 1; }
+  return 0
+}
+
+# install_and_import — the install-and-assert half shared by the default and
+# --wheel modes: file-level checks, fresh venv, offline install, import.
+install_and_import() { # <wheel> <expect-version> <name> <tmpdir>
+  local wheel="$1" ver="$2" name="$3" tmp="$4" faults out
+  faults=$(wheel_file_faults "$wheel" "$ver" "$name") ||
+    fail "wheel '$(basename -- "$wheel")' rejected: $faults"
+  make_venv "$tmp/consumer-venv" ||
+    fail "cannot create a fresh virtualenv under '$tmp' with interpreter '$PY'"
+  pip_install_offline "$VENV_PY" "$wheel" ||
+    fail "offline install of '$(basename -- "$wheel")' failed (--no-index)"
+  out=$(import_version_matches "$VENV_PY" "$ver") || fail "$out"
+}
+
+# build_wheel — build the distribution from pulsehive-py/ with maturin and print
+# the single wheel path. Only this half may touch the network (installing
+# maturin) and cargo; compilation goes to $TARGET_DIR, the wheel to <dist-dir>.
+build_wheel() { # <dist-dir>
+  local dist="$1" mv="$SMOKE_TMP/maturin-venv" maturin wheel
+  make_venv "$mv" || fail "cannot create the maturin virtualenv with interpreter '$PY'"
+  "$VENV_PY" -m pip install --disable-pip-version-check --quiet maturin ||
+    fail "cannot install maturin into the build venv (only the build half uses the network)"
+  maturin=$(venv_script "$mv" maturin) ||
+    fail "no maturin launcher in '$mv' — looked for Scripts/maturin.exe (Windows) and bin/maturin (POSIX)"
+  mkdir -p "$dist" || fail "cannot create the wheel output dir '$dist'"
+  (cd "$ROOT/pulsehive-py" && CARGO_TARGET_DIR="$TARGET_DIR" "$maturin" build --release -o "$dist") ||
+    fail "maturin build failed (cargo target dir: '$TARGET_DIR')"
+  local wheels=()
+  shopt -s nullglob
+  wheels=("$dist"/*.whl)
+  shopt -u nullglob
+  [ "${#wheels[@]}" -eq 1 ] || fail "expected exactly one wheel in '$dist', found ${#wheels[@]}"
+  wheel=${wheels[0]}
+  echo "$PROG: built $(basename -- "$wheel")" >&2
+  printf '%s\n' "$wheel"
+}
+
+# plant_wheel — build a synthetic wheel for the self-test: a valid zip (RECORD
+# included — pip refuses RECORD-less wheels) whose filename version, METADATA
+# version and tags are chosen by the caller, so tampered variants can be planted
+# per case. The platform tag is this host's, so pip will actually install it.
+plant_wheel() { # <case-dir> <fname-version> <metadata-version> <python-tag> <abi-tag> [wheel-tag]
+  "$PY" - "$@" <<'PLANT'
+import base64, hashlib, os, sys, sysconfig, zipfile
+
+case_dir, fname_ver, meta_ver, py_tag, abi_tag = sys.argv[1:6]
+wheel_tag = sys.argv[6] if len(sys.argv) > 6 else f"{py_tag}-{abi_tag}"
+plat = sysconfig.get_platform().replace("-", "_").replace(".", "_")
+name = "pulsehive"
+os.makedirs(case_dir, exist_ok=True)
+path = os.path.join(case_dir, f"{name}-{fname_ver}-{py_tag}-{abi_tag}-{plat}.whl")
+di = f"{name}-{meta_ver}.dist-info"
+files = [
+    (f"{name}/__init__.py", ""),
+    (f"{di}/METADATA", f"Metadata-Version: 2.1\nName: {name}\nVersion: {meta_ver}\n"),
+    (f"{di}/WHEEL", "Wheel-Version: 1.0\nGenerator: pulsehive wheel smoke self-test\n"
+                    f"Root-Is-Purelib: true\nTag: {wheel_tag}-{plat}\n"),
+]
+def digest(data):
+    return base64.urlsafe_b64encode(hashlib.sha256(data).digest()).rstrip(b"=").decode()
+with zipfile.ZipFile(path, "w") as z:
+    for arc, text in files:
+        z.writestr(arc, text)
+    record = "".join(f"{arc},{digest(z.read(arc))},{z.getinfo(arc).file_size}\n" for arc, _ in files)
+    z.writestr(f"{di}/RECORD", record + f"{di}/RECORD,,\n")
+PLANT
+}
+
+expect_file_ok() { # <label> <wheel> <ver> <name>
+  local out
+  out=$(wheel_file_faults "$2" "$3" "$4") || {
+    echo "self-test: FAILED [$1]: expected acceptance, got: $out" >&2
+    exit 1
+  }
+}
+
+expect_file_reject() { # <label> <wheel> <ver> <name> <named-error substring>
+  local out rc
+  out=$(wheel_file_faults "$2" "$3" "$4")
+  rc=$?
+  if [ "$rc" -eq 0 ]; then
+    echo "self-test: FAILED [$1]: expected rejection, but the checks exited 0" >&2
+    exit 1
+  fi
+  case "$out" in
+    *"$5"*) : ;;
+    *)
+      echo "self-test: FAILED [$1]: rejected without the named error ('$5'): $out" >&2
+      exit 1
+      ;;
+  esac
+}
+
+expect_import_ok() { # <label> <venv-python> <ver>
+  local out
+  out=$(import_version_matches "$2" "$3") || {
+    echo "self-test: FAILED [$1]: $out" >&2
+    exit 1
+  }
+}
+
+expect_import_reject() { # <label> <venv-python> <ver> <named-error substring>
+  local out rc
+  out=$(import_version_matches "$2" "$3")
+  rc=$?
+  if [ "$rc" -eq 0 ]; then
+    echo "self-test: FAILED [$1]: expected the import assertion to fire, but it passed" >&2
+    exit 1
+  fi
+  case "$out" in
+    *"$4"*) : ;;
+    *)
+      echo "self-test: FAILED [$1]: failed without the named error ('$4'): $out" >&2
+      exit 1
+      ;;
+  esac
+}
+
+# expect_version_rule — the class B rule itself, before any wheel is planted:
+# the spellings a Cargo manifest, a `v*` tag and a maturin-built wheel can use
+# for one and the same version must compare equal, and a real version
+# difference must never be normalized away. The cases below pin both halves of
+# that, including the ones a numeric comparison gets wrong: `1.10` and `1.1`
+# are different versions ([1, 10] vs [1, 1]) though they are the same number,
+# and `1e2` is not a version at all, though `100` is one. A rule that only ever
+# said "equal" — or only ever compared numbers — would fail here.
+expect_version_rule() {
+  local got
+  expect_eq "3.0.0-beta.1" "3.0.0b1"
+  expect_eq "3.0.0b1" "3.0.0-beta.1"
+  expect_eq "3.0.0-beta.1" "3.0.0-BETA.1"
+  expect_eq "3.0.0-alpha.2" "3.0.0a2"
+  expect_eq "3.0.0-rc.3" "3.0.0rc3"
+  expect_eq "2.0.0-c1" "2.0.0rc1"
+  expect_eq "3.0.0" "3.0.0"
+  expect_eq "1.0" "1.00"
+  expect_eq "1.0" "1.0.0"
+  expect_eq "3.0.0" "3.0.0.0"
+  expect_eq "01.0" "1.0"
+  expect_eq "1.0-1" "1.0.post1"
+  expect_ne "1.10" "1.1"
+  expect_ne "1.10" "1.1.0"
+  expect_ne "1e2" "100"
+  expect_ne "3.0.0b1" "3.0.0b2"
+  expect_ne "3.0.0" "3.0.0b1"
+  expect_ne "3.0.0b1" "3.0.0rc1"
+  expect_ne "3.0.0" "0.3.0"
+  expect_ne "0.3.0b2" "0.3.0"
+  got=$(pep440_canon "$PRE_CARGO") || fail "self-test: cannot canonicalize '$PRE_CARGO'"
+  [ "$got" = "$PRE_PEP" ] ||
+    { echo "self-test: FAILED [version rule]: canonical '$PRE_CARGO' is '$got', expected '$PRE_PEP'" >&2; exit 1; }
+}
+
+expect_eq() { # <a> <b>
+  version_eq "$1" "$2" || {
+    echo "self-test: FAILED [version rule]: '$1' and '$2' are the same PEP 440 version but compared unequal" >&2
+    exit 1
+  }
+}
+
+expect_ne() { # <a> <b>
+  if version_eq "$1" "$2"; then
+    echo "self-test: FAILED [version rule]: '$1' and '$2' are different versions but compared equal" >&2
+    exit 1
+  fi
+}
+
+expect_resolves_to() { # <label> <expected path> <resolver> <args...>
+  local label="$1" want="$2" resolver="$3" got
+  shift 3
+  got=$("$resolver" "$@") || {
+    echo "self-test: FAILED [$label]: $resolver $* resolved nothing" >&2
+    exit 1
+  }
+  [ "$got" = "$want" ] || {
+    echo "self-test: FAILED [$label]: $resolver $* -> '$got', expected '$want'" >&2
+    exit 1
+  }
+}
+
+expect_resolves_nothing() { # <label> <resolver> <args...>
+  local label="$1" resolver="$2"
+  shift 2
+  if "$resolver" "$@" >/dev/null 2>&1; then
+    echo "self-test: FAILED [$label]: $resolver $* resolved something, expected a failure" >&2
+    exit 1
+  fi
+}
+
+# expect_venv_layouts — the venv layout rule is live for BOTH layouts the
+# release matrix meets: the POSIX one this host uses and the Windows one
+# (Scripts/python.exe, Scripts/maturin.exe) that the windows-latest leg needs.
+# Without this, class A's defect could return with the self-test still green.
+expect_venv_layouts() {
+  local base="$SMOKE_TMP/venv-layout" posix="$SMOKE_TMP/venv-layout/posix" win="$SMOKE_TMP/venv-layout/windows"
+  mkdir -p "$posix/bin" "$win/Scripts" "$base/empty" ||
+    fail "self-test: cannot create the venv layout fixtures"
+  : > "$posix/bin/python" && chmod +x "$posix/bin/python" || fail "self-test: cannot plant bin/python"
+  : > "$posix/bin/maturin" && chmod +x "$posix/bin/maturin" || fail "self-test: cannot plant bin/maturin"
+  : > "$win/Scripts/python.exe" || fail "self-test: cannot plant Scripts/python.exe"
+  : > "$win/Scripts/maturin.exe" || fail "self-test: cannot plant Scripts/maturin.exe"
+  expect_resolves_to "venv interpreter (POSIX layout)" "$posix/bin/python" venv_python "$posix"
+  expect_resolves_to "venv interpreter (Windows layout)" "$win/Scripts/python.exe" venv_python "$win"
+  expect_resolves_to "venv console script (POSIX layout)" "$posix/bin/maturin" venv_script "$posix" maturin
+  expect_resolves_to "venv console script (Windows layout)" "$win/Scripts/maturin.exe" venv_script "$win" maturin
+  expect_resolves_nothing "venv with neither layout" venv_python "$base/empty"
+  expect_resolves_nothing "console script in neither layout" venv_script "$base/empty" maturin
+  expect_make_venv_windows_layout
+}
+
+# expect_make_venv_windows_layout — make_venv itself, against a venv that has
+# only the WINDOWS layout. The interpreter here is a stand-in whose `-m venv`
+# writes Scripts/python.exe (that single difference is what makes the
+# windows-latest leg fail), and whose Scripts/python.exe answers the pip probe
+# make_venv makes — which only looks at the exit status, as pip's does. So a
+# make_venv that went back to `$1/bin/python` fails this self-test on this host
+# instead of failing the Windows leg at tag time, where it blocks every
+# publish.
+expect_make_venv_windows_layout() {
+  local saved_py="$PY" fake="$SMOKE_TMP/fake-py" dir="$SMOKE_TMP/windows-venv"
+  mkdir -p "$fake/bin" || fail "self-test: cannot create the stand-in interpreter dir"
+  cat > "$fake/bin/python" <<'FAKEPY'
+#!/bin/sh
+# `-m venv [flags] <dir>` → the Windows layout. The venv dir is the last
+# argument in both invocations make_venv can make.
+if [ "${1:-}" = "-m" ] && [ "${2:-}" = "venv" ]; then
+  shift 2
+  dir=""
+  for arg in "$@"; do dir="$arg"; done
+  [ -n "$dir" ] || exit 1
+  mkdir -p "$dir/Scripts" || exit 1
+  printf '%s\n' '#!/bin/sh' 'exit 0' > "$dir/Scripts/python.exe" || exit 1
+  chmod +x "$dir/Scripts/python.exe" || exit 1
+  exit 0
+fi
+exit 1
+FAKEPY
+  chmod +x "$fake/bin/python" || fail "self-test: cannot make the stand-in interpreter runnable"
+  rm -rf "$dir"
+  PY="$fake/bin/python"
+  make_venv "$dir" || {
+    PY="$saved_py"
+    echo "self-test: FAILED [windows venv layout]: make_venv cannot create a venv whose interpreter is Scripts/python.exe" >&2
+    exit 1
+  }
+  PY="$saved_py"
+  [ "$VENV_PY" = "$dir/Scripts/python.exe" ] || {
+    echo "self-test: FAILED [windows venv layout]: VENV_PY is '$VENV_PY', expected '$dir/Scripts/python.exe'" >&2
+    exit 1
+  }
+  VENV_PY=""
+}
+
+# self_test — RELEASE.md's negative control for this proof: every assertion the
+# install-and-assert half makes must be seen rejecting a tampered wheel (and
+# accepting a well-formed one) before the default mode's ok line is earned.
+# Hermetic throughout: planting, venv creation and --no-index installs only.
+self_test() { # <ver> <name>
+  local ver="$1" name="$2" p="$SMOKE_TMP/plant" cv="$SMOKE_TMP/import-venv"
+  expect_venv_layouts
+  expect_version_rule
+  plant_wheel "$p/good" "$ver" "$ver" "$PY_TAG" "$ABI_TAG" ||
+    fail "self-test: cannot plant the well-formed wheel"
+  plant_wheel "$p/prerelease" "$PRE_PEP" "$PRE_PEP" "$PY_TAG" "$ABI_TAG" ||
+    fail "self-test: cannot plant the prerelease wheel"
+  plant_wheel "$p/filename" "$STALE_VER" "$STALE_VER" "$PY_TAG" "$ABI_TAG" ||
+    fail "self-test: cannot plant the filename-version-mismatch wheel"
+  plant_wheel "$p/metadata" "$ver" "$STALE_VER" "$PY_TAG" "$ABI_TAG" ||
+    fail "self-test: cannot plant the metadata-version-mismatch wheel"
+  plant_wheel "$p/pytag" "$ver" "$ver" cp39 "$ABI_TAG" ||
+    fail "self-test: cannot plant the python-tag-mismatch wheel"
+  plant_wheel "$p/wheel-tag" "$ver" "$ver" "$PY_TAG" "$ABI_TAG" "cp39-$ABI_TAG" ||
+    fail "self-test: cannot plant the wheel-tag-mismatch wheel"
+  expect_file_ok "well-formed wheel" "$p/good/"*.whl "$ver" "$name"
+  expect_file_ok "prerelease wheel, expected under Cargo's spelling" "$p/prerelease/"*.whl "$PRE_CARGO" "$name"
+  expect_file_reject "filename version mismatch" "$p/filename/"*.whl "$ver" "$name" "wheel filename carries version '$STALE_VER'"
+  expect_file_reject "metadata version mismatch" "$p/metadata/"*.whl "$ver" "$name" "METADATA version '$STALE_VER'"
+  expect_file_reject "prerelease wheel against a different prerelease" "$p/prerelease/"*.whl "3.0.0-beta.2" "$name" "wheel filename carries version '$PRE_PEP'"
+  expect_file_reject "python tag mismatch" "$p/pytag/"*.whl "$ver" "$name" "python tag 'cp39'"
+  expect_file_reject "wheel metadata tag mismatch" "$p/wheel-tag/"*.whl "$ver" "$name" "no 'Tag: ${PY_TAG}-${ABI_TAG}-'"
+  make_venv "$cv" || fail "self-test: cannot create the import-control virtualenv"
+  pip_install_offline "$VENV_PY" "$p/good/"*.whl ||
+    fail "self-test: the well-formed wheel refused to install offline"
+  expect_import_ok "well-formed wheel imports at the manifest version" "$VENV_PY" "$ver"
+  pip_install_offline "$VENV_PY" "$p/metadata/"*.whl --force-reinstall ||
+    fail "self-test: the tampered wheel refused to install offline"
+  expect_import_reject "import version assertion fires on the tampered wheel" "$VENV_PY" "$ver" "reports version '$STALE_VER'"
+  pip_install_offline "$VENV_PY" "$p/prerelease/"*.whl --force-reinstall ||
+    fail "self-test: the prerelease wheel refused to install offline"
+  expect_import_ok "prerelease wheel imports, expected under Cargo's spelling" "$VENV_PY" "$PRE_CARGO"
+  expect_import_reject "import version assertion still fires on the prerelease wheel" "$VENV_PY" "$ver" "reports version '$PRE_PEP'"
+  echo "self-test: ok"
+}
+
+cleanup() {
+  rm -rf "${SMOKE_TMP:-}"
+  if [ "$LOCK_GENERATED" -eq 1 ]; then
+    rm -f "$ROOT/Cargo.lock"
+  fi
+  return 0
+}
+
+main() {
+  local mode="build" wheel_arg="" ver name
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --wheel)
+        [ $# -ge 2 ] || { usage >&2; fail "--wheel needs a path"; }
+        mode="wheel"
+        wheel_arg="$2"
+        shift 2
+        ;;
+      --self-test)
+        mode="self-test"
+        shift
+        ;;
+      -h | --help)
+        usage
+        exit 0
+        ;;
+      *)
+        usage >&2
+        fail "unknown argument '$1'"
+        ;;
+    esac
+  done
+
+  resolve_py
+  MANIFEST="$ROOT/pulsehive-py/Cargo.toml"
+  PYPROJECT="$ROOT/pulsehive-py/pyproject.toml"
+  [ -f "$MANIFEST" ] || fail "missing $MANIFEST"
+  [ -f "$PYPROJECT" ] || fail "missing $PYPROJECT"
+  ver=$(manifest_version) || exit 1
+  name=$(project_name) || exit 1
+  check_py_version
+  SMOKE_TMP=$(mktemp -d "${TMPDIR:-/tmp}/py-wheel-smoke.XXXXXX") || fail "cannot create a temp dir"
+  trap cleanup EXIT
+
+  case "$mode" in
+    build)
+      TARGET_DIR="${PULSEHIVE_WHEEL_SMOKE_TARGET_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/pulsehive/py-wheel-smoke/target}"
+      mkdir -p "$TARGET_DIR" || fail "cannot create the cargo target dir '$TARGET_DIR'"
+      [ -e "$ROOT/Cargo.lock" ] || LOCK_GENERATED=1
+      local wheel
+      wheel=$(build_wheel "$SMOKE_TMP/dist") || exit 1
+      install_and_import "$wheel" "$ver" "$name" "$SMOKE_TMP" || exit 1
+      echo "py wheel smoke: ok"
+      ;;
+    wheel)
+      [ -f "$wheel_arg" ] || fail "--wheel: no such wheel: '$wheel_arg'"
+      install_and_import "$wheel_arg" "$ver" "$name" "$SMOKE_TMP" || exit 1
+      echo "py wheel smoke: ok"
+      ;;
+    self-test)
+      self_test "$ver" "$name"
+      ;;
+  esac
+}
+
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+ROOT=$(cd -- "$SCRIPT_DIR/../.." && pwd)
+[ -r "$SCRIPT_DIR/lib/pep440.sh" ] ||
+  fail "missing the version rule $SCRIPT_DIR/lib/pep440.sh (it ships next to this script)"
+# shellcheck source=lib/pep440.sh
+. "$SCRIPT_DIR/lib/pep440.sh"
+main "$@"

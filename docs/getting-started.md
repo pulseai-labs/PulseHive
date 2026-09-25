@@ -7,7 +7,7 @@ PulseHive is a Rust SDK for building multi-agent AI systems where agents share c
 | Language | Requirement |
 |----------|-------------|
 | Rust | Stable toolchain via [rustup](https://rustup.rs/) |
-| Python | Python 3.9+ with pip |
+| Python | Python 3.11+ with pip |
 | TypeScript | Node.js 18+ with npm |
 
 ## Installation
