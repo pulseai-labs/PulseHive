@@ -33,6 +33,14 @@
 # Interpreter rule (every mode): $PYTHON if set, else python3, else python, and
 # it must be >= 3.11 (ADR-016 requires-python) or the script fails with a named
 # error.
+#
+# venv rule (every mode): a virtualenv is resolved where the interpreter that
+# created it puts it — `bin/python` and `bin/<script>` on POSIX, `Scripts/
+# python.exe` and `Scripts/<script>.exe` on Windows (both the release matrix's
+# windows-latest leg and the local Git Bash there). Nothing here assumes the
+# POSIX layout: a layout this host does not have is simply not the one that is
+# used, so the same script proves the same wheel on all three advertised
+# targets.
 
 set -u
 
@@ -147,23 +155,54 @@ wheel_file_faults() { # <wheel> <expect-version> <name>
   return 0
 }
 
+# venv_python — the interpreter a virtualenv created under <dir> exposes:
+# `Scripts/python.exe` on Windows, `bin/python` elsewhere. Prints the path; rc 1
+# when the dir holds neither layout.
+venv_python() { # <venv-dir>
+  if [ -f "$1/Scripts/python.exe" ]; then
+    printf '%s\n' "$1/Scripts/python.exe"
+  elif [ -x "$1/bin/python" ] || [ -f "$1/bin/python" ]; then
+    printf '%s\n' "$1/bin/python"
+  else
+    return 1
+  fi
+}
+
+# venv_script — a console script that the venv's pip installed for <name>:
+# `Scripts/<name>.exe` on Windows, `bin/<name>` elsewhere. Prints the path; rc 1
+# when the venv holds neither layout (maturin is the caller that matters).
+venv_script() { # <venv-dir> <name>
+  if [ -f "$1/Scripts/$2.exe" ]; then
+    printf '%s\n' "$1/Scripts/$2.exe"
+  elif [ -x "$1/bin/$2" ] || [ -f "$1/bin/$2" ]; then
+    printf '%s\n' "$1/bin/$2"
+  else
+    return 1
+  fi
+}
+
 # make_venv — create a virtualenv under <dir>; works with or without ensurepip
 # (Debian images ship python3 without it) by falling back to --without-pip with
-# the system pip left visible. Sets VENV_PY to the venv's interpreter.
+# the system pip left visible. Sets VENV_PY to the venv's interpreter, resolved
+# from whichever layout this host's venv uses.
 make_venv() { # <dir>
+  local vp
   if "$PY" -m venv "$1" >/dev/null 2>&1 &&
-    "$1/bin/python" -m pip --version >/dev/null 2>&1; then
-    VENV_PY="$1/bin/python"
+    vp=$(venv_python "$1") &&
+    "$vp" -m pip --version >/dev/null 2>&1; then
+    VENV_PY="$vp"
     return 0
   fi
   rm -rf "$1"
   if ! "$PY" -m venv --without-pip --system-site-packages "$1" >/dev/null 2>&1; then
     return 1
   fi
-  if ! "$1/bin/python" -m pip --version >/dev/null 2>&1; then
+  vp=$(venv_python "$1") || return 1
+  if ! "$vp" -m pip --version >/dev/null 2>&1; then
     return 1
   fi
-  VENV_PY="$1/bin/python"
+  VENV_PY="$vp"
+  return 0
 }
 
 # pip_install_offline — install one wheel into the venv with --no-index (no
@@ -208,12 +247,14 @@ install_and_import() { # <wheel> <expect-version> <name> <tmpdir>
 # the single wheel path. Only this half may touch the network (installing
 # maturin) and cargo; compilation goes to $TARGET_DIR, the wheel to <dist-dir>.
 build_wheel() { # <dist-dir>
-  local dist="$1" mv="$SMOKE_TMP/maturin-venv" wheel
+  local dist="$1" mv="$SMOKE_TMP/maturin-venv" maturin wheel
   make_venv "$mv" || fail "cannot create the maturin virtualenv with interpreter '$PY'"
   "$VENV_PY" -m pip install --disable-pip-version-check --quiet maturin ||
     fail "cannot install maturin into the build venv (only the build half uses the network)"
+  maturin=$(venv_script "$mv" maturin) ||
+    fail "no maturin launcher in '$mv' — looked for Scripts/maturin.exe (Windows) and bin/maturin (POSIX)"
   mkdir -p "$dist" || fail "cannot create the wheel output dir '$dist'"
-  (cd "$ROOT/pulsehive-py" && CARGO_TARGET_DIR="$TARGET_DIR" "$mv/bin/maturin" build --release -o "$dist") ||
+  (cd "$ROOT/pulsehive-py" && CARGO_TARGET_DIR="$TARGET_DIR" "$maturin" build --release -o "$dist") ||
     fail "maturin build failed (cargo target dir: '$TARGET_DIR')"
   local wheels=()
   shopt -s nullglob
@@ -306,12 +347,55 @@ expect_import_reject() { # <label> <venv-python> <ver> <named-error substring>
   esac
 }
 
+expect_resolves_to() { # <label> <expected path> <resolver> <args...>
+  local label="$1" want="$2" resolver="$3" got
+  shift 3
+  got=$("$resolver" "$@") || {
+    echo "self-test: FAILED [$label]: $resolver $* resolved nothing" >&2
+    exit 1
+  }
+  [ "$got" = "$want" ] || {
+    echo "self-test: FAILED [$label]: $resolver $* -> '$got', expected '$want'" >&2
+    exit 1
+  }
+}
+
+expect_resolves_nothing() { # <label> <resolver> <args...>
+  local label="$1" resolver="$2"
+  shift 2
+  if "$resolver" "$@" >/dev/null 2>&1; then
+    echo "self-test: FAILED [$label]: $resolver $* resolved something, expected a failure" >&2
+    exit 1
+  fi
+}
+
+# expect_venv_layouts — the venv layout rule is live for BOTH layouts the
+# release matrix meets: the POSIX one this host uses and the Windows one
+# (Scripts/python.exe, Scripts/maturin.exe) that the windows-latest leg needs.
+# Without this, class A's defect could return with the self-test still green.
+expect_venv_layouts() {
+  local base="$SMOKE_TMP/venv-layout" posix="$SMOKE_TMP/venv-layout/posix" win="$SMOKE_TMP/venv-layout/windows"
+  mkdir -p "$posix/bin" "$win/Scripts" "$base/empty" ||
+    fail "self-test: cannot create the venv layout fixtures"
+  : > "$posix/bin/python" && chmod +x "$posix/bin/python" || fail "self-test: cannot plant bin/python"
+  : > "$posix/bin/maturin" && chmod +x "$posix/bin/maturin" || fail "self-test: cannot plant bin/maturin"
+  : > "$win/Scripts/python.exe" || fail "self-test: cannot plant Scripts/python.exe"
+  : > "$win/Scripts/maturin.exe" || fail "self-test: cannot plant Scripts/maturin.exe"
+  expect_resolves_to "venv interpreter (POSIX layout)" "$posix/bin/python" venv_python "$posix"
+  expect_resolves_to "venv interpreter (Windows layout)" "$win/Scripts/python.exe" venv_python "$win"
+  expect_resolves_to "venv console script (POSIX layout)" "$posix/bin/maturin" venv_script "$posix" maturin
+  expect_resolves_to "venv console script (Windows layout)" "$win/Scripts/maturin.exe" venv_script "$win" maturin
+  expect_resolves_nothing "venv with neither layout" venv_python "$base/empty"
+  expect_resolves_nothing "console script in neither layout" venv_script "$base/empty" maturin
+}
+
 # self_test — RELEASE.md's negative control for this proof: every assertion the
 # install-and-assert half makes must be seen rejecting a tampered wheel (and
 # accepting a well-formed one) before the default mode's ok line is earned.
 # Hermetic throughout: planting, venv creation and --no-index installs only.
 self_test() { # <ver> <name>
   local ver="$1" name="$2" p="$SMOKE_TMP/plant" cv="$SMOKE_TMP/import-venv"
+  expect_venv_layouts
   plant_wheel "$p/good" "$ver" "$ver" "$PY_TAG" "$ABI_TAG" ||
     fail "self-test: cannot plant the well-formed wheel"
   plant_wheel "$p/metadata" "$ver" "$STALE_VER" "$PY_TAG" "$ABI_TAG" ||
