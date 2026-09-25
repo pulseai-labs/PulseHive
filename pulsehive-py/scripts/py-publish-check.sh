@@ -224,11 +224,14 @@ self_test() {
   local ver="3.0.0"
   local cargo_pre="3.0.0-beta.1" wheel_pre="3.0.0b1"
 
-  # 0a. The class B rule itself, before any candidate set is judged: the
-  #     spellings a `v*` tag and a maturin-built wheel can use for one version
-  #     must compare equal, and a real version difference must not be
-  #     normalized away (a rule that always said "equal" would pass every
-  #     acceptance case below without proving anything).
+  # 0a. The class B / round-2 rule itself, before any candidate set is judged:
+  #     the spellings a `v*` tag and a maturin-built wheel can use for one
+  #     version must compare equal, a real version difference must not be
+  #     normalized away, and nothing here may be decided by how a value would
+  #     read as a number (`1.10` and `1.1` are different versions, [1, 10] vs
+  #     [1, 1], though they are the same number; `1e2` is not a version, though
+  #     `100` is one). A rule that always said "equal", or compared numbers,
+  #     fails below.
   expect_eq() { # <a> <b>
     version_eq "$1" "$2" || {
       echo "self-test: FAILED [version rule]: '$1' and '$2' are the same PEP 440 version but compared unequal" >&2
@@ -247,7 +250,12 @@ self_test() {
   expect_eq "3.0.0-alpha.2" "3.0.0a2"
   expect_eq "3.0.0-rc.3" "3.0.0rc3"
   expect_eq "3.0.0" "3.0.0"
+  expect_eq "1.0" "1.00"
+  expect_eq "1.0" "1.0.0"
   expect_eq "1.0-1" "1.0.post1"
+  expect_ne "1.10" "1.1"
+  expect_ne "1.10" "1.1.0"
+  expect_ne "1e2" "100"
   expect_ne "3.0.0b1" "3.0.0b2"
   expect_ne "3.0.0" "3.0.0b1"
   expect_ne "3.0.0b1" "3.0.0rc1"

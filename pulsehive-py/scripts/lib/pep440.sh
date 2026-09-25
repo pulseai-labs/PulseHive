@@ -23,6 +23,16 @@
 # preview/rc, post/rev/r and dev spellings, `-N` as an implicit post-release,
 # local-version separators, and release groups compared numerically so that
 # `1.0` and `1.0.0` are the same version (as they are to pip and PyPI).
+#
+# Every comparison here is a string comparison, and that is deliberate. The
+# versions arrive through `-v`, so awk hands over a value that merely looks
+# numeric as a number as well as a string, and `a == b` would then read `1.10`
+# and `1.1` as the same number — while PEP 440 reads them as release segments
+# [1, 10] and [1, 1], which are different versions. A gate that answers "same
+# version" for two different versions is worse than one that answers nothing,
+# so no comparison in this file is left to numeric coercion: byte-identical
+# values are settled by version_eq below, and every other pair is decided by
+# the canonical spelling, group by group.
 
 # The parser is awk (POSIX), so this rule costs the release path no interpreter
 # beyond the ones it already runs — the smoke is invoked on macOS, Linux and
@@ -100,7 +110,12 @@ BEGIN {
     print c
     exit 0
   }
-  if (a == b) { print 1; exit 0 }
+  # No `if (a == b)` fast path here, on purpose. version_eq has already
+  # returned on byte-identical strings, so this program only ever sees pairs
+  # that differ as strings — and a numeric comparison of two values from -v
+  # would answer "equal" for `1.10` and `1.1` (both 1.1 as numbers) while PEP
+  # 440 says [1, 10] and [1, 1] are different versions. Every pair that reaches
+  # this point is decided by the canonical form, compared as strings.
   ca = canon(a); cb = canon(b)
   if (ca == "" || cb == "") { print 0; exit 0 }
   na = relsplit(ca); ra = G_REL; sa = G_SUF
@@ -116,9 +131,12 @@ pep440_canon() {
   awk -v mode=canon -v v="$1" "$PEP440_AWK" /dev/null
 }
 
-# version_eq <a> <b> — rc 0 iff <a> and <b> are the same PEP 440 version. Exact
-# equality is the fast path; anything else is decided by the rule above, and a
-# value the rule cannot canonicalize is only ever equal to itself.
+# version_eq <a> <b> — rc 0 iff <a> and <b> are the same PEP 440 version.
+# Byte-identical values are the one pair settled here, as a string comparison:
+# they are the same version by reflexivity, and a value the rule cannot
+# canonicalize stays equal to itself — a different spelling of it is not.
+# Every other pair is decided by the rule above, which never compares
+# numerically (see the note in its BEGIN block).
 version_eq() {
   [ "$1" = "$2" ] && return 0
   [ "$(awk -v mode=eq -v a="$1" -v b="$2" "$PEP440_AWK" /dev/null)" = "1" ]

@@ -369,8 +369,11 @@ expect_import_reject() { # <label> <venv-python> <ver> <named-error substring>
 # expect_version_rule — the class B rule itself, before any wheel is planted:
 # the spellings a Cargo manifest, a `v*` tag and a maturin-built wheel can use
 # for one and the same version must compare equal, and a real version
-# difference must never be normalized away. A rule that only ever said "equal"
-# would pass every acceptance case below without proving anything.
+# difference must never be normalized away. The cases below pin both halves of
+# that, including the ones a numeric comparison gets wrong: `1.10` and `1.1`
+# are different versions ([1, 10] vs [1, 1]) though they are the same number,
+# and `1e2` is not a version at all, though `100` is one. A rule that only ever
+# said "equal" — or only ever compared numbers — would fail here.
 expect_version_rule() {
   local got
   expect_eq "3.0.0-beta.1" "3.0.0b1"
@@ -380,8 +383,14 @@ expect_version_rule() {
   expect_eq "3.0.0-rc.3" "3.0.0rc3"
   expect_eq "2.0.0-c1" "2.0.0rc1"
   expect_eq "3.0.0" "3.0.0"
+  expect_eq "1.0" "1.00"
+  expect_eq "1.0" "1.0.0"
   expect_eq "3.0.0" "3.0.0.0"
+  expect_eq "01.0" "1.0"
   expect_eq "1.0-1" "1.0.post1"
+  expect_ne "1.10" "1.1"
+  expect_ne "1.10" "1.1.0"
+  expect_ne "1e2" "100"
   expect_ne "3.0.0b1" "3.0.0b2"
   expect_ne "3.0.0" "3.0.0b1"
   expect_ne "3.0.0b1" "3.0.0rc1"
