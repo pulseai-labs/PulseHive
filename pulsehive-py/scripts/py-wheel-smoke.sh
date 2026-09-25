@@ -41,6 +41,14 @@
 # POSIX layout: a layout this host does not have is simply not the one that is
 # used, so the same script proves the same wheel on all three advertised
 # targets.
+#
+# Version rule (every mode): the expected version is the literal `version` under
+# [package] in pulsehive-py/Cargo.toml, while the versions this script reads off
+# the artifact are the ones maturin wrote — PEP 440's canonical spelling. The
+# two are compared as versions through lib/pep440.sh, at every site (the wheel
+# filename, the wheel METADATA, and the imported distribution), so a Cargo
+# prerelease like `3.0.0-beta.1`, which maturin spells `3.0.0b1` on the wheel,
+# is accepted as the version it is.
 
 set -u
 
@@ -50,6 +58,8 @@ ABI_TAG="abi3"
 MIN_MAJOR=3
 MIN_MINOR=11
 STALE_VER="0.3.0b2" # the stale version issue #92 forbids; a fixture, never asserted
+PRE_CARGO="3.0.0-beta.1" # a Cargo prerelease the way the manifest or a tag spells it
+PRE_PEP="3.0.0b1"        # ...and the way maturin spells it on the wheel (a fixture too)
 
 PY=""
 ROOT=""
@@ -140,15 +150,15 @@ wheel_file_faults() { # <wheel> <expect-version> <name>
   fi
   [ "${fields[0]}" = "$name" ] ||
     { echo "wheel distribution name '${fields[0]}' != '$name' (pyproject [project] name)"; return 1; }
-  [ "${fields[1]}" = "$ver" ] ||
-    { echo "wheel filename carries version '${fields[1]}' but $MANIFEST declares '$ver'"; return 1; }
+  version_eq "${fields[1]}" "$ver" ||
+    { echo "wheel filename carries version '${fields[1]}' but $MANIFEST declares '$ver' (compared as PEP 440 versions)"; return 1; }
   [ "${fields[2]}" = "$PY_TAG" ] ||
     { echo "wheel python tag '${fields[2]}' != '$PY_TAG' (ADR-016: >=3.11 on the stable ABI)"; return 1; }
   [ "${fields[3]}" = "$ABI_TAG" ] ||
     { echo "wheel abi tag '${fields[3]}' != '$ABI_TAG'"; return 1; }
   meta=$(unzip -p "$wheel" '*.dist-info/METADATA' 2>/dev/null | awk '/^Version:/{print $2; exit}')
-  [ "$meta" = "$ver" ] ||
-    { echo "wheel METADATA version '${meta:-<missing>}' != '$ver' declared by $MANIFEST"; return 1; }
+  version_eq "$meta" "$ver" ||
+    { echo "wheel METADATA version '${meta:-<missing>}' != '$ver' declared by $MANIFEST (compared as PEP 440 versions)"; return 1; }
   wheel_tags=$(unzip -p "$wheel" '*.dist-info/WHEEL' 2>/dev/null | grep -c "^Tag: ${PY_TAG}-${ABI_TAG}-")
   [ "${wheel_tags:-0}" -ge 1 ] ||
     { echo "wheel metadata carries no 'Tag: ${PY_TAG}-${ABI_TAG}-' entry"; return 1; }
@@ -220,13 +230,15 @@ pip_install_offline() { # <venv-python> <wheel> [extra pip args...]
 }
 
 # import_version_matches — import pulsehive in the venv and require the imported
-# distribution to report <expect-version>. Fault text on stdout; rc 0 iff equal.
+# distribution to report <expect-version>. Fault text on stdout; rc 0 iff the
+# reported version is that version (PEP 440 comparison — the wheel's metadata
+# carries maturin's spelling, <expect-version> may carry the manifest's).
 import_version_matches() { # <venv-python> <expect-version>
   local got
   got=$("$1" -c 'import pulsehive, importlib.metadata as m; print(m.version("pulsehive"))' 2>&1) ||
     { echo "importing 'pulsehive' in the fresh virtualenv failed: $got"; return 1; }
-  [ "$got" = "$2" ] ||
-    { echo "imported 'pulsehive' reports version '$got', expected '$2'"; return 1; }
+  version_eq "$got" "$2" ||
+    { echo "imported 'pulsehive' reports version '$got', expected '$2' (compared as PEP 440 versions)"; return 1; }
   return 0
 }
 
@@ -347,6 +359,46 @@ expect_import_reject() { # <label> <venv-python> <ver> <named-error substring>
   esac
 }
 
+# expect_version_rule — the class B rule itself, before any wheel is planted:
+# the spellings a Cargo manifest, a `v*` tag and a maturin-built wheel can use
+# for one and the same version must compare equal, and a real version
+# difference must never be normalized away. A rule that only ever said "equal"
+# would pass every acceptance case below without proving anything.
+expect_version_rule() {
+  local got
+  expect_eq "3.0.0-beta.1" "3.0.0b1"
+  expect_eq "3.0.0b1" "3.0.0-beta.1"
+  expect_eq "3.0.0-beta.1" "3.0.0-BETA.1"
+  expect_eq "3.0.0-alpha.2" "3.0.0a2"
+  expect_eq "3.0.0-rc.3" "3.0.0rc3"
+  expect_eq "2.0.0-c1" "2.0.0rc1"
+  expect_eq "3.0.0" "3.0.0"
+  expect_eq "3.0.0" "3.0.0.0"
+  expect_eq "1.0-1" "1.0.post1"
+  expect_ne "3.0.0b1" "3.0.0b2"
+  expect_ne "3.0.0" "3.0.0b1"
+  expect_ne "3.0.0b1" "3.0.0rc1"
+  expect_ne "3.0.0" "0.3.0"
+  expect_ne "0.3.0b2" "0.3.0"
+  got=$(pep440_canon "$PRE_CARGO") || fail "self-test: cannot canonicalize '$PRE_CARGO'"
+  [ "$got" = "$PRE_PEP" ] ||
+    { echo "self-test: FAILED [version rule]: canonical '$PRE_CARGO' is '$got', expected '$PRE_PEP'" >&2; exit 1; }
+}
+
+expect_eq() { # <a> <b>
+  version_eq "$1" "$2" || {
+    echo "self-test: FAILED [version rule]: '$1' and '$2' are the same PEP 440 version but compared unequal" >&2
+    exit 1
+  }
+}
+
+expect_ne() { # <a> <b>
+  if version_eq "$1" "$2"; then
+    echo "self-test: FAILED [version rule]: '$1' and '$2' are different versions but compared equal" >&2
+    exit 1
+  fi
+}
+
 expect_resolves_to() { # <label> <expected path> <resolver> <args...>
   local label="$1" want="$2" resolver="$3" got
   shift 3
@@ -396,8 +448,13 @@ expect_venv_layouts() {
 self_test() { # <ver> <name>
   local ver="$1" name="$2" p="$SMOKE_TMP/plant" cv="$SMOKE_TMP/import-venv"
   expect_venv_layouts
+  expect_version_rule
   plant_wheel "$p/good" "$ver" "$ver" "$PY_TAG" "$ABI_TAG" ||
     fail "self-test: cannot plant the well-formed wheel"
+  plant_wheel "$p/prerelease" "$PRE_PEP" "$PRE_PEP" "$PY_TAG" "$ABI_TAG" ||
+    fail "self-test: cannot plant the prerelease wheel"
+  plant_wheel "$p/filename" "$STALE_VER" "$STALE_VER" "$PY_TAG" "$ABI_TAG" ||
+    fail "self-test: cannot plant the filename-version-mismatch wheel"
   plant_wheel "$p/metadata" "$ver" "$STALE_VER" "$PY_TAG" "$ABI_TAG" ||
     fail "self-test: cannot plant the metadata-version-mismatch wheel"
   plant_wheel "$p/pytag" "$ver" "$ver" cp39 "$ABI_TAG" ||
@@ -405,7 +462,10 @@ self_test() { # <ver> <name>
   plant_wheel "$p/wheel-tag" "$ver" "$ver" "$PY_TAG" "$ABI_TAG" "cp39-$ABI_TAG" ||
     fail "self-test: cannot plant the wheel-tag-mismatch wheel"
   expect_file_ok "well-formed wheel" "$p/good/"*.whl "$ver" "$name"
+  expect_file_ok "prerelease wheel, expected under Cargo's spelling" "$p/prerelease/"*.whl "$PRE_CARGO" "$name"
+  expect_file_reject "filename version mismatch" "$p/filename/"*.whl "$ver" "$name" "wheel filename carries version '$STALE_VER'"
   expect_file_reject "metadata version mismatch" "$p/metadata/"*.whl "$ver" "$name" "METADATA version '$STALE_VER'"
+  expect_file_reject "prerelease wheel against a different prerelease" "$p/prerelease/"*.whl "3.0.0-beta.2" "$name" "wheel filename carries version '$PRE_PEP'"
   expect_file_reject "python tag mismatch" "$p/pytag/"*.whl "$ver" "$name" "python tag 'cp39'"
   expect_file_reject "wheel metadata tag mismatch" "$p/wheel-tag/"*.whl "$ver" "$name" "no 'Tag: ${PY_TAG}-${ABI_TAG}-'"
   make_venv "$cv" || fail "self-test: cannot create the import-control virtualenv"
@@ -415,6 +475,10 @@ self_test() { # <ver> <name>
   pip_install_offline "$VENV_PY" "$p/metadata/"*.whl --force-reinstall ||
     fail "self-test: the tampered wheel refused to install offline"
   expect_import_reject "import version assertion fires on the tampered wheel" "$VENV_PY" "$ver" "reports version '$STALE_VER'"
+  pip_install_offline "$VENV_PY" "$p/prerelease/"*.whl --force-reinstall ||
+    fail "self-test: the prerelease wheel refused to install offline"
+  expect_import_ok "prerelease wheel imports, expected under Cargo's spelling" "$VENV_PY" "$PRE_CARGO"
+  expect_import_reject "import version assertion still fires on the prerelease wheel" "$VENV_PY" "$ver" "reports version '$PRE_PEP'"
   echo "self-test: ok"
 }
 
@@ -483,5 +547,10 @@ main() {
   esac
 }
 
-ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+ROOT=$(cd -- "$SCRIPT_DIR/../.." && pwd)
+[ -r "$SCRIPT_DIR/lib/pep440.sh" ] ||
+  fail "missing the version rule $SCRIPT_DIR/lib/pep440.sh (it ships next to this script)"
+# shellcheck source=lib/pep440.sh
+. "$SCRIPT_DIR/lib/pep440.sh"
 main "$@"

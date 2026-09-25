@@ -11,6 +11,12 @@
 #       already-published version is a hard failure, never a warning). Every
 #       rejection exits non-zero with a named error on stderr; a publishable
 #       set prints a one-line summary and exits 0.
+#
+#       <version> arrives as the `v*` tag's spelling of the version the
+#       manifest declares, while the wheel filenames carry maturin's PEP 440
+#       spelling of it; the two are compared as versions through
+#       lib/pep440.sh, so a prerelease tag such as `v3.0.0-beta.1` matches the
+#       `3.0.0b1` wheels it names instead of being refused for its spelling.
 #   --self-test
 #       Hermetic (no network, no credentials): builds throwaway candidate sets
 #       under a temp dir and asserts that each of the four rejections fires
@@ -112,8 +118,8 @@ check_dist() {
     done
     [ -n "$matched_target" ] ||
       fail "mislabelled wheel '$base': platform tag '$platform' does not match any advertised target"
-    [ "$version" = "$expect_version" ] ||
-      fail "version disagreement: wheel '$base' carries version '$version' but --expect-version is '$expect_version'"
+    version_eq "$version" "$expect_version" ||
+      fail "version disagreement: wheel '$base' carries version '$version' but --expect-version is '$expect_version' (compared as PEP 440 versions)"
   done
 
   for target in "${TARGETS[@]}"; do
@@ -167,6 +173,36 @@ self_test() {
 }'
 
   local ver="3.0.0"
+  local cargo_pre="3.0.0-beta.1" wheel_pre="3.0.0b1"
+
+  # 0a. The class B rule itself, before any candidate set is judged: the
+  #     spellings a `v*` tag and a maturin-built wheel can use for one version
+  #     must compare equal, and a real version difference must not be
+  #     normalized away (a rule that always said "equal" would pass every
+  #     acceptance case below without proving anything).
+  expect_eq() { # <a> <b>
+    version_eq "$1" "$2" || {
+      echo "self-test: FAILED [version rule]: '$1' and '$2' are the same PEP 440 version but compared unequal" >&2
+      exit 1
+    }
+  }
+  expect_ne() { # <a> <b>
+    if version_eq "$1" "$2"; then
+      echo "self-test: FAILED [version rule]: '$1' and '$2' are different versions but compared equal" >&2
+      exit 1
+    fi
+  }
+  expect_eq "3.0.0-beta.1" "3.0.0b1"
+  expect_eq "3.0.0b1" "3.0.0-beta.1"
+  expect_eq "3.0.0-beta.1" "3.0.0-BETA.1"
+  expect_eq "3.0.0-alpha.2" "3.0.0a2"
+  expect_eq "3.0.0-rc.3" "3.0.0rc3"
+  expect_eq "3.0.0" "3.0.0"
+  expect_eq "1.0-1" "1.0.post1"
+  expect_ne "3.0.0b1" "3.0.0b2"
+  expect_ne "3.0.0" "3.0.0b1"
+  expect_ne "3.0.0b1" "3.0.0rc1"
+  expect_ne "0.3.0b2" "3.0.0"
 
   # 0. The parse that decides "already published" judges the canned bodies.
   SELFTEST_PYPI_JSON="$canned_published"
@@ -253,6 +289,22 @@ self_test() {
   make_set "$d"
   expect_reject "already published" "$d" "$ver" "already published"
 
+  # 6. A prerelease candidate set: the wheels carry maturin's spelling
+  # (`3.0.0b1`) while --expect-version arrives as the tag's Cargo spelling
+  # (`3.0.0-beta.1`). Those name the same version, so the set is publishable.
+  SELFTEST_PYPI_JSON="$canned_unpublished"
+  d="$tmp/prerelease"
+  mkdir -p "$d"
+  make_wheel "$d" pulsehive "$wheel_pre" cp311 abi3 macosx_11_0_arm64
+  make_wheel "$d" pulsehive "$wheel_pre" cp311 abi3 manylinux_2_28_x86_64
+  make_wheel "$d" pulsehive "$wheel_pre" cp311 abi3 win_amd64
+  expect_ok "prerelease set against the tag's Cargo spelling" "$d" "$cargo_pre"
+
+  # 7. ...and the normalization must not turn a different prerelease into the
+  # same version: `3.0.0b1` wheels are not `3.0.0-beta.2`.
+  expect_reject "prerelease set against a different prerelease" "$d" "3.0.0-beta.2" \
+    "carries version '$wheel_pre' but --expect-version is '3.0.0-beta.2'"
+
   echo "self-test: ok"
 }
 
@@ -305,5 +357,11 @@ main() {
 
   check_dist "$dist_dir" "$expect_version"
 }
+
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+[ -r "$SCRIPT_DIR/lib/pep440.sh" ] ||
+  fail "missing the version rule $SCRIPT_DIR/lib/pep440.sh (it ships next to this script)"
+# shellcheck source=lib/pep440.sh
+. "$SCRIPT_DIR/lib/pep440.sh"
 
 main "$@"
