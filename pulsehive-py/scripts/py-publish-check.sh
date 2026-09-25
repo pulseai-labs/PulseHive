@@ -22,9 +22,14 @@
 #       lib/pep440.sh, so a prerelease tag such as `v3.0.0-beta.1` matches the
 #       `3.0.0b1` wheels it names instead of being refused for its spelling.
 #   --self-test
-#       Hermetic (no network, no credentials): builds throwaway candidate sets
-#       under a temp dir and asserts that each of the four rejections fires
-#       AND that a correctly-formed set passes. Prints `self-test: ok` as its
+#       Hermetic (no network, no credentials): stubs only the HTTP layer,
+#       builds throwaway candidate sets under a temp dir, and asserts that
+#       every rejection fires AND that a correctly-formed set passes — the
+#       four wheel-set rejections (missing target, mislabelled target, version
+#       disagreement, already published), the non-wheel-artifact rejection,
+#       the version rule including the prerelease spellings a tag and maturin
+#       disagree on, and the published-state probe's three outcomes (200, 404,
+#       and everything else failing closed). Prints `self-test: ok` as its
 #       last line on success.
 #
 # The TARGETS list below is the single source of the advertised targets (L3);

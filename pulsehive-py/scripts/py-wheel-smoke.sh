@@ -12,18 +12,25 @@
 #                       as its last line on success.
 #   --wheel <path>      the same install-and-assert half against an already-built
 #                       wheel — no build step (w4's CI matrix legs call this).
-#   --self-test         hermetic (no network): plants tampered wheels whose
-#                       metadata version and tags disagree and requires this
-#                       script's own checks to reject each, plus a live
-#                       import-path control against the tampered wheel. Prints
+#   --self-test         hermetic (no network): proves the checks are live —
+#                       both venv layouts resolve and make_venv is driven on
+#                       the Windows one, the version rule reads a Cargo
+#                       prerelease as the version maturin spells on the wheel,
+#                       tampered wheels whose metadata version and tags
+#                       disagree are rejected, a different prerelease is still
+#                       rejected, and the import-path control fires on the
+#                       tampered wheel and passes on the truthful one. Prints
 #                       `self-test: ok` as its last line.
 #
 # Build profile (implementer's choice, sized for the warm < 240 s bound against
 # RELEASE.md's 600 s budget): maturin itself is installed into a throwaway venv
-# under the run's mktemp dir; cargo compilation lands in a persistent target dir
-# OUTSIDE the worktree ($PULSEHIVE_WHEEL_SMOKE_TARGET_DIR, default
-# ~/.cache/pulsehive/py-wheel-smoke/target) so the cold ort-sys/onnxruntime
-# fetch is paid once and later runs stay warm. The wheel, the virtualenvs and
+# under the run's mktemp dir; cargo compilation lands in the persistent target
+# dir $PULSEHIVE_WHEEL_SMOKE_TARGET_DIR — by default
+# ~/.cache/pulsehive/py-wheel-smoke/target, outside the worktree so a local run
+# leaves nothing behind, and in CI the workspace target/ that the job's
+# rust-cache step already caches, so no PR run compiles the release tree a
+# second time. The default dir is also what keeps the cold
+# ort-sys/onnxruntime fetch to one payment. The wheel, the virtualenvs and
 # every other temp file live under one mktemp -d dir that the EXIT trap removes.
 # Nothing this script creates is ever written inside the worktree; a workspace
 # Cargo.lock the build generates (gitignored in this repo) is removed again on
