@@ -76,6 +76,19 @@ jobs:
               apt-get update && apt-get install -y libssl-dev pkg-config
             fi
 
+      # r2.s2.w4: prove the wheel this leg just built installs and imports on
+      # this leg's own runner before it can be uploaded. The step lives inside
+      # the matrix job body, so it runs once per advertised target against that
+      # target's own wheel from dist/. PYTHON=python pins the setup-python 3.12
+      # interpreter (the smoke needs >=3.11; `python3` is not a reliable name on
+      # the Windows runner). A leg whose wheel fails install/import fails the
+      # matrix job, which the publish job's needs: already blocks on.
+      - name: Smoke the wheel (install + import, this target)
+        shell: bash
+        run: |
+          export PYTHON=python
+          bash pulsehive-py/scripts/py-wheel-smoke.sh --wheel dist/*.whl
+
       - name: Upload wheel
         uses: actions/upload-artifact@v7
         with:
