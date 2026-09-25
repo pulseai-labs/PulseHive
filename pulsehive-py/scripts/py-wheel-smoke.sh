@@ -439,6 +439,50 @@ expect_venv_layouts() {
   expect_resolves_to "venv console script (Windows layout)" "$win/Scripts/maturin.exe" venv_script "$win" maturin
   expect_resolves_nothing "venv with neither layout" venv_python "$base/empty"
   expect_resolves_nothing "console script in neither layout" venv_script "$base/empty" maturin
+  expect_make_venv_windows_layout
+}
+
+# expect_make_venv_windows_layout — make_venv itself, against a venv that has
+# only the WINDOWS layout. The interpreter here is a stand-in whose `-m venv`
+# writes Scripts/python.exe (that single difference is what makes the
+# windows-latest leg fail), and whose Scripts/python.exe answers the pip probe
+# make_venv makes — which only looks at the exit status, as pip's does. So a
+# make_venv that went back to `$1/bin/python` fails this self-test on this host
+# instead of failing the Windows leg at tag time, where it blocks every
+# publish.
+expect_make_venv_windows_layout() {
+  local saved_py="$PY" fake="$SMOKE_TMP/fake-py" dir="$SMOKE_TMP/windows-venv"
+  mkdir -p "$fake/bin" || fail "self-test: cannot create the stand-in interpreter dir"
+  cat > "$fake/bin/python" <<'FAKEPY'
+#!/bin/sh
+# `-m venv [flags] <dir>` → the Windows layout. The venv dir is the last
+# argument in both invocations make_venv can make.
+if [ "${1:-}" = "-m" ] && [ "${2:-}" = "venv" ]; then
+  shift 2
+  dir=""
+  for arg in "$@"; do dir="$arg"; done
+  [ -n "$dir" ] || exit 1
+  mkdir -p "$dir/Scripts" || exit 1
+  printf '%s\n' '#!/bin/sh' 'exit 0' > "$dir/Scripts/python.exe" || exit 1
+  chmod +x "$dir/Scripts/python.exe" || exit 1
+  exit 0
+fi
+exit 1
+FAKEPY
+  chmod +x "$fake/bin/python" || fail "self-test: cannot make the stand-in interpreter runnable"
+  rm -rf "$dir"
+  PY="$fake/bin/python"
+  make_venv "$dir" || {
+    PY="$saved_py"
+    echo "self-test: FAILED [windows venv layout]: make_venv cannot create a venv whose interpreter is Scripts/python.exe" >&2
+    exit 1
+  }
+  PY="$saved_py"
+  [ "$VENV_PY" = "$dir/Scripts/python.exe" ] || {
+    echo "self-test: FAILED [windows venv layout]: VENV_PY is '$VENV_PY', expected '$dir/Scripts/python.exe'" >&2
+    exit 1
+  }
+  VENV_PY=""
 }
 
 # self_test — RELEASE.md's negative control for this proof: every assertion the
