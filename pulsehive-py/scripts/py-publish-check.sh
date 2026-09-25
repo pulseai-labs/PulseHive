@@ -7,10 +7,14 @@
 #   --dist <dir> --expect-version <version>
 #       Verify that <dir> holds a complete, correctly-labelled, correctly-
 #       versioned wheel set covering every advertised target, and that
-#       <version> is NOT already published on PyPI (JSON API query; an
-#       already-published version is a hard failure, never a warning). Every
-#       rejection exits non-zero with a named error on stderr; a publishable
-#       set prints a one-line summary and exits 0.
+#       <version> is NOT already published on PyPI. The state is asked of the
+#       JSON API's per-version endpoint and decided by its HTTP status: 200 is
+#       "published" (a hard failure, never a warning), 404 is "not published"
+#       — which is also what an absent project answers, so a first-ever
+#       publish is allowed through — and any other status, or a transport
+#       failure, refuses to publish (fail closed). Every rejection exits
+#       non-zero with a named error on stderr; a publishable set prints a
+#       one-line summary and exits 0.
 #
 #       <version> arrives as the `v*` tag's spelling of the version the
 #       manifest declares, while the wheel filenames carry maturin's PEP 440
@@ -61,26 +65,41 @@ fail() {
   exit 1
 }
 
-# pypi_fetch_project_json <project>
-#   Prints the project's JSON API body; non-zero when the query itself fails.
-#   Split from the version match below so --self-test can stub only the
-#   network and exercise the real parsing.
-pypi_fetch_project_json() {
-  curl -fsSL --max-time 30 "$PYPI_JSON_URL/$1/json" 2>/dev/null
+# pypi_version_url <project> <version>
+#   The per-version JSON endpoint for <version>, in PEP 440's canonical
+#   spelling — the spelling PyPI indexes, so the tag `v3.0.0-beta.1` asks about
+#   `3.0.0b1`. Pure and network-free: --self-test judges the URL a probe would
+#   use, and rc non-zero means the version has no release segment to spell.
+pypi_version_url() {
+  local canon
+  canon=$(pep440_canon "$2") || return 1
+  printf '%s/%s/%s/json' "$PYPI_JSON_URL" "$1" "$canon"
 }
 
-# pypi_has_version <project> <version>
-#   rc 0 — <version> is published for <project>
-#   rc 1 — <version> is not published
-#   rc 2 — the query itself failed (network/API); callers must fail closed
-pypi_has_version() {
-  local project="$1" version="$2" json esc
-  esc=$(printf '%s' "$version" | sed -e 's/[.[]/\\&/g')
-  json=$(pypi_fetch_project_json "$project") || return 2
-  # The JSON API maps every released version to an ARRAY of files
-  # ("1.2.3": [ ... ]) — never to a bare object. Matching an object shape
-  # here silently reports published versions as unpublished.
-  printf '%s' "$json" | grep -qE "\"${esc}\":[[:space:]]*\["
+# pypi_http_status <url>
+#   The transport: the HTTP status code a GET of <url> answers with, or rc
+#   non-zero when the request itself failed (DNS, TLS, timeout). Deliberately
+#   without curl -f: here the status IS the answer, so a 404 has to stay
+#   readable instead of being flattened into a transport error.
+pypi_http_status() {
+  curl -s -o /dev/null -w '%{http_code}' --max-time 30 "$1" 2>/dev/null
+}
+
+# pypi_version_status <project> <version>
+#   rc 0 — <version> is published for <project> (HTTP 200)
+#   rc 1 — <version> is not published (HTTP 404; an absent project answers with
+#          the same 404, which is why a first-ever publish is allowed through)
+#   rc 2 — the state could not be established: any other status, an
+#          unspellable version, or a transport failure. Callers fail closed.
+pypi_version_status() {
+  local project="$1" version="$2" url code
+  url=$(pypi_version_url "$project" "$version") || return 2
+  code=$(pypi_http_status "$url") || return 2
+  case "$code" in
+    200) return 0 ;;
+    404) return 1 ;;
+    *) return 2 ;;
+  esac
 }
 
 check_dist() {
@@ -130,11 +149,11 @@ check_dist() {
   done
 
   local rc=0
-  pypi_has_version "$name" "$expect_version" || rc=$?
+  pypi_version_status "$name" "$expect_version" || rc=$?
   case $rc in
     0) fail "already published: version '$expect_version' of project '$name' already exists on PyPI — re-publishing an existing version is forbidden" ;;
     1) : ;;
-    *) fail "cannot verify PyPI state for '$name' (query failed) — refusing to publish an unproven version" ;;
+    *) fail "cannot verify PyPI state for '$name' '$expect_version' (the per-version JSON probe answered neither 200 nor 404) — refusing to publish an unproven version" ;;
   esac
 
   echo "$PROG: ok: ${#wheels[@]} wheel(s) cover all ${#TARGETS[@]} advertised targets at version '$expect_version' (project '$name') — publishable"
@@ -147,30 +166,42 @@ self_test() {
     fail "self-test: cannot create a temp dir"
   trap 'rm -rf "${tmp:-}"' EXIT
 
-  # Hermetic: stub ONLY the network fetch, feeding canned PyPI JSON bodies —
-  # the version-matching parse inside pypi_has_version runs for real, so a
-  # wrong releases-shape assumption fails here offline instead of on PyPI.
-  # The bodies mirror the live API: every key under "releases" maps to an
-  # ARRAY of files. The unpublished body carries the candidate version only
-  # as info.version (a value), never as a releases key.
-  pypi_fetch_project_json() { printf '%s' "$SELFTEST_PYPI_JSON"; }
-  SELFTEST_PYPI_JSON=""
-  local canned_published canned_unpublished
-  canned_published='{
- "info": {"name": "pulsehive", "version": "3.0.0"},
- "releases": {
-  "2.0.0rc1": [{"filename": "pulsehive-2.0.0rc1-cp39-abi3-win_amd64.whl"}],
-  "3.0.0": [{"filename": "pulsehive-3.0.0-cp311-abi3-macosx_11_0_arm64.whl"}]
- },
- "urls": []
-}'
-  canned_unpublished='{
- "info": {"name": "pulsehive", "version": "3.0.0"},
- "releases": {
-  "2.0.0rc1": [{"filename": "pulsehive-2.0.0rc1-cp39-abi3-win_amd64.whl"}]
- },
- "urls": []
-}'
+  # Hermetic: stub ONLY the HTTP layer. The endpoint a probe asks for and the
+  # rc mapping that turns a status code into published / not published / cannot
+  # tell both run for real, so a wrong endpoint or a wrong reading of a status
+  # fails here offline instead of on the release path, where the answers are
+  # live. The stub records every URL it is handed and can fail like a dead
+  # network.
+  SELFTEST_HTTP_LOG="$tmp/http-requests.log"
+  : > "$SELFTEST_HTTP_LOG"
+  SELFTEST_HTTP_CODE="200"
+  SELFTEST_HTTP_FAIL=0
+  pypi_http_status() { # <url>
+    printf '%s\n' "$1" >> "$SELFTEST_HTTP_LOG"
+    if [ "${SELFTEST_HTTP_FAIL:-0}" -eq 1 ]; then
+      return 7
+    fi
+    printf '%s' "$SELFTEST_HTTP_CODE"
+  }
+  expect_status() { # <label> <project> <version> <expected rc>
+    local rc=0
+    pypi_version_status "$2" "$3" || rc=$?
+    [ "$rc" -eq "$4" ] || {
+      echo "self-test: FAILED [$1]: pypi_version_status '$2' '$3' -> rc=$rc, expected rc=$4" >&2
+      exit 1
+    }
+  }
+  expect_url() { # <label> <expected url> <project> <version>
+    local got
+    got=$(pypi_version_url "$3" "$4") || {
+      echo "self-test: FAILED [$1]: no URL for '$3' '$4'" >&2
+      exit 1
+    }
+    [ "$got" = "$2" ] || {
+      echo "self-test: FAILED [$1]: URL '$got', expected '$2'" >&2
+      exit 1
+    }
+  }
 
   local ver="3.0.0"
   local cargo_pre="3.0.0-beta.1" wheel_pre="3.0.0b1"
@@ -204,17 +235,27 @@ self_test() {
   expect_ne "3.0.0b1" "3.0.0rc1"
   expect_ne "0.3.0b2" "3.0.0"
 
-  # 0. The parse that decides "already published" judges the canned bodies.
-  SELFTEST_PYPI_JSON="$canned_published"
-  if ! pypi_has_version pulsehive "$ver"; then
-    echo "self-test: FAILED [pypi parse]: published '$ver' not detected in an array-shaped releases body" >&2
-    exit 1
-  fi
-  SELFTEST_PYPI_JSON="$canned_unpublished"
-  if pypi_has_version pulsehive "$ver"; then
-    echo "self-test: FAILED [pypi parse]: a version present only as a value was treated as a published release" >&2
-    exit 1
-  fi
+  # 0. The probe's endpoint and its three outcomes. The per-version endpoint is
+  #    what is asked, in canonical PEP 440 spelling; 200 means published, 404
+  #    means not published (an absent project reads the same way, so a
+  #    first-ever publish is allowed through), and everything else — any other
+  #    status, no status, or a dead connection — fails closed.
+  expect_url "per-version endpoint" "$PYPI_JSON_URL/pulsehive/$ver/json" pulsehive "$ver"
+  expect_url "per-version endpoint, prerelease normalized" "$PYPI_JSON_URL/pulsehive/$wheel_pre/json" pulsehive "$cargo_pre"
+  expect_status "published version (HTTP 200)" pulsehive "$ver" 0
+  SELFTEST_HTTP_CODE="404"
+  expect_status "unpublished version (HTTP 404)" pulsehive "$ver" 1
+  SELFTEST_HTTP_CODE="401"
+  expect_status "unexpected status (HTTP 401) fails closed" pulsehive "$ver" 2
+  SELFTEST_HTTP_CODE="500"
+  expect_status "unexpected status (HTTP 500) fails closed" pulsehive "$ver" 2
+  SELFTEST_HTTP_CODE="000"
+  expect_status "no status code at all fails closed" pulsehive "$ver" 2
+  SELFTEST_HTTP_FAIL=1
+  expect_status "transport failure fails closed" pulsehive "$ver" 2
+  SELFTEST_HTTP_FAIL=0
+  SELFTEST_HTTP_CODE="404"
+  expect_status "version with no release segment fails closed" pulsehive "not-a-version" 2
 
   make_wheel() { # <dir> <name> <version> <pytag> <abitag> <platform>
     printf '' > "$1/$2-$3-$4-$5-$6.whl"
@@ -252,12 +293,18 @@ self_test() {
     esac
   }
 
-  # 1. A correctly-formed, unpublished set passes (canned body: candidate
-  #    version absent from "releases").
-  SELFTEST_PYPI_JSON="$canned_unpublished"
+  # 1. A correctly-formed, unpublished set passes (stub: the per-version
+  #    endpoint answers 404, which is also what a project that has never been
+  #    published answers — hence the check below that the probe really asked
+  #    for the endpoint it claims to).
+  SELFTEST_HTTP_CODE="404"
   d="$tmp/pass"
   make_set "$d"
-  expect_ok "correctly-formed set" "$d" "$ver"
+  expect_ok "correctly-formed set (first-ever publish)" "$d" "$ver"
+  grep -qxF "$PYPI_JSON_URL/pulsehive/$ver/json" "$SELFTEST_HTTP_LOG" || {
+    echo "self-test: FAILED [probe endpoint]: the gate never asked the per-version endpoint for '$ver'" >&2
+    exit 1
+  }
 
   # 2. An advertised target's wheel missing from the set.
   d="$tmp/missing"
@@ -282,17 +329,23 @@ self_test() {
   expect_reject "version disagreement" "$d" "$ver" \
     "carries version '0.3.0b2' but --expect-version is '$ver'"
 
-  # 5. The version already exists on PyPI — decided by the real parse against
-  # a canned array-shaped releases body (never a real query).
-  SELFTEST_PYPI_JSON="$canned_published"
+  # 5. The version already exists on PyPI (stub: the per-version endpoint
+  # answers 200) — a hard failure, decided by the status and never by the
+  # shape of a JSON body.
+  SELFTEST_HTTP_CODE="200"
   d="$tmp/published"
   make_set "$d"
   expect_reject "already published" "$d" "$ver" "already published"
 
+  # 5b. ...and a probe that cannot establish the state (stub: HTTP 503)
+  # refuses to publish rather than assuming the version is free.
+  SELFTEST_HTTP_CODE="503"
+  expect_reject "unverifiable PyPI state" "$d" "$ver" "cannot verify PyPI state"
+
   # 6. A prerelease candidate set: the wheels carry maturin's spelling
   # (`3.0.0b1`) while --expect-version arrives as the tag's Cargo spelling
   # (`3.0.0-beta.1`). Those name the same version, so the set is publishable.
-  SELFTEST_PYPI_JSON="$canned_unpublished"
+  SELFTEST_HTTP_CODE="404"
   d="$tmp/prerelease"
   mkdir -p "$d"
   make_wheel "$d" pulsehive "$wheel_pre" cp311 abi3 macosx_11_0_arm64
