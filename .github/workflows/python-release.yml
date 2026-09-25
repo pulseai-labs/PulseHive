@@ -88,7 +88,16 @@ jobs:
       # every pair re-points `python` at one advertised minor and runs the same
       # install-and-import path against it. PYTHON=python pins the interpreter
       # the pair just installed (the smoke needs >=3.11, and `python3` is not a
-      # reliable name on the Windows runner). A leg whose wheel fails
+      # reliable name on the Windows runner).
+      #
+      # Each pair also asserts the minor it claims, because PATH is what
+      # decides, not the step name: the smoke's own floor is >=3.11, so a
+      # `python` this leg never set up (an earlier PATH entry winning on the
+      # runner) would let all three pairs pass while covering one minor three
+      # times and leaving the advertised ones untested. The assertion prints
+      # the interpreter and fails the step if its major.minor is not the one
+      # setup-python was asked for — so a drift between the two also fails
+      # here, loudly, instead of passing quietly. A leg whose wheel fails
       # install/import under any advertised minor fails the matrix job, which
       # the publish job's needs: already blocks on.
       - uses: actions/setup-python@v6
@@ -97,8 +106,11 @@ jobs:
 
       - name: Smoke the wheel under Python 3.11 (install + import, this target)
         shell: bash
+        env:
+          EXPECT_MINOR: "3.11"
         run: |
           export PYTHON=python
+          python -c 'import os, sys; want = os.environ["EXPECT_MINOR"]; got = "%d.%d" % sys.version_info[:2]; print("smoke interpreter: Python " + sys.version.split()[0]); raise SystemExit(0 if got == want else "expected Python " + want + ", got " + got)'
           bash pulsehive-py/scripts/py-wheel-smoke.sh --wheel dist/*.whl
 
       - uses: actions/setup-python@v6
@@ -107,8 +119,11 @@ jobs:
 
       - name: Smoke the wheel under Python 3.12 (install + import, this target)
         shell: bash
+        env:
+          EXPECT_MINOR: "3.12"
         run: |
           export PYTHON=python
+          python -c 'import os, sys; want = os.environ["EXPECT_MINOR"]; got = "%d.%d" % sys.version_info[:2]; print("smoke interpreter: Python " + sys.version.split()[0]); raise SystemExit(0 if got == want else "expected Python " + want + ", got " + got)'
           bash pulsehive-py/scripts/py-wheel-smoke.sh --wheel dist/*.whl
 
       - uses: actions/setup-python@v6
@@ -117,8 +132,11 @@ jobs:
 
       - name: Smoke the wheel under Python 3.13 (install + import, this target)
         shell: bash
+        env:
+          EXPECT_MINOR: "3.13"
         run: |
           export PYTHON=python
+          python -c 'import os, sys; want = os.environ["EXPECT_MINOR"]; got = "%d.%d" % sys.version_info[:2]; print("smoke interpreter: Python " + sys.version.split()[0]); raise SystemExit(0 if got == want else "expected Python " + want + ", got " + got)'
           bash pulsehive-py/scripts/py-wheel-smoke.sh --wheel dist/*.whl
 
       - name: Upload wheel
