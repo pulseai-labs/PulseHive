@@ -25,6 +25,7 @@ ADRs follow numbered naming convention: `NNN-decision-title.md`
 | 013 | 2026-09-13 | Transport & Substrate Boundary Contract | Accepted |
 | 014 | 2026-09-14 | Cancellation Semantics | Accepted |
 | 015 | 2026-09-23 | npm Installation Contract | Accepted |
+| 016 | 2026-09-25 | Python Distribution and Versioning Contract | Accepted |
 
 ---
 
