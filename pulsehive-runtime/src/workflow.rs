@@ -170,25 +170,24 @@ async fn run_sequential(children: Vec<AgentDefinition>, ctx: &WorkflowContext) -
         };
     }
 
-    let mut last_response = String::new();
     // The sequence's pending result (L1): what its `Complete` would carry over
     // the children completed so far — the last `Complete` child's response, or
-    // the last partial child's own `responses`, unjoined.
+    // the last partial child's own `responses`, unjoined. Joined, it is the
+    // sequence's last response.
     let mut pending: Vec<String> = Vec::new();
     let mut errors: Vec<String> = Vec::new();
     for (i, child) in children.into_iter().enumerate() {
         if ctx.cancel.is_cancelled() {
             tracing::info!(child_index = i, "Sequential: cancelled before child");
             return AgentOutcome::Cancelled {
-                partial_response: last_response,
+                partial_response: pending.join("\n"),
             };
         }
         tracing::info!(child_index = i, child_name = %child.name, "Sequential: running child");
         let outcome = dispatch_agent(child, &ctx.for_child()).await;
         match outcome {
             AgentOutcome::Complete { response } => {
-                pending = vec![response.clone()];
-                last_response = response;
+                pending = vec![response];
             }
             // D3: partial results are progress — the next child still runs. The
             // child's responses become the sequence's pending result (unjoined,
@@ -198,7 +197,6 @@ async fn run_sequential(children: Vec<AgentDefinition>, ctx: &WorkflowContext) -
                 responses,
                 errors: child_errors,
             } => {
-                last_response = responses.join("\n");
                 pending = responses;
                 errors.extend(child_errors);
             }
@@ -206,7 +204,7 @@ async fn run_sequential(children: Vec<AgentDefinition>, ctx: &WorkflowContext) -
             // cancelled child's internal partial.
             AgentOutcome::Cancelled { .. } => {
                 return AgentOutcome::Cancelled {
-                    partial_response: last_response,
+                    partial_response: pending.join("\n"),
                 };
             }
             // L2: Error, MaxIterationsReached and any future variant stay
@@ -218,7 +216,7 @@ async fn run_sequential(children: Vec<AgentDefinition>, ctx: &WorkflowContext) -
     }
     if errors.is_empty() {
         AgentOutcome::Complete {
-            response: last_response,
+            response: pending.join("\n"),
         }
     } else {
         AgentOutcome::PartialComplete {

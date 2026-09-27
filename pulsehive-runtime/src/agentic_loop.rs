@@ -335,7 +335,7 @@ async fn think_act_loop(
                 }
             }
 
-            let (result, body_ran) = match execute_tool_call(
+            let dispatched = match execute_tool_call(
                 agent_id,
                 tool_call,
                 tool_map,
@@ -348,7 +348,7 @@ async fn think_act_loop(
             .instrument(tracing::info_span!("act", agent_id = %agent_id, tool = %tool_call.name))
             .await
             {
-                Ok(outcome) => outcome,
+                Ok(dispatched) => dispatched,
                 // Cancelled at the approval boundary: the tool body never
                 // ran, so no tool result is recorded — the turn ends as
                 // `Cancelled` with the turn's partial response.
@@ -358,9 +358,13 @@ async fn think_act_loop(
             };
 
             // L5.2: only a call that reached the tool body spends budget.
-            if body_ran {
-                executed_tool_calls += 1;
-            }
+            let result = match dispatched {
+                ToolDispatch::Executed(result) => {
+                    executed_tool_calls += 1;
+                    result
+                }
+                ToolDispatch::NotExecuted(result) => result,
+            };
 
             messages.push(Message::tool_result(&tool_call.id, result.to_content()));
             tool_calls_since_refresh += 1;
@@ -419,11 +423,23 @@ async fn think_act_loop(
 /// turn as [`AgentOutcome::Cancelled`].
 struct ApprovalCancelled;
 
+/// The result of dispatching one tool call, tagged with whether a tool body
+/// actually ran — ADR-017 L5.2: the tool-call budget counts only the calls that
+/// reach the body. Every result to record is one of the two, so a new return
+/// path has to say which.
+enum ToolDispatch {
+    /// A tool body ran; the call spends budget.
+    Executed(ToolResult),
+    /// No body ran (a missing tool, a denied approval, a failed approval
+    /// handler); the result is recorded but spends no budget.
+    NotExecuted(ToolResult),
+}
+
 /// Execute a single tool call with approval check.
 ///
-/// Returns the result to record beside whether a tool body actually ran
-/// (ADR-017 L5.2 — the tool-call budget counts only the calls that reach the
-/// body, so a missing tool and a denied approval report `false`).
+/// Returns the result to record as a [`ToolDispatch`], which says whether a
+/// tool body actually ran (ADR-017 L5.2 — a missing tool and a denied
+/// approval are `NotExecuted`).
 #[allow(clippy::too_many_arguments)]
 async fn execute_tool_call(
     agent_id: &str,
@@ -434,13 +450,13 @@ async fn execute_tool_call(
     event_emitter: &EventEmitter,
     collective_id: &CollectiveId,
     cancel: &CancellationToken,
-) -> std::result::Result<(ToolResult, bool), ApprovalCancelled> {
+) -> std::result::Result<ToolDispatch, ApprovalCancelled> {
     let Some(&tool) = tool_map.get(tool_call.name.as_str()) else {
         tracing::warn!(agent_id = %agent_id, tool = %tool_call.name, "Tool not found");
-        return Ok((
-            ToolResult::error(format!("Tool '{}' not found", tool_call.name)),
-            false,
-        ));
+        return Ok(ToolDispatch::NotExecuted(ToolResult::error(format!(
+            "Tool '{}' not found",
+            tool_call.name
+        ))));
     };
 
     // Check approval if required
@@ -486,14 +502,13 @@ async fn execute_tool_call(
         match decision {
             Ok(ApprovalResult::Approved) => {} // proceed
             Ok(ApprovalResult::Denied { reason }) => {
-                return Ok((
-                    ToolResult::error(format!("Tool execution denied: {reason}")),
-                    false,
-                ));
+                return Ok(ToolDispatch::NotExecuted(ToolResult::error(format!(
+                    "Tool execution denied: {reason}"
+                ))));
             }
             Ok(ApprovalResult::Modified { new_params }) => {
                 // Execute with modified params
-                return Ok((
+                return Ok(ToolDispatch::Executed(
                     execute_tool_inner(
                         agent_id,
                         &tool_call.name,
@@ -505,20 +520,18 @@ async fn execute_tool_call(
                         cancel,
                     )
                     .await,
-                    true,
                 ));
             }
             Err(e) => {
                 // No body ran either: the decision never arrived.
-                return Ok((
-                    ToolResult::error(format!("Approval handler error: {e}")),
-                    false,
-                ));
+                return Ok(ToolDispatch::NotExecuted(ToolResult::error(format!(
+                    "Approval handler error: {e}"
+                ))));
             }
         }
     }
 
-    Ok((
+    Ok(ToolDispatch::Executed(
         execute_tool_inner(
             agent_id,
             &tool_call.name,
@@ -530,7 +543,6 @@ async fn execute_tool_call(
             cancel,
         )
         .await,
-        true,
     ))
 }
 
