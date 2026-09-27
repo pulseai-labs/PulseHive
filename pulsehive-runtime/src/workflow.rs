@@ -142,8 +142,19 @@ pub(crate) fn dispatch_agent(
 /// naturally finds experiences recorded by all previous children. This is the
 /// "shared consciousness" model — no explicit data passing between agents.
 ///
-/// Returns the last child's outcome. Stops early on error or `MaxIterationsReached`.
-/// Empty children list returns `Complete` with empty response.
+/// A degraded sequence reports itself as degraded (L1): when any child
+/// contributed an error — a `PartialComplete` child's own, already-named errors
+/// — the sequence ends `PartialComplete` carrying the pending result's
+/// `responses` (what its `Complete` would have carried: the last `Complete`
+/// child's response, or the last partial child's own `responses`) and the
+/// accumulated `errors`. It never ends `Complete` when any child contributed an
+/// error. With no error it ends `Complete { response }` with the last child's
+/// response, exactly as before.
+///
+/// Terminal child outcomes stay terminal (L2): `Error`,
+/// `MaxIterationsReached` and any future variant are returned unchanged, and
+/// earlier children's errors are never folded into them. Empty children list
+/// returns `Complete` with empty response.
 ///
 /// Cancellation (ADR-014): a cancelled run token — checked before each child is
 /// dispatched — ends the sequence as `Cancelled` carrying the last completed
@@ -160,6 +171,11 @@ async fn run_sequential(children: Vec<AgentDefinition>, ctx: &WorkflowContext) -
     }
 
     let mut last_response = String::new();
+    // The sequence's pending result (L1): what its `Complete` would carry over
+    // the children completed so far — the last `Complete` child's response, or
+    // the last partial child's own `responses`, unjoined.
+    let mut pending: Vec<String> = Vec::new();
+    let mut errors: Vec<String> = Vec::new();
     for (i, child) in children.into_iter().enumerate() {
         if ctx.cancel.is_cancelled() {
             tracing::info!(child_index = i, "Sequential: cancelled before child");
@@ -171,12 +187,20 @@ async fn run_sequential(children: Vec<AgentDefinition>, ctx: &WorkflowContext) -
         let outcome = dispatch_agent(child, &ctx.for_child()).await;
         match outcome {
             AgentOutcome::Complete { response } => {
+                pending = vec![response.clone()];
                 last_response = response;
             }
-            // D3: partial results are progress — the child's responses become
-            // the sequence's last response and the next child runs.
-            AgentOutcome::PartialComplete { responses, .. } => {
+            // D3: partial results are progress — the next child still runs. The
+            // child's responses become the sequence's pending result (unjoined,
+            // so a degraded sequence's `responses` mirror its `Complete`) and
+            // its errors are accumulated rather than dropped (L1).
+            AgentOutcome::PartialComplete {
+                responses,
+                errors: child_errors,
+            } => {
                 last_response = responses.join("\n");
+                pending = responses;
+                errors.extend(child_errors);
             }
             // A16: the composite reports its own accumulated response, not the
             // cancelled child's internal partial.
@@ -185,14 +209,22 @@ async fn run_sequential(children: Vec<AgentDefinition>, ctx: &WorkflowContext) -
                     partial_response: last_response,
                 };
             }
-            // Error, MaxIterationsReached and any future variant stay terminal.
+            // L2: Error, MaxIterationsReached and any future variant stay
+            // terminal and unchanged — earlier errors are never folded in.
             other => {
                 return other;
             }
         }
     }
-    AgentOutcome::Complete {
-        response: last_response,
+    if errors.is_empty() {
+        AgentOutcome::Complete {
+            response: last_response,
+        }
+    } else {
+        AgentOutcome::PartialComplete {
+            responses: pending,
+            errors,
+        }
     }
 }
 

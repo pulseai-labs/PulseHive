@@ -5,6 +5,11 @@ All notable changes to PulseHive will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Behaviour change
+- **pulsehive-runtime**: a `Sequential` whose child ends `AgentOutcome::PartialComplete` now ends `PartialComplete` itself instead of `Complete`. Its `responses` carry what a clean run's `Complete` would have carried — the last `Complete` child's response, or a partial last child's own `responses` — and its `errors` name the failed children (`<agent>: <error>`, `<agent>: max iterations reached`, `<agent>: task failed: <reason>`), so a degraded sequence can no longer be mistaken for a clean run (pulse-guard PH-1; ADR-014's r2.s5 amendment, L1). The child still counts as progress and the sequence still runs its next child, exactly as before; with no failing child the sequence still ends `Complete` with the last child's response, and a terminal child outcome (`Error`, `MaxIterationsReached`, `Cancelled`) is still returned unchanged, with no earlier child's error folded into it (L2).
+
 ## [3.0.0] - 2026-09-14
 
 ### Fixed
