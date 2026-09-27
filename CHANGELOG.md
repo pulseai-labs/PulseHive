@@ -5,6 +5,11 @@ All notable changes to PulseHive will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+- **pulsehive-runtime**: perception no longer panics when an experience's byte 500 falls inside a multi-byte character (pulse-guard PH-2) — `format_as_intrinsic_knowledge` now cuts long content at the preceding character boundary and marks it with `...`, through the same char-safe helper experience extraction already used.
+
 ## [3.0.0] - 2026-09-14
 
 ### Fixed

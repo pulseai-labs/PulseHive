@@ -190,11 +190,7 @@ pub fn format_as_intrinsic_knowledge(
         parts.push("Based on your previous experience and knowledge:\n".to_string());
         for exp in experiences {
             // Truncate long content for context window efficiency
-            let content = if exp.content.len() > 500 {
-                format!("{}...", &exp.content[..500])
-            } else {
-                exp.content.clone()
-            };
+            let content = crate::text::truncate(&exp.content, 500);
             parts.push(format!("• You understand that {content}"));
         }
     }
