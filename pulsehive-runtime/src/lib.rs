@@ -10,4 +10,5 @@ pub mod hivemind;
 pub mod intelligence;
 pub mod perception;
 mod substrate_ids;
+mod text;
 pub mod workflow;
