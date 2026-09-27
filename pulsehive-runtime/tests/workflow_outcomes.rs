@@ -2,8 +2,8 @@
 //!
 //! Sequential, Parallel and Loop honor the task's cancellation token; a
 //! Parallel stage keeps the responses of children that completed when a
-//! sibling fails (`PartialComplete`), and a Sequential whose child ended
-//! `PartialComplete` ends `PartialComplete` itself — its `responses` are what
+//! sibling fails (`PartialComplete`), and a Sequential to which any child
+//! contributed an error ends `PartialComplete` itself — its `responses` are what
 //! its `Complete` would have carried and its `errors` name the failed children
 //! (L1), while a terminal child outcome is returned unchanged (L2). Every test
 //! drives the real path —
@@ -686,7 +686,8 @@ async fn sequential_partial_last_child_carries_its_responses() {
                 "one error from the partial last child: {errors:?}"
             );
             assert!(
-                errors[0].starts_with("second-failing: ") && errors[0].contains("second lens broke"),
+                errors[0].starts_with("second-failing: ")
+                    && errors[0].contains("second lens broke"),
                 "the error must name the failed child, got {:?}",
                 errors[0]
             );
