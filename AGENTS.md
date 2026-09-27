@@ -16,10 +16,11 @@
 ### Workflow outcomes never erase child failures
 
 - Flag a change that lets a `Sequential` or `Parallel` parent end `Complete` when any child
-  contributed an error, or that folds an earlier child's accumulated errors into a terminal
-  child outcome (`Error`, `MaxIterationsReached`, `ToolCallCapReached`), because it hides a
-  degraded run from consumers — the defect pulse-guard PH-1 found.
-  Safe path: a degraded `Sequential`/`Parallel` ends `PartialComplete` carrying its
-  accumulated errors; terminal child outcomes are returned unchanged; a `Loop` reflects only
-  its final iteration — the documented exception (docs/adr/014-cancellation-semantics.md,
-  amendment of 2026-09-26, L1–L2 and A1).
+  contributed an error, or that lets a `Sequential` fold its accumulated errors into a
+  terminal child outcome (`Error`, `MaxIterationsReached`, `ToolCallCapReached`), because it
+  hides a degraded run from consumers — the defect pulse-guard PH-1 found.
+  Safe path: a degraded `Sequential`/`Parallel` ends `PartialComplete` naming its failed
+  children; a `Sequential` returns a terminal child outcome unchanged, while a `Parallel`
+  aggregates each failed child as a named error beside the surviving responses (or `Error`
+  when none survive); a `Loop` reflects only its final iteration — the documented exception
+  (docs/adr/014-cancellation-semantics.md, amendment of 2026-09-26, L1–L2 and A1).
