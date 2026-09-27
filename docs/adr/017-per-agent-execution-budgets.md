@@ -66,8 +66,10 @@ knob on two types with no rule for which wins; a new `AgentKind` or wrapper type
 
 **The cost is recorded here.** `LlmConfig` stops being purely provider-call
 configuration: it now carries two values that every provider ignores. Providers
-must not read them and never send them — they are skipped by serde when unset,
-and no provider crate is touched. A consumer reading `LlmConfig` can no longer
+must not read them and never send them — every provider builds its own request
+body from the fields it knows, and no provider crate is touched. Serde skips
+each when unset, so an uncapped `LlmConfig` keeps the 2.0.2 shape; a set cap
+does appear in `LlmConfig`'s own serialization. A consumer reading `LlmConfig` can no longer
 assume every field describes the request on the wire; the two budget fields
 describe the loop that drives the requests. Making the caps `Option` and
 `None`-defaulted is what keeps that cost additive rather than breaking.
@@ -123,9 +125,10 @@ each begin at zero. Making it a workflow-wide total is PH-6's budget, not this
 one.
 
 **Counting needs the dispatch to report it.** The private `execute_tool_call`
-returns `(ToolResult, bool)` — the result to record, and whether a tool body
-actually ran. `false` for a missing tool and for a denied approval, `true` for
-the paths that reach the body. L5.2's rule is what makes `unknown_tool_does_not_count_against_the_cap`
+returns a private `ToolDispatch` — `Executed(ToolResult)` for the paths that
+reach the body, `NotExecuted(ToolResult)` for a missing tool, a denied approval
+and a failed approval handler — so every return path names whether it spent
+budget. L5.2's rule is what makes `unknown_tool_does_not_count_against_the_cap`
 expressible at all: a missing tool and a real one both produce a `ToolResult` to
 push into the conversation, and only the second is work.
 
@@ -165,3 +168,7 @@ workflow, not to the script that drives one.
   counters; a consumer that wants a total for the workflow does not have it
   (PH-6).
 - **The iteration cap is silent about its limit** (PH-7, above).
+- **A cap-ended turn records no experience.** The default extractor records a
+  `Difficulty` for `MaxIterationsReached`, but `ToolCallCapReached` falls to its
+  wildcard arm and extracts nothing, like `Cancelled` and `PartialComplete`. A
+  custom `ExperienceExtractor` still receives the outcome and may record one.

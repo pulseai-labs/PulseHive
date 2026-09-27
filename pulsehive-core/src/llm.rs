@@ -73,16 +73,20 @@ pub struct LlmConfig {
     pub tool_choice: Option<ToolChoice>,
     /// Per-agent cap on the agent-loop iterations this agent may run.
     ///
-    /// Agent-loop policy read by the runtime, ignored by providers and never
-    /// sent on the wire (it is skipped by serde when unset). `None` keeps the
+    /// Agent-loop policy read by the runtime and ignored by providers, which
+    /// build their own request bodies and never send it. Serde skips it when
+    /// unset, so an uncapped `LlmConfig` keeps the 2.0.2 serialized shape; a
+    /// set cap does serialize. `None` keeps the
     /// loop bound the caller passed (`LoopContext::max_iterations`);
     /// `Some(0)` runs no iteration.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_iterations: Option<usize>,
     /// Per-agent cap on the tool calls whose bodies this agent may execute.
     ///
-    /// Agent-loop policy read by the runtime, ignored by providers and never
-    /// sent on the wire (it is skipped by serde when unset). `None` means no
+    /// Agent-loop policy read by the runtime and ignored by providers, which
+    /// build their own request bodies and never send it. Serde skips it when
+    /// unset, so an uncapped `LlmConfig` keeps the 2.0.2 serialized shape; a
+    /// set cap does serialize. `None` means no
     /// cap; `Some(0)` trips on the first requested call. A call counts once it
     /// reaches the tool body — an unknown tool and a denied approval do not.
     #[serde(default, skip_serializing_if = "Option::is_none")]
