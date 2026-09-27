@@ -119,3 +119,44 @@ change under ADR-005.
 - A caller that wants the *task* cancelled must keep the token; there is no
   query for "the token of a running deployment" — by design, since ownership
   stays with the caller.
+
+## Amendment (2026-09-26, r2.s5)
+
+**Status:** Accepted. This amends the Decision above; the Decision text itself
+is unedited. **Trigger:** pulse-guard's smoke pass on published 3.0.0 — finding
+**PH-1**, probe `a2_one_failed_lens_is_erased_by_the_surrounding_sequential`:
+`Sequential([Parallel([lenses]), critic])` with one failing lens returned
+`Complete`, erasing the failure.
+
+**L1 — a degraded Sequential reports itself as degraded.** A Sequential parent
+ends `PartialComplete` when any child contributed an error, and never ends
+`Complete` in that state. Its `PartialComplete.responses` mirror what its
+`Complete` would have carried over the children completed so far — the last
+`Complete` child's response, or a partial last child's own `responses` — and its
+`errors` are the accumulated, already-named child errors. The Decision's "a
+nested `PartialComplete` merges into its parent's `responses` and `errors`"
+describes a **`Parallel` parent**, which flattens a nested result into its own
+aggregate; a Sequential parent replaces its pending result with the last child's
+and accumulates the errors, because a Sequential's `Complete` carries the last
+child's response alone.
+
+**L2 — terminal precedence.** A terminal child outcome — `Error`,
+`MaxIterationsReached`, and any future variant (`ToolCallCapReached`, ADR-017) —
+is returned unchanged, and no earlier child's accumulated errors are folded into
+it. A `Cancelled` child is terminal too, but the Sequential returns its **own**
+`Cancelled { partial_response }` carrying the sequence's accumulated response,
+not the child's internal partial (A16). L1's invariant is one-directional and
+scoped to **`Sequential` and `Parallel`**: neither returns `Complete` when any
+child contributed an error; either may still return a terminal outcome that
+names its own terminal child alone. A **`Loop` is the exception** (A1): it
+reflects its final iteration, so a Loop whose earlier iteration ended
+`PartialComplete` and whose final iteration is clean ends `Complete`.
+
+**A1 — a Loop reflects its final iteration.** `run_loop` keeps its
+latest-only semantics: `last_outcome` is the final iteration's outcome, so a Loop
+does not accumulate errors across iterations. Documented here, not changed.
+
+**Correction.** `run_sequential` diverged from this Decision's own merge rule:
+its `PartialComplete` arm kept the child's joined `responses` as the sequence's
+last response and dropped the child's `errors`, so the sequence always ended
+`Complete`. A degraded run is now reported as one (pulse-guard PH-1).

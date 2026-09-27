@@ -1,8 +1,12 @@
 //! r1.s2.w3 — workflow cancellation and parallel survivors (#45).
 //!
-//! Sequential, Parallel and Loop honor the task's cancellation token, and a
+//! Sequential, Parallel and Loop honor the task's cancellation token; a
 //! Parallel stage keeps the responses of children that completed when a
-//! sibling fails (`PartialComplete`). Every test drives the real path —
+//! sibling fails (`PartialComplete`), and a Sequential to which any child
+//! contributed an error ends `PartialComplete` itself — its `responses` are what
+//! its `Complete` would have carried and its `errors` name the failed children
+//! (L1), while a terminal child outcome is returned unchanged (L2). Every test
+//! drives the real path —
 //! `HiveMind::deploy`, `Task::with_cancel`, a distinct `ScriptedProvider`
 //! name per Parallel child so script order is deterministic — and every wait
 //! is bounded by `BOUND` so a regression fails the test instead of hanging
@@ -549,8 +553,11 @@ async fn parallel_with_failed_child_returns_partial_complete() {
 // ── AC-5 ─────────────────────────────────────────────────────────────
 
 /// `Sequential([Parallel([ok, failing]), critic])`: the Parallel ends
-/// `PartialComplete`, which is progress — the critic still runs, perceives
-/// the survivor's recorded work, and the sequence completes.
+/// `PartialComplete`, which is progress — the critic still runs and perceives
+/// the survivor's recorded work, and the sequence ends `PartialComplete` (L1)
+/// because a child contributed an error. Its `responses` are the critic's, the
+/// same thing its `Complete` would have carried, and its `errors` name the
+/// failed lens. It never ends `Complete`.
 #[tokio::test]
 async fn sequential_continues_past_partial_parallel() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -583,11 +590,24 @@ async fn sequential_continues_past_partial_parallel() {
     let events = drain_until_agent_completes(stream, "seq-partial").await;
 
     match outcome_of(&events, "seq-partial") {
-        Some(AgentOutcome::Complete { response }) => assert_eq!(
-            response, "critique done",
-            "the Sequential should finish with the critic's response"
-        ),
-        other => panic!("expected AgentOutcome::Complete, got {other:?}"),
+        Some(AgentOutcome::PartialComplete { responses, errors }) => {
+            assert_eq!(
+                responses,
+                &["critique done".to_string()],
+                "the degraded sequence's responses mirror what its Complete would carry: {responses:?}"
+            );
+            assert_eq!(
+                errors.len(),
+                1,
+                "one error for the one failed lens: {errors:?}"
+            );
+            assert!(
+                errors[0].starts_with("failing: ") && errors[0].contains("bad child"),
+                "the error must name the failed child, got {:?}",
+                errors[0]
+            );
+        }
+        other => panic!("expected AgentOutcome::PartialComplete, got {other:?}"),
     }
     match outcome_of(&events, "par-stage") {
         Some(AgentOutcome::PartialComplete { .. }) => {}
@@ -612,6 +632,134 @@ async fn sequential_continues_past_partial_parallel() {
         "the critic's request did not carry the survivor's work: {:?}",
         requests[0].messages
     );
+}
+
+/// `Sequential([clean stage, Parallel([ok, failing])])`: the last child is the
+/// partial Parallel, so the degraded sequence's `responses` are that child's
+/// own `responses` (unjoined) and its `errors` are that child's errors — the
+/// mirror of what its `Complete` would have carried.
+#[tokio::test]
+async fn sequential_partial_last_child_carries_its_responses() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let first = ScriptedProvider::new().then_text("first stage done");
+    let second_ok = ScriptedProvider::new().then_text("second survivor text");
+    let second_bad = ScriptedProvider::new().then_error(PulseHiveError::llm("second lens broke"));
+    let hive = scripted_hive(
+        &dir,
+        vec![
+            ("first", first),
+            ("second-ok", second_ok),
+            ("second-bad", second_bad),
+        ],
+    );
+
+    let workflow = AgentDefinition {
+        name: "seq-last-partial".into(),
+        kind: AgentKind::Sequential(vec![
+            llm_child("first-stage", "first", vec![]),
+            AgentDefinition {
+                name: "last-par".into(),
+                kind: AgentKind::Parallel(vec![
+                    llm_child("second-survivor", "second-ok", vec![]),
+                    llm_child("second-failing", "second-bad", vec![]),
+                ]),
+            },
+        ]),
+    };
+    let task = Task::new("sequential with a partial last child");
+    let stream = hive
+        .deploy(vec![workflow], vec![task])
+        .await
+        .expect("deploy agents");
+    let events = drain_until_agent_completes(stream, "seq-last-partial").await;
+
+    match outcome_of(&events, "seq-last-partial") {
+        Some(AgentOutcome::PartialComplete { responses, errors }) => {
+            assert_eq!(
+                responses,
+                &["second survivor text".to_string()],
+                "the sequence's responses are the partial last child's responses: {responses:?}"
+            );
+            assert_eq!(
+                errors.len(),
+                1,
+                "one error from the partial last child: {errors:?}"
+            );
+            assert!(
+                errors[0].starts_with("second-failing: ")
+                    && errors[0].contains("second lens broke"),
+                "the error must name the failed child, got {:?}",
+                errors[0]
+            );
+        }
+        other => panic!("expected AgentOutcome::PartialComplete, got {other:?}"),
+    }
+    match outcome_of(&events, "last-par") {
+        Some(AgentOutcome::PartialComplete { responses, errors }) => {
+            assert_eq!(responses, &["second survivor text".to_string()]);
+            assert_eq!(errors.len(), 1, "the child's own error: {errors:?}");
+        }
+        other => panic!("expected the last child PartialComplete, got {other:?}"),
+    }
+}
+
+/// L2 — terminal precedence: a partial stage followed by a critic that errors
+/// ends the sequence as the critic's own `Error`, unchanged. No earlier child's
+/// error is folded into it, and the partial stage's own `AgentCompleted` still
+/// carries its error.
+#[tokio::test]
+async fn sequential_terminal_child_wins_over_accumulated_errors() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let ok = ScriptedProvider::new().then_text("survivor text");
+    let bad = ScriptedProvider::new().then_error(PulseHiveError::llm("bad child"));
+    let critic = ScriptedProvider::new().then_error(PulseHiveError::llm("critic broke"));
+    let hive = scripted_hive(&dir, vec![("ok", ok), ("bad", bad), ("critic", critic)]);
+
+    let workflow = AgentDefinition {
+        name: "seq-terminal".into(),
+        kind: AgentKind::Sequential(vec![
+            AgentDefinition {
+                name: "par-stage".into(),
+                kind: AgentKind::Parallel(vec![
+                    llm_child("survivor", "ok", vec![]),
+                    llm_child("failing", "bad", vec![]),
+                ]),
+            },
+            llm_child("critic", "critic", vec![]),
+        ]),
+    };
+    let task = Task::new("sequential terminal child");
+    let stream = hive
+        .deploy(vec![workflow], vec![task])
+        .await
+        .expect("deploy agents");
+    let events = drain_until_agent_completes(stream, "seq-terminal").await;
+
+    match outcome_of(&events, "seq-terminal") {
+        Some(AgentOutcome::Error { error }) => {
+            assert!(
+                error.contains("critic broke"),
+                "the terminal outcome is the critic's own error, got {error:?}"
+            );
+            assert!(
+                !error.contains("bad child"),
+                "an earlier child's error must not be folded into the terminal outcome, got {error:?}"
+            );
+        }
+        other => panic!("expected AgentOutcome::Error from the critic, got {other:?}"),
+    }
+    match outcome_of(&events, "par-stage") {
+        Some(AgentOutcome::PartialComplete { responses, errors }) => {
+            assert_eq!(responses, &["survivor text".to_string()]);
+            assert_eq!(errors.len(), 1, "the stage keeps its own error: {errors:?}");
+            assert!(
+                errors[0].starts_with("failing: ") && errors[0].contains("bad child"),
+                "the stage's error still names its failed child, got {:?}",
+                errors[0]
+            );
+        }
+        other => panic!("expected the partial stage PartialComplete, got {other:?}"),
+    }
 }
 
 // ── AC-6 ─────────────────────────────────────────────────────────────

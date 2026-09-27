@@ -68,6 +68,39 @@ fn llm_config_new_fields_serialize_only_when_set() {
     assert!(choice.contains(r#""tool_choice":"required""#), "{choice}");
 }
 
+/// The per-agent execution budgets (ADR-017) are additive on the wire like the
+/// other loop-policy fields: absent until set, present once set — including a
+/// zero cap, which is a value and not an absent one.
+#[test]
+fn llm_config_execution_budgets_serialize_only_when_set() {
+    // Unset, neither field appears: an agent with no budgets serializes
+    // exactly as 2.0.2 did, so the byte-identical assertion above holds
+    // unchanged alongside this one.
+    let base = serde_json::to_string(&LlmConfig::new("openai", "gpt-4o")).unwrap();
+    assert!(!base.contains("max_iterations"), "{base}");
+    assert!(!base.contains("max_tool_calls"), "{base}");
+    assert_eq!(
+        base,
+        r#"{"provider":"openai","model":"gpt-4o","temperature":0.7,"max_tokens":4096}"#
+    );
+
+    // Set, each cap appears with its value — `Some(0)` is literal (L5.3).
+    let capped = LlmConfig::new("openai", "gpt-4o")
+        .with_max_iterations(3)
+        .with_max_tool_calls(0);
+    let json = serde_json::to_string(&capped).unwrap();
+    assert!(json.contains(r#""max_iterations":3"#), "{json}");
+    assert!(json.contains(r#""max_tool_calls":0"#), "{json}");
+
+    // A 2.0.2 payload deserializes with both budgets unset.
+    let back: LlmConfig = serde_json::from_str(
+        r#"{"provider":"openai","model":"gpt-4o","temperature":0.2,"max_tokens":512}"#,
+    )
+    .unwrap();
+    assert_eq!(back.max_iterations, None);
+    assert_eq!(back.max_tool_calls, None);
+}
+
 /// The cancellation carrier is runtime state, never wire state — and cloning a
 /// config shares the token, which is what r1.s2's thread-through relies on.
 #[test]

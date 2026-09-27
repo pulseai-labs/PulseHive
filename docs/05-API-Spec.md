@@ -591,6 +591,8 @@ pub struct LlmConfig {
     pub max_retries: Option<u32>,            // Per-call retry-budget override
     pub reasoning_effort: Option<ReasoningEffort>,
     pub tool_choice: Option<ToolChoice>,
+    pub max_iterations: Option<usize>,       // Per-agent loop budget (ADR-017)
+    pub max_tool_calls: Option<usize>,       // Per-agent tool-call budget (ADR-017)
     pub cancel: Option<CancellationToken>,   // Runtime state, never serialized
 }
 
@@ -603,6 +605,8 @@ impl LlmConfig {
     pub fn with_max_retries(self, max_retries: u32) -> Self;
     pub fn with_reasoning_effort(self, reasoning_effort: ReasoningEffort) -> Self;
     pub fn with_tool_choice(self, tool_choice: ToolChoice) -> Self;
+    pub fn with_max_iterations(self, max_iterations: usize) -> Self;
+    pub fn with_max_tool_calls(self, max_tool_calls: usize) -> Self;
     pub fn with_cancel(self, cancel: CancellationToken) -> Self;
 }
 ```
@@ -610,6 +614,8 @@ impl LlmConfig {
 The `provider` field matches the name passed to `HiveMindBuilder::llm_provider()`.
 
 `timeout_secs` and `max_retries` override the provider's configured values for that single call (`Some(0)` retries means exactly one attempt). `cancel` carries a `tokio_util::sync::CancellationToken`; cancelling it aborts the in-flight request and the call returns a `LlmErrorKind::Cancelled` transport error. `reasoning_effort` (`Minimal`/`Low`/`Medium`/`High`) and `tool_choice` (`Auto`/`None`/`Required`/`Function { name }`) reach the wire only when set.
+
+`max_iterations` and `max_tool_calls` are **per-agent execution budgets** (ADR-017) — agent-loop policy the runtime reads and providers ignore; no provider sends them. `None` (the default) keeps today's behaviour: the loop bound the caller passed (`DEFAULT_MAX_ITERATIONS` from a workflow dispatch) and no tool-call cap. `max_iterations` overrides that bound for this agent; `Some(0)` ends `MaxIterationsReached` with no LLM call. `max_tool_calls` is checked before every requested tool call, including later calls in one response: when the agent has already executed `limit` calls and requests another, the turn ends `AgentOutcome::ToolCallCapReached { limit }` and the unstarted calls emit no `ToolCallStarted`. A call counts once it reaches the tool body — an unknown tool and a denied approval spend nothing. Cancellation wins over a cap, and a final answer with no tool calls ends `Complete` even at the cap. Counters are per dispatch (every workflow child and `Loop` iteration starts at zero); there is no workflow-wide budget. Both are skipped by serde when unset, so an uncapped config keeps the 2.0.2 serialized shape. The bindings expose no cap knob.
 
 ### 3.7 Task
 
@@ -976,10 +982,16 @@ pub enum AgentOutcome {
     /// declaration order and `errors` describes each child that did not
     /// contribute one in the same order.
     PartialComplete { responses: Vec<String>, errors: Vec<String> },
+
+    /// The agent's `LlmConfig::max_tool_calls` budget was spent and the
+    /// model requested another call (ADR-017). `limit` is the configured cap.
+    ToolCallCapReached { limit: usize },
 }
 ```
 
-`AgentOutcome` is `#[non_exhaustive]` — every `match` needs a wildcard arm; new variants land additively in minor releases. It serializes through the tagged `status` field (`"complete"`, `"error"`, `"max_iterations_reached"`, `"cancelled"`, `"partial_complete"`).
+`AgentOutcome` is `#[non_exhaustive]` — every `match` needs a wildcard arm; new variants land additively in minor releases. It serializes through the tagged `status` field (`"complete"`, `"error"`, `"max_iterations_reached"`, `"cancelled"`, `"partial_complete"`, `"tool_call_cap_reached"` with a `limit` field).
+
+For a `Parallel` parent, `PartialComplete.responses` holds the completed children's responses; a `Sequential` parent's holds what its `Complete` would have carried — the last child's contribution (§5.5). A `Parallel` parent names a capped child in `errors` as `<agent>: tool call cap reached (limit N)`; a `Sequential` returns `ToolCallCapReached` unchanged as a terminal child outcome; a `Loop` records it and continues to its own cap. The default experience extractor records nothing for a cap-ended turn. The Python and JS bindings map `ToolCallCapReached` to `unknown`.
 
 ---
 
@@ -1108,7 +1120,7 @@ What a cancelled run does:
 - The agent loop checks the run token **before every LLM call and before every tool call** — a cancelled token ends the turn as `AgentOutcome::Cancelled { partial_response }` with the latest assistant text, and no `LlmCallStarted`/`ToolCallStarted` is emitted for work that never began.
 - Each provider call carries a child of the run token on `LlmConfig.cancel`, so an **in-flight provider request aborts mid-flight** (the provider returns a `Cancelled` transport error the loop maps to `AgentOutcome::Cancelled`). An agent definition's own `LlmConfig.cancel` is honored alongside the run token — either token aborts the call.
 - A **tool already executing is awaited, never force-aborted**. Its `ToolContext.cancel` fires so a cooperative tool can wind down and return partial results, which still reach `ToolCallCompleted`.
-- **Workflow agents** pass a child of the run token to every dispatched child, so cancelling the task cancels the whole tree. Sequential and Loop workflows treat a child's `PartialComplete` as progress and continue; a `Cancelled` child ends the workflow as `Cancelled`. When any child cancels, the composite returns `Cancelled` with the completed-child responses assembled in child declaration order, while sibling errors remain visible on each child's `AgentCompleted` event.
+- **Workflow agents** pass a child of the run token to every dispatched child, so cancelling the task cancels the whole tree. Sequential and Loop workflows treat a child's `PartialComplete` as progress and continue; a `Cancelled` child ends the workflow as `Cancelled`. When any child cancels, the composite returns `Cancelled` with the completed-child responses assembled in child declaration order, while sibling errors remain visible on each child's `AgentCompleted` event. A child's `PartialComplete` also marks the run degraded: a `Sequential` to which any child contributed an error (a child that ended `PartialComplete` with named errors) ends `PartialComplete` itself — `responses` carrying what its `Complete` would have carried (the last child's response, or a partial last child's own `responses`) and `errors` naming the failed children — instead of `Complete`, so a degraded sequence is never reported as a clean run (ADR-014's r2.s5 amendment, L1). A terminal child outcome (`Error`, `MaxIterationsReached`, `ToolCallCapReached`) is still returned unchanged, with no earlier child's error folded into it (L2). A `Loop` reflects its final iteration, so a clean final iteration after a partial one ends `Complete` (A1).
 - **A cancelled run records no experience**: the loop skips the record phase on `AgentOutcome::Cancelled`, so neither the default extractor nor a custom `ExperienceExtractor` is invoked — a custom extractor receives no cancellation token and must never start new work (e.g. its own LLM calls) after the run has ended. An extraction already underway for a non-cancelled outcome is awaited to completion — never aborted.
 
 HiveMind-level cancellation: `shutdown()` and `Drop` cancel an internal root token every run is linked to, stopping all running agents — `shutdown() cancels running agents` — in addition to ending the Watch background tasks. The HiveMind is terminal after `shutdown()`: the root token is one-shot, so agents deployed afterwards start cancelled and end at their first checkpoint. There is deliberately **no `HiveMind::abort_handle()` and no `CancellableTool` trait** — `deploy()`/`redeploy()` signatures are unchanged.

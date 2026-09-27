@@ -190,11 +190,19 @@ async fn think_act_loop(
     refresh_every: Option<usize>,
 ) -> AgentOutcome {
     let mut tool_calls_since_refresh: usize = 0;
+    // Per-agent execution budgets (ADR-017 L3/L5.3): the agent's own
+    // `LlmConfig` cap wins when set, so the bound holds at every entry point —
+    // the workflow dispatch keeps `DEFAULT_MAX_ITERATIONS` in its
+    // `LoopContext` literal. Unset, the caller's bound stands unchanged.
+    let max_iterations = llm_config.max_iterations.unwrap_or(ctx.max_iterations);
+    // Tool calls whose body actually ran, for THIS dispatch: a `Loop`
+    // re-dispatch, a workflow child and a retry each start at zero (L5.4).
+    let mut executed_tool_calls: usize = 0;
     // Latest assistant text produced this turn — the `partial_response` a
     // `Cancelled` outcome carries; empty until the provider produces any.
     let mut partial_response = String::new();
 
-    for iteration in 1..=ctx.max_iterations {
+    for iteration in 1..=max_iterations {
         // Cancellation checkpoint (ADR-014): a cancelled run token ends the
         // turn before the next LLM call — no `LlmCallStarted`, no request sent.
         if ctx.cancel.is_cancelled() {
@@ -310,7 +318,24 @@ async fn think_act_loop(
                 return AgentOutcome::Cancelled { partial_response };
             }
 
-            let result = match execute_tool_call(
+            // Tool-call budget (ADR-017 L5.1): checked for every requested
+            // call, including the second and later calls in one response, and
+            // after the cancellation checkpoint above so cancellation wins.
+            // The call that trips it — and every later call in this response —
+            // gets no `ToolCallStarted` and no execution.
+            if let Some(limit) = llm_config.max_tool_calls {
+                if executed_tool_calls == limit {
+                    tracing::info!(
+                        agent_id = %agent_id,
+                        limit,
+                        executed = executed_tool_calls,
+                        "Tool-call cap reached"
+                    );
+                    return AgentOutcome::ToolCallCapReached { limit };
+                }
+            }
+
+            let dispatched = match execute_tool_call(
                 agent_id,
                 tool_call,
                 tool_map,
@@ -323,13 +348,22 @@ async fn think_act_loop(
             .instrument(tracing::info_span!("act", agent_id = %agent_id, tool = %tool_call.name))
             .await
             {
-                Ok(result) => result,
+                Ok(dispatched) => dispatched,
                 // Cancelled at the approval boundary: the tool body never
                 // ran, so no tool result is recorded — the turn ends as
                 // `Cancelled` with the turn's partial response.
                 Err(ApprovalCancelled) => {
                     return AgentOutcome::Cancelled { partial_response };
                 }
+            };
+
+            // L5.2: only a call that reached the tool body spends budget.
+            let result = match dispatched {
+                ToolDispatch::Executed(result) => {
+                    executed_tool_calls += 1;
+                    result
+                }
+                ToolDispatch::NotExecuted(result) => result,
             };
 
             messages.push(Message::tool_result(&tool_call.id, result.to_content()));
@@ -379,7 +413,7 @@ async fn think_act_loop(
         return AgentOutcome::Cancelled { partial_response };
     }
 
-    tracing::warn!(agent_id = %agent_id, max = ctx.max_iterations, "Max iterations reached");
+    tracing::warn!(agent_id = %agent_id, max = max_iterations, "Max iterations reached");
     AgentOutcome::MaxIterationsReached
 }
 
@@ -389,7 +423,23 @@ async fn think_act_loop(
 /// turn as [`AgentOutcome::Cancelled`].
 struct ApprovalCancelled;
 
+/// The result of dispatching one tool call, tagged with whether a tool body
+/// actually ran — ADR-017 L5.2: the tool-call budget counts only the calls that
+/// reach the body. Every result to record is one of the two, so a new return
+/// path has to say which.
+enum ToolDispatch {
+    /// A tool body ran; the call spends budget.
+    Executed(ToolResult),
+    /// No body ran (a missing tool, a denied approval, a failed approval
+    /// handler); the result is recorded but spends no budget.
+    NotExecuted(ToolResult),
+}
+
 /// Execute a single tool call with approval check.
+///
+/// Returns the result to record as a [`ToolDispatch`], which says whether a
+/// tool body actually ran (ADR-017 L5.2 — a missing tool and a denied
+/// approval are `NotExecuted`).
 #[allow(clippy::too_many_arguments)]
 async fn execute_tool_call(
     agent_id: &str,
@@ -400,13 +450,13 @@ async fn execute_tool_call(
     event_emitter: &EventEmitter,
     collective_id: &CollectiveId,
     cancel: &CancellationToken,
-) -> std::result::Result<ToolResult, ApprovalCancelled> {
+) -> std::result::Result<ToolDispatch, ApprovalCancelled> {
     let Some(&tool) = tool_map.get(tool_call.name.as_str()) else {
         tracing::warn!(agent_id = %agent_id, tool = %tool_call.name, "Tool not found");
-        return Ok(ToolResult::error(format!(
+        return Ok(ToolDispatch::NotExecuted(ToolResult::error(format!(
             "Tool '{}' not found",
             tool_call.name
-        )));
+        ))));
     };
 
     // Check approval if required
@@ -452,41 +502,48 @@ async fn execute_tool_call(
         match decision {
             Ok(ApprovalResult::Approved) => {} // proceed
             Ok(ApprovalResult::Denied { reason }) => {
-                return Ok(ToolResult::error(format!(
+                return Ok(ToolDispatch::NotExecuted(ToolResult::error(format!(
                     "Tool execution denied: {reason}"
-                )));
+                ))));
             }
             Ok(ApprovalResult::Modified { new_params }) => {
                 // Execute with modified params
-                return Ok(execute_tool_inner(
-                    agent_id,
-                    &tool_call.name,
-                    new_params,
-                    tool,
-                    substrate,
-                    event_emitter,
-                    collective_id,
-                    cancel,
-                )
-                .await);
+                return Ok(ToolDispatch::Executed(
+                    execute_tool_inner(
+                        agent_id,
+                        &tool_call.name,
+                        new_params,
+                        tool,
+                        substrate,
+                        event_emitter,
+                        collective_id,
+                        cancel,
+                    )
+                    .await,
+                ));
             }
             Err(e) => {
-                return Ok(ToolResult::error(format!("Approval handler error: {e}")));
+                // No body ran either: the decision never arrived.
+                return Ok(ToolDispatch::NotExecuted(ToolResult::error(format!(
+                    "Approval handler error: {e}"
+                ))));
             }
         }
     }
 
-    Ok(execute_tool_inner(
-        agent_id,
-        &tool_call.name,
-        tool_call.arguments.clone(),
-        tool,
-        substrate,
-        event_emitter,
-        collective_id,
-        cancel,
-    )
-    .await)
+    Ok(ToolDispatch::Executed(
+        execute_tool_inner(
+            agent_id,
+            &tool_call.name,
+            tool_call.arguments.clone(),
+            tool,
+            substrate,
+            event_emitter,
+            collective_id,
+            cancel,
+        )
+        .await,
+    ))
 }
 
 /// Renders a caught panic payload as a message: the `&'static str` /
