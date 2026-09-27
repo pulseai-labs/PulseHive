@@ -33,6 +33,7 @@ use serde_json::{json, Value};
 use tokio_util::sync::CancellationToken;
 
 use pulsehive_core::agent::{AgentDefinition, AgentKind, AgentOutcome, LlmAgentConfig};
+use pulsehive_core::approval::{ApprovalHandler, ApprovalResult, PendingAction};
 use pulsehive_core::error::Result;
 use pulsehive_core::event::HiveEvent;
 use pulsehive_core::lens::Lens;
@@ -283,7 +284,11 @@ async fn tool_call_cap_zero_trips_on_the_first_request() {
         Some(AgentOutcome::ToolCallCapReached { limit }) => assert_eq!(*limit, 0),
         other => panic!("expected AgentOutcome::ToolCallCapReached {{ limit: 0 }}, got {other:?}"),
     }
-    assert_eq!(runs.load(Ordering::SeqCst), 0, "no body may run at a zero cap");
+    assert_eq!(
+        runs.load(Ordering::SeqCst),
+        0,
+        "no body may run at a zero cap"
+    );
     assert_eq!(
         tool_call_starts(&events, "capped"),
         0,
@@ -461,7 +466,11 @@ async fn cancel_wins_over_the_tool_call_cap() {
     let token = CancellationToken::new();
     let workflow = llm_child(
         "capped",
-        vec![Arc::new(CountingTool::cancelling("count", &runs, token.clone()))],
+        vec![Arc::new(CountingTool::cancelling(
+            "count",
+            &runs,
+            token.clone(),
+        ))],
         LlmConfig::new("prov", "test-model").with_max_tool_calls(1),
     );
 
@@ -503,7 +512,10 @@ async fn uncapped_sibling_runs_past_both_thresholds() {
         .then_response(response_requesting("count", 1))
         .then_response(response_requesting("count", 1))
         .then_text("sibling done");
-    let hive = scripted_hive(&dir, vec![("capped-prov", capped), ("uncapped-prov", uncapped)]);
+    let hive = scripted_hive(
+        &dir,
+        vec![("capped-prov", capped), ("uncapped-prov", uncapped)],
+    );
     let capped_runs = Arc::new(AtomicUsize::new(0));
     let uncapped_runs = Arc::new(AtomicUsize::new(0));
 
@@ -550,7 +562,11 @@ async fn uncapped_sibling_runs_past_both_thresholds() {
                 &["sibling done".to_string()],
                 "the sibling's response survives: {responses:?}"
             );
-            assert_eq!(errors.len(), 1, "one error, naming the capped child: {errors:?}");
+            assert_eq!(
+                errors.len(),
+                1,
+                "one error, naming the capped child: {errors:?}"
+            );
             assert_eq!(
                 errors[0], "capped: tool call cap reached (limit 1)",
                 "the composite names the capped child and the limit it hit"
@@ -619,5 +635,165 @@ async fn loop_redispatch_resets_the_counter() {
         provider.requests().len(),
         6,
         "two provider calls per dispatch, three dispatches"
+    );
+}
+
+/// A tool that requires approval and counts the runs of its body — paired
+/// with [`DenyAll`], its body must never run.
+struct GatedTool {
+    runs: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl Tool for GatedTool {
+    fn name(&self) -> &str {
+        "gated"
+    }
+
+    fn description(&self) -> &str {
+        "Requires approval; counts how many times its body ran"
+    }
+
+    fn parameters(&self) -> Value {
+        json!({"type": "object"})
+    }
+
+    fn requires_approval(&self) -> bool {
+        true
+    }
+
+    async fn execute(&self, _params: Value, _ctx: &ToolContext) -> Result<ToolResult> {
+        self.runs.fetch_add(1, Ordering::SeqCst);
+        Ok(ToolResult::text("gated ran"))
+    }
+}
+
+/// Denies every approval request.
+struct DenyAll;
+
+#[async_trait]
+impl ApprovalHandler for DenyAll {
+    async fn request_approval(&self, _action: &PendingAction) -> Result<ApprovalResult> {
+        Ok(ApprovalResult::Denied {
+            reason: "denied by test".into(),
+        })
+    }
+}
+
+/// L5.2 — a denied approval never reaches the tool body, so it spends no
+/// budget: the real call beside it still runs under a cap of one, and only the
+/// NEXT requested call trips the cap.
+#[tokio::test]
+async fn denied_approval_does_not_count_against_the_cap() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let provider = ScriptedProvider::new()
+        .then_response(LlmResponse::new(
+            None,
+            vec![
+                ToolCall {
+                    id: "call_1".into(),
+                    name: "gated".into(),
+                    arguments: json!({}),
+                },
+                ToolCall {
+                    id: "call_2".into(),
+                    name: "count".into(),
+                    arguments: json!({}),
+                },
+            ],
+            TokenUsage::default(),
+        ))
+        .then_response(response_requesting("count", 1));
+    let hive = HiveMind::builder()
+        .substrate_path(dir.path().join("agent-caps.db"))
+        .no_insight_synthesizer()
+        .llm_provider("prov", provider)
+        .approval_handler(DenyAll)
+        .build()
+        .expect("build HiveMind");
+    let gated_runs = Arc::new(AtomicUsize::new(0));
+    let runs = Arc::new(AtomicUsize::new(0));
+    let workflow = llm_child(
+        "capped",
+        vec![
+            Arc::new(GatedTool {
+                runs: Arc::clone(&gated_runs),
+            }),
+            Arc::new(CountingTool::new("count", &runs)),
+        ],
+        LlmConfig::new("prov", "test-model").with_max_tool_calls(1),
+    );
+
+    let task = Task::new("a denied call beside a real one");
+    let stream = hive
+        .deploy(vec![workflow], vec![task])
+        .await
+        .expect("deploy agents");
+    let events = drain_until_agent_completes(stream, "capped").await;
+
+    match outcome_of(&events, "capped") {
+        Some(AgentOutcome::ToolCallCapReached { limit }) => assert_eq!(
+            *limit, 1,
+            "the real call must run, and only the NEXT requested call may trip the cap"
+        ),
+        other => panic!("expected AgentOutcome::ToolCallCapReached, got {other:?}"),
+    }
+    assert_eq!(
+        gated_runs.load(Ordering::SeqCst),
+        0,
+        "the denied body never ran"
+    );
+    assert_eq!(
+        runs.load(Ordering::SeqCst),
+        1,
+        "the real call ran; the denied call did not consume the budget"
+    );
+}
+
+/// L5.4 with a trip — a `Loop` re-dispatches a child that trips its cap in
+/// every iteration. Each dispatch executes exactly `limit` calls before the
+/// trip, the `Loop` treats the trip like `MaxIterationsReached` (recorded and
+/// looped through to its own cap), and the `Loop` ends on its final
+/// iteration's outcome (ADR-014's r2.s5 amendment, A1).
+#[tokio::test]
+async fn cap_trip_inside_a_loop_child() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let provider = ScriptedProvider::new()
+        .then_response(response_requesting("count", 2))
+        .then_response(response_requesting("count", 2));
+    let hive = scripted_hive(&dir, vec![("loop-prov", provider.clone())]);
+    let runs = Arc::new(AtomicUsize::new(0));
+
+    let workflow = AgentDefinition {
+        name: "loop-trips".into(),
+        kind: AgentKind::Loop {
+            agent: Box::new(llm_child(
+                "worker",
+                vec![Arc::new(CountingTool::new("count", &runs))],
+                LlmConfig::new("loop-prov", "test-model").with_max_tool_calls(1),
+            )),
+            max_iterations: 2,
+        },
+    };
+    let task = Task::new("a loop re-dispatching a child that trips its cap");
+    let stream = hive
+        .deploy(vec![workflow], vec![task])
+        .await
+        .expect("deploy agents");
+    let events = drain_until_agent_completes(stream, "loop-trips").await;
+
+    match outcome_of(&events, "loop-trips") {
+        Some(AgentOutcome::ToolCallCapReached { limit }) => assert_eq!(*limit, 1),
+        other => panic!("expected the Loop to end on its final iteration's trip, got {other:?}"),
+    }
+    assert_eq!(
+        runs.load(Ordering::SeqCst),
+        2,
+        "one executed call per dispatch before each trip — the counter resets (L5.4)"
+    );
+    assert_eq!(
+        provider.requests().len(),
+        2,
+        "one provider call per dispatch: the trip ends each iteration's turn"
     );
 }
