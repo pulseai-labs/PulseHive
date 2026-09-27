@@ -158,6 +158,15 @@ pub enum AgentOutcome {
     Error { error: String },
     /// Agent hit the maximum iteration limit without completing.
     MaxIterationsReached,
+    /// Agent exhausted the tool-call budget its `LlmConfig` set (ADR-017).
+    ///
+    /// `limit` is the configured `max_tool_calls` cap. The turn ends at the
+    /// first requested call beyond it: that call — and every later call in the
+    /// same response — starts nothing and emits no `ToolCallStarted`. A call
+    /// the loop could not run (an unknown tool name, a denied approval) does
+    /// not count against the budget, and a final response with no tool calls
+    /// completes rather than tripping the cap.
+    ToolCallCapReached { limit: usize },
     /// The caller cancelled the run (ADR-014).
     ///
     /// `partial_response` carries the latest assistant text produced before

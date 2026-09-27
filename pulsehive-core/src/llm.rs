@@ -43,6 +43,8 @@ use crate::tool::Tool;
 ///     max_retries: None,
 ///     reasoning_effort: None,
 ///     tool_choice: None,
+///     max_iterations: None,
+///     max_tool_calls: None,
 ///     cancel: None,
 /// };
 /// ```
@@ -69,6 +71,22 @@ pub struct LlmConfig {
     /// Constraint on whether and which tool the model may call.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_choice: Option<ToolChoice>,
+    /// Per-agent cap on the agent-loop iterations this agent may run.
+    ///
+    /// Agent-loop policy read by the runtime, ignored by providers and never
+    /// sent on the wire (it is skipped by serde when unset). `None` keeps the
+    /// loop bound the caller passed (`LoopContext::max_iterations`);
+    /// `Some(0)` runs no iteration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_iterations: Option<usize>,
+    /// Per-agent cap on the tool calls whose bodies this agent may execute.
+    ///
+    /// Agent-loop policy read by the runtime, ignored by providers and never
+    /// sent on the wire (it is skipped by serde when unset). `None` means no
+    /// cap; `Some(0)` trips on the first requested call. A call counts once it
+    /// reaches the tool body — an unknown tool and a denied approval do not.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_tool_calls: Option<usize>,
     /// Cancellation carrier for the in-flight call. Runtime state, never wire
     /// state — it is skipped by serde in both directions.
     #[serde(skip)]
@@ -87,6 +105,8 @@ impl LlmConfig {
             max_retries: None,
             reasoning_effort: None,
             tool_choice: None,
+            max_iterations: None,
+            max_tool_calls: None,
             cancel: None,
         }
     }
@@ -112,6 +132,24 @@ impl LlmConfig {
     /// Overrides the provider's configured retry budget for this call.
     pub fn with_max_retries(mut self, max_retries: u32) -> Self {
         self.max_retries = Some(max_retries);
+        self
+    }
+
+    /// Caps the agent-loop iterations this agent may run (ADR-017).
+    ///
+    /// Agent-loop policy read by the runtime — never sent to the provider and
+    /// ignored by it. Left unset, the loop uses the bound its caller passed.
+    pub fn with_max_iterations(mut self, max_iterations: usize) -> Self {
+        self.max_iterations = Some(max_iterations);
+        self
+    }
+
+    /// Caps the tool calls this agent may execute (ADR-017).
+    ///
+    /// Agent-loop policy read by the runtime — never sent to the provider and
+    /// ignored by it. Left unset, the agent has no tool-call cap.
+    pub fn with_max_tool_calls(mut self, max_tool_calls: usize) -> Self {
+        self.max_tool_calls = Some(max_tool_calls);
         self
     }
 

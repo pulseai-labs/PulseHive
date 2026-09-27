@@ -244,6 +244,7 @@ async fn run_sequential(children: Vec<AgentDefinition>, ctx: &WorkflowContext) -
 /// responses while sibling errors remain visible on each child's own
 /// `AgentCompleted` event. Each non-`Complete` child contributes a named
 /// error — `<agent>: <error>`, `<agent>: max iterations reached`,
+/// `<agent>: tool call cap reached (limit N)` (ADR-017),
 /// `<agent>: task failed: <reason>` for a join failure — so every
 /// child's failure stays attributable (#45). `responses` and `errors`
 /// are both assembled in child declaration order, never finish order.
@@ -324,6 +325,11 @@ async fn run_parallel(children: Vec<AgentDefinition>, ctx: &WorkflowContext) -> 
             }
             AgentOutcome::MaxIterationsReached => {
                 errors.push(format!("{name}: max iterations reached"));
+            }
+            // ADR-017 L4: a capped child is named with the limit it hit, the
+            // same way an iteration-capped one is.
+            AgentOutcome::ToolCallCapReached { limit } => {
+                errors.push(format!("{name}: tool call cap reached (limit {limit})"));
             }
             other => {
                 errors.push(format!("{name}: {other:?}"));
