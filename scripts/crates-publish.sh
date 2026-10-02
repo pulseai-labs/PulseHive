@@ -21,8 +21,8 @@
 #       invocation the gate used, and every `.crate` must equal SHA256SUMS; a
 #       difference is a named refusal. Prints
 #       `crates-publish: <n> crates match the tested packages`.
-#       (The upload-shaped single-crate repackage lives in `publish`, where the
-#       crate's dependencies are already on the index — see do_verify_local.)
+#       (`publish` repeats this joint repackage for the remaining set just
+#       before upload — see do_publish.)
 #   plan --tested <dir>
 #       Read-only: read the index for each crate and print its decision. Exits
 #       non-zero if any crate would be refused, so the pre-approval inventory
@@ -86,7 +86,7 @@ CRATES=()
 VERSION=""
 
 # Directories this run must remove; SELFTEST_TMP is the self-test's fixture
-# tree, SCRATCH a single-crate repackage's output.
+# tree, SCRATCH a joint repackage's output (verify-local's or publish's).
 SCRATCH=""
 SELFTEST_TMP=""
 
