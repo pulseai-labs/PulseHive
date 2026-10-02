@@ -164,6 +164,13 @@ jobs:
           PULSEHIVE_WHEEL_SMOKE_TARGET_DIR: ${{ runner.temp }}/py-wheel-smoke-target
         run: bash pulsehive-py/scripts/py-wheel-smoke.sh
 
+      # #108: the smoke's own hermetic self-test runs in no workflow otherwise,
+      # so a broken smoke check could surface only on the release path, where the
+      # smoke is the last gate before an upload. Quick (no build, no network): it
+      # proves the smoke's checks are live before the smoke gates the wheels.
+      - name: Wheel smoke self-test (hermetic)
+        run: bash pulsehive-py/scripts/py-wheel-smoke.sh --self-test
+
       - name: Run Python tests
         run: |
           source .venv/bin/activate

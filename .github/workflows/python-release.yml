@@ -9,7 +9,22 @@ on:
 permissions:
   contents: read
 
+# A14: one release run per ref. A second tag push cannot cancel a publish that
+# is already mid-flight (cancel-in-progress: false), and the publish job's
+# recheck (A15) is what re-reads the published state once approval is given.
+concurrency:
+  group: release-pypi-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
+  # The reusable release gate: tree/manifest consistency and the tag check, then
+  # the whole test workflow (ci.yml) — a tag publishes only what has passed it.
+  # Every publish job in this file needs this job (A12/A13).
+  gate:
+    name: Release gate
+    if: startsWith(github.ref, 'refs/tags/v')
+    uses: ./.github/workflows/release-gate.yml
+
   build-wheels:
     name: Build wheels (${{ matrix.target }})
     runs-on: ${{ matrix.os }}
@@ -144,13 +159,21 @@ jobs:
         with:
           name: wheel-${{ matrix.platform }}
           path: dist/*.whl
+          # A16: keep the tested wheels long enough for a partial release to be
+          # completed by re-running this tag's failed publish job (L4 narrowed)
+          # without rebuilding — 90 days outlives any plausible approval wait.
+          retention-days: 90
 
   verify-artifacts:
     name: Verify artifacts before publish
     runs-on: ubuntu-latest
-    # Gate only on tag push (not workflow_dispatch) — mirrors the publish gate
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
-    needs: build-wheels
+    # A tag push and a workflow_dispatch on a tag both reach this job. The
+    # pre-approval classification below is the evidence the environment approval
+    # is requested on; the publish job re-classifies after approval (A15).
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [gate, build-wheels]
+    outputs:
+      publish-mode: ${{ steps.check.outputs.publish-mode }}
     steps:
       - uses: actions/checkout@v7
 
@@ -165,31 +188,133 @@ jobs:
       - name: Self-test the publish gate (hermetic, no network)
         run: bash pulsehive-py/scripts/py-publish-check.sh --self-test
 
-      - name: Verify wheels match the tag and are unpublished
-        run: bash pulsehive-py/scripts/py-publish-check.sh --dist dist --expect-version "${GITHUB_REF_NAME#v}"
+      # --expect-name closes #107: the wheels must belong to the distribution
+      # the manifest names, on their filenames and in their METADATA, and the
+      # version they carry must be the manifest version (compared as PEP 440
+      # versions, so a tag's `3.0.0-beta.1` matches maturin's `3.0.0b1`).
+      # A15: the mode this prints is the pre-approval evidence, not the upload
+      # gate — publish re-runs the same check after approval.
+      - name: Verify the wheels and classify the published state
+        id: check
+        run: |
+          FRESH=""
+          if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then FRESH="--fresh-build"; fi
+          # `run:` with no `shell:` is `bash -e {0}`, so the assignment must
+          # carry its own `|| rc=$?`: a bare `out=$(…)` would abort the step on
+          # a refusal, and the mode, the reason and the summary would all be
+          # lost exactly when they matter most.
+          rc=0
+          out=$(bash pulsehive-py/scripts/py-publish-check.sh \
+            --dist dist \
+            --expect-name "$(bash scripts/release-check.sh --get python.distribution)" \
+            --expect-version "$(bash scripts/release-check.sh --get python.version)" $FRESH 2>&1) || rc=$?
+          # A16: the pre-approval inventory — wheel names, their sha256 and the
+          # publish-mode — lands in the run summary before approval is requested.
+          printf '%s\n' "$out" | tee -a "$GITHUB_STEP_SUMMARY"
+          exit $rc
 
   publish:
     name: Publish to PyPI
-    needs: [build-wheels, verify-artifacts]
+    needs: [gate, build-wheels, verify-artifacts]
     runs-on: ubuntu-latest
-    # Only publish on tag push (not workflow_dispatch)
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    # A tag push and a workflow_dispatch on a tag both reach this job; nothing
+    # else does, and the condition carries no event-name clause (a dispatch on a
+    # tag must be able to publish after its recheck).
+    if: startsWith(github.ref, 'refs/tags/v')
     environment: pypi
     permissions:
+      # A job-level permissions block replaces the workflow default entirely, so
+      # contents: read is restated here for the checkout this job now needs (the
+      # recheck re-reads the scripts, and the post-upload verification runs one).
+      contents: read
       id-token: write # trusted publishing (OIDC)
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
       # pattern: wheel-* — the same artifact set verify-artifacts proved. Without
       # it this job downloads every artifact of the run, not only the wheels the
       # gate judged, so anything else a matrix leg uploads would reach the
       # publish step as part of dist/.
       - name: Download all wheel artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           pattern: wheel-*
           path: dist
           merge-multiple: true
 
+      # A15, binding (spec §4.4.1): the environment approval happens before this
+      # job starts, so the published state can move while a human reviews the
+      # request. The upload is conditioned on THIS classification — made right
+      # before the upload, never on verify-artifacts' pre-approval output. A
+      # refusal here fails the job before anything uploads.
+      - name: Re-check the published state after approval (A15)
+        id: recheck
+        run: |
+          FRESH=""
+          if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then FRESH="--fresh-build"; fi
+          # See the check step above: `bash -e {0}` would abort on a refusal
+          # before `rc=$?`, so the capture handles its own failure and the
+          # refusal is recorded in the log, the temp file and the summary.
+          rc=0
+          out=$(bash pulsehive-py/scripts/py-publish-check.sh \
+            --dist dist \
+            --expect-name "$(bash scripts/release-check.sh --get python.distribution)" \
+            --expect-version "$(bash scripts/release-check.sh --get python.version)" $FRESH 2>&1) || rc=$?
+          printf '%s\n' "$out" | tee "${RUNNER_TEMP}/pypi-recheck.txt"
+          exit $rc
+
+      # skip-existing is safe only because the recheck above proved, moments
+      # before this step, that every file PyPI already holds is byte-identical to
+      # a tested wheel: skipping an existing filename then skips exactly the
+      # files that are already correct and uploads only the missing ones. A
+      # `complete` mode uploads nothing at all.
       - name: Publish to PyPI
+        if: steps.recheck.outputs.publish-mode != 'complete'
         uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b # v1.14.0
         with:
           packages-dir: dist/
+          skip-existing: true
+
+      # The post-upload proof: PyPI must hold the tested bytes. PyPI's index can
+      # lag a just-finished upload, so the check retries a bounded number of
+      # times before it fails naming the file it could not prove.
+      - name: Verify the published files are the tested wheels
+        id: verify
+        run: |
+          # See the check step above: the capture handles its own failure, so a
+          # failed verification keeps its message and its exit status.
+          rc=0
+          out=$(bash pulsehive-py/scripts/py-publish-check.sh \
+            --dist dist \
+            --expect-name "$(bash scripts/release-check.sh --get python.distribution)" \
+            --expect-version "$(bash scripts/release-check.sh --get python.version)" \
+            --verify-published 2>&1) || rc=$?
+          printf '%s\n' "$out" | tee "${RUNNER_TEMP}/pypi-verify.txt"
+          exit $rc
+
+      # A16: the recheck mode and the verify line reach the run summary even
+      # when a step above failed — the job keeps its own exit status, so a
+      # refusal is readable next to the error that caused it.
+      - name: Append the PyPI publish summary
+        if: always()
+        run: |
+          {
+            echo '### PyPI publish'
+            echo ''
+            if [ -f "${RUNNER_TEMP}/pypi-recheck.txt" ]; then
+              echo 'Recheck after approval (A15):'
+              echo '```'
+              cat "${RUNNER_TEMP}/pypi-recheck.txt"
+              echo '```'
+            else
+              echo '- recheck: did not run'
+            fi
+            if [ -f "${RUNNER_TEMP}/pypi-verify.txt" ]; then
+              echo 'Post-upload verification:'
+              echo '```'
+              cat "${RUNNER_TEMP}/pypi-verify.txt"
+              echo '```'
+            else
+              echo '- verify-published: did not run'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
