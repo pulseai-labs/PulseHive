@@ -22,8 +22,8 @@ place. Its `MISSING:` lines map here: the repository secrets and the
 environment's `NPM_TOKEN` to step 2, the environment's required reviewer
 (`draco28`) and `prevent_self_review: false` to the same **Settings →
 Environments → `<env>`** page as step 3, the deployment policy to step 3, the
-ruleset to step 4, and the required checks to step 5; a `cannot read …` line
-means the read failed — retry it.
+ruleset to step 4, and the required checks to step 5; a `cannot read …` or
+`cannot parse …` line means the read failed — retry it.
 
 **1. crates.io and PyPI trusted publishing.** Register the trusted publishers;
 `gh` cannot read them, so they are **manual evidence rows** — record the
@@ -154,7 +154,8 @@ Every line below is quoted from the landed script that prints it. The
 classification is the first response; where a line can have two causes, the
 action says so. `scripts/release-settings-check.sh`'s `MISSING:` lines are not
 release-run failures: each names the setting to fix in `## One-time settings`
-(a `cannot read …` line there means the read failed — retry it).
+(a `cannot read …` or `cannot parse …` line there means the read failed —
+retry it).
 
 ### The gate (`release-gate.yml` → `scripts/release-check.sh`)
 
