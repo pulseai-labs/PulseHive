@@ -1,0 +1,22 @@
+# Release manifest: the version each registry publishes for one v* tag.
+# The release engineer's input before tagging (RELEASE.md, version and tag contract;
+# ADR-018). Package files keep their literal versions; scripts/release-check.sh fails
+# on any disagreement. Every registry line joins the workspace line while ADR-015 L1
+# and ADR-016 L1 hold.
+schema = 1
+
+[workspace]
+version = "3.0.0"   # the tag is v<version>
+
+[rust]
+version = "3.0.0"
+# publish order: each crate's dependencies precede it
+crates = ["pulsehive-core", "pulsehive-openai", "pulsehive-anthropic", "pulsehive-runtime", "pulsehive"]
+
+[npm]
+version = "3.0.0"
+package = "@pulsehive/sdk"
+
+[python]
+version = "3.0.0"   # Cargo spelling; maturin derives the PEP 440 spelling
+distribution = "pulsehive"

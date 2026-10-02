@@ -5,6 +5,9 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  # The release gate (release-gate.yml) calls this workflow so a tag publishes
+  # only what these jobs have already proven.
+  workflow_call:
 
 env:
   CARGO_TERM_COLOR: always
@@ -172,7 +175,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        node: ["20", "22"]
+        # The advertised Node lines (A7; pulsehive-js/package.json engines >=22,
+        # npm-release.yml's verify-install matrix), not the retired 20.
+        node: ["22", "24"]
 
     steps:
       - uses: actions/checkout@v7
@@ -196,6 +201,24 @@ jobs:
       - name: Run Node.js tests
         working-directory: pulsehive-js
         run: npm test
+
+  release-workflows:
+    name: Release workflows
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install PyYAML
+        run: pip install pyyaml
+
+      # A12: the three release workflows must wait on the release gate before
+      # their publish jobs. Round 3 (w5) adds `--all` for the whole set.
+      - name: Check the release workflows
+        run: python3 scripts/check-release-workflows.py --self-test
 
   deny:
     name: Cargo Deny
