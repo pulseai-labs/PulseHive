@@ -17,10 +17,11 @@
 #      substrate path, and prints `npm local-registry smoke: ok`.
 #
 # --negative runs the same steps with the host platform package deliberately NOT
-# published: the install must still succeed and `require` must throw w2's
-# unadvertised-host error (`does not support`). That control is what makes step
-# 6's success mean something — without it, an install that silently fell back to
-# the local source tree would print `ok` too.
+# published: the install must still succeed and `require` must throw w3's
+# missing-installation diagnosis (`cannot load the native binding for`, quoted
+# from load-diagnosis.js's missingBindingMessage). That control is what makes
+# step 6's success mean something — without it, an install that silently fell
+# back to the local source tree would print `ok` too.
 #
 # Nothing here is committed and nothing real is published: every byte of scratch
 # (the tarballs, the registry's config and storage, the consumer project, the
@@ -374,13 +375,13 @@ if [ "$NEGATIVE" -eq 1 ]; then
   #
   # The control is only worth anything if the platform package really is
   # missing: if it were present, require() would succeed and prove nothing about
-  # the unadvertised-host path.
+  # the missing-installation path.
   if [ -e "$CONSUMER_DIR/node_modules/$HOST_PLATFORM_PKG" ]; then
     die "$HOST_PLATFORM_PKG is installed although it was never published; the control is not isolated"
   fi
   say "    install succeeded with $HOST_PLATFORM_PKG never published"
 
-  say "==> require must throw the unadvertised-host error"
+  say "==> require must throw the missing-installation error"
   # From inside the consumer, as the positive path runs: the error has to come
   # out of the installed package, not out of the repository this script lives in.
   (
@@ -399,10 +400,13 @@ if [ "$NEGATIVE" -eq 1 ]; then
     }
     const message = String(error.message || "");
     // ADR-015 A3 / ADR-007: the consumer gets the host and the advertised
-    // matrix, not a bare module-resolution trace.
+    // matrix, not a bare module-resolution trace. This host is advertised but
+    // its platform package is absent, so the diagnosis is `missing` — the
+    // substring is the missingBindingMessage text from load-diagnosis.js, not
+    // the unadvertised-host wording.
     const host = `${process.platform}/${process.arch}`;
-    if (!message.includes("does not support")) {
-      throw new Error(`expected the unadvertised-host error ("does not support"), got: ${message}`);
+    if (!message.includes("cannot load the native binding for")) {
+      throw new Error(`expected the missing-installation error ("cannot load the native binding for"), got: ${message}`);
     }
     if (!message.includes(host)) {
       throw new Error(`the error does not name this host (${host}): ${message}`);

@@ -141,3 +141,34 @@ permanent-publication rule applied to PyPI.
   from this tree installs and imports at the version the workflow would
   publish (w3), and to installing and importing every advertised target under
   3.11, 3.12 and 3.13 before publish (w4).
+
+## Amendment — r2.s3 (ADR-018)
+
+**L3's claim about the retained `0.3.0b2` is narrowed (V1).** `0.3.0b2` stays on
+PyPI exactly as published — resolvable by a consumer that pins it explicitly —
+and nothing in the release path re-publishes, re-uploads or reinstates it. The
+joined line is what a consumer asking for `pulsehive` resolves to; the stale
+artifact is reached only by an explicit pin.
+
+**A2 is restated as fail-closed on *differing* bytes (V3).** Before publishing,
+the path checks that the candidate set's version matches the tagged version and
+classifies the version's published state from PyPI's per-version JSON: `full`
+(nothing published), `complete` (every published file is a tested wheel with the
+same sha256, and every tested wheel is published), `resume` (some tested wheels
+are missing), or `refuse`. Completion without replacement is permitted — a
+`complete` state publishes nothing, and a `resume` uploads only the missing
+wheels. The run refuses, naming the file, when a published file is foreign to
+the tested set, differs from the tested wheel, or is yanked (A17), and it
+refuses any state it cannot prove (a transport failure, an unparseable body, a
+status other than 200/404). A partially published set is never reported as
+complete, and `--verify-published` proves after the upload that every tested
+wheel is on PyPI with the same sha256.
+
+**The platform × interpreter matrix is explicit (V4).** The advertised targets
+are exactly `aarch64-apple-darwin`, `x86_64-unknown-linux-gnu` (manylinux_2_28,
+glibc) and `x86_64-pc-windows-msvc`, each with CPython 3.11, 3.12 and 3.13
+through the one forward-compatible `cp311-abi3` wheel per platform. musllinux
+and every other host are excluded, and w4's `excluded-host` check enforces the
+exclusion: a wheel built for a platform outside this matrix is refused by name
+before anything uploads. Widening the matrix remains a deliberate, versioned act
+under this ADR's evolution rule.
