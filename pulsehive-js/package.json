@@ -29,6 +29,7 @@
   "files": [
     "wrapper.js",
     "wrapper.d.ts",
+    "load-diagnosis.js",
     "index.js",
     "index.d.ts"
   ],
