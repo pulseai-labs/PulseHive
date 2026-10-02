@@ -227,6 +227,11 @@ jobs:
       - name: Check the release workflows
         run: python3 scripts/check-release-workflows.py --self-test
 
+      # Round 3 (w5): all three release workflows are wired by now, so the
+      # checker runs against the real files too, not only its own fixtures.
+      - name: Check the release workflows (all)
+        run: python3 scripts/check-release-workflows.py --all
+
   deny:
     name: Cargo Deny
     runs-on: ubuntu-latest
