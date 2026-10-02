@@ -16,7 +16,21 @@ on:
 permissions:
   contents: read
 
+# One npm release at a time per ref, queued rather than cancelled: an
+# interrupted publish would leave a partial release that only the resume path
+# could finish (A14).
+concurrency:
+  group: release-npm-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
+  # The release gate every publish path must wait on: the manifest/tag check,
+  # the on-main check, then all of ci.yml (A2). A tag that does not name the
+  # manifest version, or that is not on main, never reaches the registry.
+  gate:
+    if: startsWith(github.ref, 'refs/tags/v')
+    uses: ./.github/workflows/release-gate.yml
+
   build-binaries:
     name: Build (${{ matrix.platform }})
     runs-on: ${{ matrix.os }}
@@ -150,12 +164,48 @@ jobs:
           npm ci
           bash scripts/pack-npm.sh --artifacts artifacts --targets all --out dist-npm
 
+      # A16: the pre-approval inventory — exactly which bytes this run will
+      # publish, readable in the job summary before the `npm` environment's
+      # review. Fails closed if a tarball cannot be read, before the artifact is
+      # uploaded.
+      - name: Write the pre-approval tarball inventory to the job summary
+        working-directory: pulsehive-js
+        run: |
+          set -euo pipefail
+          {
+            echo "### npm tarball inventory (pre-approval)"
+            echo
+            echo "| tarball | package | version | sha512 integrity |"
+            echo "|---|---|---|---|"
+            for tarball in dist-npm/*.tgz; do
+              meta="$(tar -xzOf "$tarball" package/package.json | node -e '
+                let raw = "";
+                process.stdin.on("data", (chunk) => (raw += chunk));
+                process.stdin.on("end", () => {
+                  const pkg = JSON.parse(raw);
+                  process.stdout.write(pkg.name + "\t" + pkg.version);
+                });
+              ')"
+              integrity="$(node -e '
+                const crypto = require("crypto");
+                const fs = require("fs");
+                process.stdout.write(
+                  "sha512-" + crypto.createHash("sha512").update(fs.readFileSync(process.argv[1])).digest("base64"),
+                );
+              ' "$tarball")"
+              echo "| $(basename "$tarball") | ${meta%%$'\t'*} | ${meta#*$'\t'} | $integrity |"
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
+
       - name: Upload packed tarballs
         uses: actions/upload-artifact@v7
         with:
           name: npm-tarballs
           path: pulsehive-js/dist-npm/*.tgz
           if-no-files-found: error
+          # L4 narrowed: the tested artifacts are what a re-run of the failed
+          # jobs publishes, so they outlive the default retention window.
+          retention-days: 90
 
   # Every advertised target installs the packed tarballs on its own runner, on every
   # advertised Node line, and calls a binding. "Installed and executed, not merely
@@ -228,16 +278,22 @@ jobs:
 
   publish:
     name: Publish to npm
-    needs: [verify-install]
+    needs: [gate, verify-install]
     runs-on: ubuntu-latest
     environment: npm
-    # Only publish on tag push (not workflow_dispatch)
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    # Tag runs only — a PR and a branch dispatch never reach the registry. A
+    # dispatch on a `v*` tag does reach it, because GitHub's re-run window
+    # expires and that is the documented recovery for a partial publish (L4).
+    if: startsWith(github.ref, 'refs/tags/v')
     # Gated by the `npm` deployment environment (above), which has a required
     # reviewer — publish waits for manual approval. NPM_TOKEN is provisioned
-    # as a repository secret (see release-ops handoff).
+    # in that environment (see the release runbook).
     steps:
-      - uses: actions/setup-node@v6
+      # The gated publish path is a tracked script; the job needs the tree for
+      # `pulsehive-js/scripts/npm-publish.sh` and `scripts/release-check.sh`.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
           node-version: "22"
           registry-url: "https://registry.npmjs.org"
@@ -246,40 +302,47 @@ jobs:
       # `verify-install` installed and executed on every advertised target. Nothing
       # is re-packed and nothing is built in this job.
       - name: Download the verified tarballs
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: npm-tarballs
           path: dist-npm
 
+      # One invocation of the gated publish path. It validates the tarball set,
+      # decides per package against npm's published integrity — an identical
+      # version is skipped, a different one refuses and stops — publishes the
+      # platform packages first and the main package last, and re-reads every
+      # published integrity (L4; #100). A missing NODE_AUTH_TOKEN fails the run
+      # inside the script instead of warning and exiting 0 (A4). NPM_TOKEN is
+      # scoped to this step alone (ADR-006).
       - name: Publish to npm
         shell: bash
         run: |
-          if [ -z "${NODE_AUTH_TOKEN:-}" ]; then
-            echo "::warning::NPM_TOKEN secret is not set — skipping npm publish."
-            echo "Add the NPM_TOKEN repository secret to enable @pulsehive/sdk publishing."
-            exit 0
+          set -o pipefail
+          args=(--dist dist-npm --expect-version "$(bash scripts/release-check.sh --get npm.version)")
+          if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
+            args+=(--fresh-build)
           fi
-          # Platform packages first: the main package's optionalDependencies pin
-          # them by exact version, so an install that resolves the main tarball
-          # needs them to already exist.
-          published=0
-          for tarball in dist-npm/*.tgz; do
-            case "${tarball##*/}" in
-              pulsehive-sdk-[0-9]*) continue ;;   # the main package goes last
-            esac
-            npm publish --access public "$tarball"
-            published=$((published + 1))
-          done
-          if [ "$published" -eq 0 ]; then
-            echo "::error::no platform tarballs found in dist-npm/ — refusing to publish the main package alone"
-            exit 1
-          fi
-
-          main_tarball="$(ls dist-npm/pulsehive-sdk-[0-9]*.tgz 2>/dev/null | head -n1 || true)"
-          if [ -z "$main_tarball" ]; then
-            echo "::error::no main @pulsehive/sdk tarball in dist-npm/"
-            exit 1
-          fi
-          npm publish --access public "$main_tarball"
+          bash pulsehive-js/scripts/npm-publish.sh publish "${args[@]}" 2>&1 \
+            | tee "$RUNNER_TEMP/npm-publish.log"
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      # A9/A16: the per-package outcome lines go to the job summary from the
+      # teed log, and this step runs even when the publish step refused. The
+      # job's own exit status stays the publish step's.
+      - name: Write the npm publish outcome to the job summary
+        if: always()
+        shell: bash
+        run: |
+          log="$RUNNER_TEMP/npm-publish.log"
+          {
+            echo "### npm publish outcome"
+            echo
+            echo '```'
+            if [ -f "$log" ]; then
+              cat "$log"
+            else
+              echo "npm-publish.sh produced no output"
+            fi
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

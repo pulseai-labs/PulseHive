@@ -1,0 +1,21 @@
+name: Release gate
+on:
+  workflow_call:
+permissions:
+  contents: read
+jobs:
+  manifest-check:
+    name: Manifest and tag check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0          # origin/main for the ancestry check
+      - name: Self-test the consistency check
+        run: bash scripts/release-check.sh --self-test
+      - name: Tag names the manifest version and sits on main
+        run: bash scripts/release-check.sh --ref "$GITHUB_REF" --on-main "$GITHUB_SHA"
+  test:
+    name: Tests
+    needs: [manifest-check]
+    uses: ./.github/workflows/ci.yml

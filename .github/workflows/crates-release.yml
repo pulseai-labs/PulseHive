@@ -6,13 +6,32 @@ on:
       - "v*"
   workflow_dispatch:
 
+# Least-privilege default for the automatic GITHUB_TOKEN. The publish job opts
+# into `id-token: write` for the trusted-publishing exchange; nothing else does.
 permissions:
   contents: read
 
+# A14: one crates release run per ref, and a re-run must never cancel the run it
+# is finishing — L4's transient retry is a re-run of the original run, which is
+# the only path that reuses that run's tested artifacts.
+concurrency:
+  group: release-crates-${{ github.ref }}
+  cancel-in-progress: false
+
 env:
   CARGO_TERM_COLOR: always
+  # L5: the one toolchain pin. Both jobs install it, so the bytes the gate
+  # packaged and the bytes the publish job uploads come off the same compiler.
+  RELEASE_RUST_TOOLCHAIN: "1.98.1"
 
 jobs:
+  # The release gate first: the manifest/tag check, then all of ci.yml's jobs.
+  # `package` and `publish` both need it, so nothing is packaged or published
+  # for a tag the gate has not proven.
+  gate:
+    if: startsWith(github.ref, 'refs/tags/v')
+    uses: ./.github/workflows/release-gate.yml
+
   # Dependency policy gate — must pass before anything is published.
   # Mirrors the cargo-deny gate in ci.yml (pinned action SHA, advisories/bans/sources).
   cargo-deny:
@@ -25,66 +44,114 @@ jobs:
           rust-version: stable
           command: check advisories bans licenses sources
 
-  publish:
-    name: Publish to crates.io
+  # The gated packaging job (L5): one verified `cargo package` for the five
+  # crates, with the resolved Cargo.lock and a SHA256SUMS beside them. The
+  # 90-day retention is what lets a later re-run of this run reuse exactly these
+  # bytes (L4); after that window a partial publish takes the corrective path.
+  package:
+    name: Package the tested crates
     runs-on: ubuntu-latest
-    # Gated by a GitHub deployment environment (add a required reviewer on
-    # the "crates-io" environment to require manual approval before publish).
-    environment: crates-io
-    # Block publish until the dependency-policy gate passes.
-    needs: [cargo-deny]
-    # Only publish on tag push (not workflow_dispatch) to prevent accidental publishes
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
-
-    # Token scoped to this post-approval job only (kept out of the pre-publish cargo-deny gate).
-    env:
-      CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-
+    needs: [gate, cargo-deny]
     steps:
       - uses: actions/checkout@v7
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # v1
+        with:
+          toolchain: ${{ env.RELEASE_RUST_TOOLCHAIN }}
 
-      - uses: Swatinem/rust-cache@v2
+      - name: Package the five crates (verified)
+        run: bash scripts/crates-publish.sh package --out crates-dist
 
-      # Publish in dependency order with a wait between each so the index
-      # propagates. The `publish` helper is IDEMPOTENT — it tolerates a version
-      # that is already on crates.io (e.g. republishing after a manual publish)
-      # but FAILS LOUDLY on any other error. This replaces the old blanket
-      # `|| true`, which masked genuine publish failures (it once hid a real
-      # failed publish — see issue #26).
-      # NOTE: pulsehive-runtime dev-depends on pulsehive-openai, so openai must
-      # be indexed BEFORE runtime is published, or runtime's verify build fails.
-      - name: Publish crates (dependency order, fail-loud + idempotent)
+      # A16: the inventory the approver reads before approving the `crates-io`
+      # environment — the version, the packaged file names with their sha256,
+      # and the decisions `plan` takes against the live index. `plan` exits
+      # non-zero when it would refuse a crate; that refusal is exactly what the
+      # approver needs to see, so the inventory is written either way.
+      - name: Pre-approval inventory
         run: |
-          set -uo pipefail
+          {
+            echo "### crates.io pre-approval inventory"
+            echo
+            echo "Version: $(bash scripts/release-check.sh --get rust.version)"
+            echo
+            echo '```'
+            cat crates-dist/SHA256SUMS
+            echo '```'
+            echo
+            echo "Planned decisions (crates-publish.sh plan):"
+            echo
+            echo '```'
+            bash scripts/crates-publish.sh plan --tested crates-dist 2>&1 || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
 
-          publish() {
-            local crate="$1"
-            echo "::group::cargo publish -p $crate"
-            local out status
-            out="$(cargo publish -p "$crate" --no-verify 2>&1)"
-            status=$?
-            printf '%s\n' "$out"
-            echo "::endgroup::"
-            if [ "$status" -eq 0 ]; then
-              echo "published: $crate"
-              return 0
-            fi
-            # Idempotent: a version already on the index is not a failure.
-            if printf '%s\n' "$out" | grep -qiE 'already (uploaded|exists)'; then
-              echo "note: $crate is already published at this version — skipping (idempotent)"
-              return 0
-            fi
-            echo "::error::publishing $crate failed (exit $status) — see log above" >&2
-            return 1
-          }
+      - name: Upload the tested crates
+        uses: actions/upload-artifact@v7
+        with:
+          name: tested-crates
+          path: crates-dist/
+          retention-days: 90
+          if-no-files-found: error
 
-          publish pulsehive-core     || exit 1
-          sleep 30
-          publish pulsehive-openai   || exit 1
-          publish pulsehive-anthropic || exit 1
-          sleep 30
-          publish pulsehive-runtime  || exit 1
-          sleep 30
-          publish pulsehive          || exit 1
+  # The publish job: the only job that holds registry credentials, and it holds
+  # no long-lived ones — the job's OIDC token is exchanged here for a
+  # short-lived crates.io token, in the approved job (L1, ADR-006).
+  publish:
+    name: Publish to crates.io
+    runs-on: ubuntu-latest
+    # Gated by a GitHub deployment environment; the operator is the required
+    # reviewer on `crates-io`, and approving is what admits the run here.
+    environment: crates-io
+    needs: [gate, package]
+    # A dispatch on a v* tag must reach this job — GitHub's re-run window
+    # expires after 30 days, and the gate refuses any non-tag ref. No
+    # event-name clause: that clause is what used to make workflow_dispatch
+    # unable to publish at all.
+    if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      # Every action in this job is pinned to a full commit SHA with the ref it
+      # was resolved from (A12; the refs are release tags, read with ls-remote).
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # v1
+        with:
+          toolchain: ${{ env.RELEASE_RUST_TOOLCHAIN }}
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: tested-crates
+          path: crates-dist
+      - uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
+        id: auth
+
+      # `set -o pipefail` is load-bearing: GitHub's default shell has no
+      # pipefail, so a bare `| tee` would report tee's success over a failed
+      # publish. The tee'd log is what the always() step below reprints into the
+      # job summary — that step is the only place the outcome lines are written,
+      # and it never touches this step's exit status (A9, A16).
+      - name: Publish the tested crates
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+        run: |
+          set -o pipefail
+          fresh=()
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            fresh=(--fresh-build)
+          fi
+          bash scripts/crates-publish.sh publish --tested crates-dist "${fresh[@]}" 2>&1 | tee crates-publish.log
+
+      - name: Publish outcome in the job summary
+        if: always()
+        run: |
+          {
+            echo "### crates.io publish outcome"
+            echo
+            echo '```'
+            if [ -f crates-publish.log ]; then
+              cat crates-publish.log
+            else
+              echo "(the publish step produced no log)"
+            fi
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

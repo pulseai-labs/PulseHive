@@ -122,3 +122,7 @@ module-not-found trace.
   advertised target before publish (w4), and to a hermetic local-registry proof
   that the host platform package resolves and the main package carries no
   binary (w3).
+- Publish authorization — who may publish, from which tag, and with which
+  credential — is ADR-018's: npm publishes through a stored, environment-scoped
+  `NPM_TOKEN` for its first publication and moves to trusted publishing once the
+  packages exist (feature map).
