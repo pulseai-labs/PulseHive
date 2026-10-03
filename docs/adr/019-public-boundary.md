@@ -92,8 +92,9 @@ hit would print the secret onto the exact path that handles leaks) and with
 `--log-opts="--all -m"` so a secret introduced while resolving a merge is
 scanned rather than skipped. It runs with gitleaks' built-in default config —
 `.gitleaks.toml` and `.gitleaksignore` are themselves `never-tracked:`, so no
-repository config can weaken or extend an allowlist — and the CI job fetches the
-pull-request refs before scanning so an unmerged head is covered too (C2, C3).
+repository config can weaken or extend an allowlist — and the weekly full-corpus
+CI job fetches the pull-request refs before scanning so an unmerged head is
+covered too (C2, C3).
 The **judgment half** is a path-first review of history against the rules block
 and the prose rules, finding by finding, because no pattern distinguishes a
 synthetic fixture from a real one.
@@ -129,9 +130,19 @@ quiet a hit is exactly the failure the pinning exists to prevent.
 `.github/workflows/boundary.yml` runs on every pull request and on every push to
 `main`, with `contents: read` and on `pull_request` (never
 `pull_request_target`), so a pull request's code runs with no write token and no
-secrets. It has two jobs: **"Public boundary"** — the checker's hermetic
-self-test, then the checker — and **"Secrets scan (gitleaks)"** — a
-checksum-verified gitleaks binary, then a full-history scan. The "Public
+secrets. It has two jobs on those events: **"Public boundary"** — the checker's
+hermetic self-test, then the checker — and **"Secrets scan (gitleaks)"** — a
+checksum-verified gitleaks binary, then a scan scoped to the event. On a pull
+request it scans only that pull request's own commits,
+`--log-opts="<base.sha>..<head.sha> -m"`; on a push to `main` it scans every
+branch and tag with `--all -m`. Neither fetches `refs/pull/*`, because GitHub
+keeps those refs after a pull request closes: one fork pull request with a
+secret-looking string would otherwise turn the required check red on every
+later pull request, and no in-repo change could clear it. A third job,
+**"Secrets scan (full public corpus)"**, runs weekly on a `schedule` and on
+`workflow_dispatch`: it fetches `+refs/pull/*/head:refs/remotes/origin/pr/*`
+and scans `--all -m`, so a pull-request head is still covered, and it is not a
+required check. The "Public
 boundary" job runs the pull request's own copy of the checker against the pull
 request's own rules block, so a pull request that edits either one sets its own
 verdict; such an edit touches this ADR's touch surface, and the reviewer judges
@@ -139,10 +150,11 @@ it. The gitleaks release is downloaded and its
 tarball checked against a sha256 literal in the workflow, `actions/checkout` is
 pinned to a commit SHA, and the scanner is never invoked through
 `gitleaks/gitleaks-action` (which needs a paid licence on organization repos).
-Both jobs avoid `continue-on-error`, `|| true` and `set +e`: a check that cannot
-fail is not a check.
+All three jobs avoid `continue-on-error`, `|| true` and `set +e`: a check that
+cannot fail is not a check.
 
-Both checks become **required status checks on `main`**, so a prohibited file is
+"Public boundary" and "Secrets scan (gitleaks)" become **required status checks
+on `main`**, so a prohibited file is
 caught before it merges rather than at the next release close.
 
 One consequence of keeping the template's `**/.env.*` rule verbatim — a block
@@ -197,8 +209,14 @@ and `CONTRIBUTING.md` and `.gitignore` follow the new name.
   un-publish anything, breaks clones and links, and hides the disclosure that
   the record must carry.
 - **Scan only the current ref.** Rejected: a secret introduced on an unmerged
-  branch, a tag or a pull-request head is still one push from public. The CI job
-  fetches the pull-request refs and the scan is merge-aware.
+  branch, a tag or a pull-request head is still one push from public. The push
+  scan reads every branch and tag, the weekly full-corpus job fetches the
+  pull-request refs, and every scan is merge-aware.
+- **Scan every pull-request head in the required check.** Rejected: GitHub keeps
+  `refs/pull/*/head` after a pull request closes, so one fork pull request with
+  a secret-looking string would turn every later pull request red with no
+  in-repo fix. The required check scans the pull request's own range; the full
+  corpus runs in a non-required weekly job.
 - **Use `gitleaks/gitleaks-action`.** Rejected: it needs a paid licence on
   organization repositories; the release tarball with a checksum literal keeps
   the scan free, verifiable and version-pinned.

@@ -1,14 +1,18 @@
 name: Public boundary
 
 # The public boundary (ADR-019) as two required checks: the rules block executed
-# against the tracked tree, and a full-history secrets scan. A prohibited file is
-# caught here, on the pull request that introduces it, rather than at the next
-# release close.
+# against the tracked tree, and a secrets scan of what the event adds. A
+# prohibited file is caught here, on the pull request that introduces it, rather
+# than at the next release close. A weekly, non-required job scans the full
+# public corpus, pull-request heads included.
 
 on:
   pull_request:
   push:
     branches: [main]
+  schedule:
+    - cron: "17 4 * * 1"  # weekly, Monday 04:17 UTC
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -16,6 +20,7 @@ permissions:
 jobs:
   public-boundary:
     name: Public boundary
+    if: github.event_name == 'pull_request' || github.event_name == 'push'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -25,7 +30,54 @@ jobs:
         run: bash scripts/check-public-boundary.sh
 
   gitleaks:
+    # Required check. On a pull request it scans only that pull request's own
+    # commits, so a secret-looking string on some other pull-request head can
+    # never turn it red. On a push to main it scans every branch and tag.
     name: Secrets scan (gitleaks)
+    if: github.event_name == 'pull_request' || github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0          # full history: base and head must both resolve
+      - name: Download and verify gitleaks 8.30.1
+        # Not gitleaks/gitleaks-action: it needs a paid licence on organization
+        # repos. The tarball is verified against the release's published
+        # checksums file before anything in it runs.
+        env:
+          GITLEAKS_VERSION: "8.30.1"
+          GITLEAKS_SHA256: "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb"
+        run: |
+          set -euo pipefail
+          asset="gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          curl -sSfL -o "$asset" \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/${asset}"
+          printf '%s  %s\n' "$GITLEAKS_SHA256" "$asset" > SHA256SUMS.gitleaks
+          sha256sum -c SHA256SUMS.gitleaks
+          tar -xzf "$asset" gitleaks
+      - name: Scan the pull request's own commits
+        if: github.event_name == 'pull_request'
+        # --redact: an unredacted hit would print the secret onto exactly the
+        # path that handles leaks. --ignore-gitleaks-allow with no --config: the
+        # built-in default rules only, since .gitleaks.toml and .gitleaksignore
+        # are never-tracked (ADR-019). -m: merge commits contribute their diffs.
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: ./gitleaks git --redact --no-banner --ignore-gitleaks-allow -i "$(mktemp -d)" --log-opts="${BASE_SHA}..${HEAD_SHA} -m" .
+      - name: Scan every branch and tag
+        if: github.event_name == 'push'
+        # --redact: an unredacted hit would print the secret onto exactly the
+        # path that handles leaks. --ignore-gitleaks-allow with no --config: the
+        # built-in default rules only, since .gitleaks.toml and .gitleaksignore
+        # are never-tracked (ADR-019). -m: merge commits contribute their diffs.
+        run: ./gitleaks git --redact --no-banner --ignore-gitleaks-allow -i "$(mktemp -d)" --log-opts="--all -m" .
+
+  gitleaks-full-corpus:
+    # Not a required check: it reads every pull-request head GitHub keeps,
+    # closed ones included, which no in-repo change can clear.
+    name: Secrets scan (full public corpus)
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -50,7 +102,7 @@ jobs:
           printf '%s  %s\n' "$GITLEAKS_SHA256" "$asset" > SHA256SUMS.gitleaks
           sha256sum -c SHA256SUMS.gitleaks
           tar -xzf "$asset" gitleaks
-      - name: Scan the full history
+      - name: Scan the full public corpus
         # --redact: an unredacted hit would print the secret onto exactly the
         # path that handles leaks. --ignore-gitleaks-allow with no --config: the
         # built-in default rules only, since .gitleaks.toml and .gitleaksignore
