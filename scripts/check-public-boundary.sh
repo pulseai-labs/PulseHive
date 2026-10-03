@@ -247,7 +247,7 @@ def parse_rules(policy_text):
 
 
 def tracked_paths():
-    return [p for p in git("ls-files").stdout.splitlines() if p]
+    return [p for p in git("ls-files", "-z").stdout.split("\0") if p]
 
 
 def check_rules(rules, tracked):
@@ -304,7 +304,7 @@ def run_hygiene(policy_text):
     else:
         print("%s: note: no '## Working-tree hygiene allowlist' section "
               "\u2014 every untracked path is unlisted" % PROG)
-    untracked = git("ls-files", "--others").stdout.splitlines()
+    untracked = [p for p in git("ls-files", "--others", "-z").stdout.split("\0") if p]
     allowlisted = unlisted = 0
     for path in untracked:
         if any(glob_to_regex(p).match(path) for p in patterns):
@@ -433,6 +433,7 @@ POLICY
   reject_case tracked-gitleaks-toml .gitleaks.toml
   reject_case tracked-gitleaksignore .gitleaksignore
   reject_case nested-env a/b/.env
+  reject_case non-ascii-pem $'caf\xc3\xa9.pem'
 
   # The synthetic deny term, in a file and in a --deny-terms list.
   printf 'AcmeWidget\n' > "$tmp/deny-terms.txt"
