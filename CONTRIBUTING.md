@@ -94,8 +94,8 @@ cargo bench -p pulsehive-runtime
 Live tests call a real LLM API (GLM via OpenAI-compatible endpoint) and are skipped by default.
 
 ```bash
-# 1. Copy .env.example to .env and fill in your API key
-cp .env.example .env
+# 1. Copy env.example to .env and fill in your API key
+cp env.example .env
 
 # 2. Run all live tests
 cargo test -- --ignored
