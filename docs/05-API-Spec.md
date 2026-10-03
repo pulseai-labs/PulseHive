@@ -288,7 +288,7 @@ Products do not implement this trait directly. They use `PulseDBSubstrate` (the 
 
 ### 2.7 StreamingTool (Streaming Tools)
 
-*Since v2.1.0.* An opt-in extension for **streaming tools** — long-running tools
+*Since 3.0.0.* An opt-in extension for **streaming tools** — long-running tools
 that report live progress instead of a frozen wait. A tool that implements only
 `Tool` is still fully supported (the agent loop wraps it so it emits `Started` →
 `Completed` with no intermediate events); implement `StreamingTool` when a tool
@@ -406,7 +406,7 @@ while let Some(event) = stream.next().await {
             println!("[{tool_name}] {progress:?}");
         }
         HiveEvent::AgentCompleted { .. } => break,
-        _ => {} // HiveEvent is #[non_exhaustive] (v2.1.0)
+        _ => {} // HiveEvent is #[non_exhaustive] (3.0.0)
     }
 }
 ```
@@ -850,14 +850,14 @@ pub enum AgentKind {
 
 ### 4.2 HiveEvent
 
-As of **v2.1.0**, `HiveEvent` is `#[non_exhaustive]` — new variants can be added
+As of **3.0.0**, `HiveEvent` is `#[non_exhaustive]` — new variants can be added
 in a minor release, so external code that matches on it exhaustively **must**
 include a `_ => {}` catch-all arm.
 
 ```rust
-#[non_exhaustive] // v2.1.0 — external exhaustive matches need a `_ => {}` arm
+#[non_exhaustive] // 3.0.0 — external exhaustive matches need a `_ => {}` arm
 pub enum HiveEvent {
-    // Agent lifecycle — both carry the run's task identity (v2.1.0):
+    // Agent lifecycle — both carry the run's task identity (3.0.0):
     // collective_id + task_description attribute a run to its task when
     // one agent executes several tasks in a single deploy.
     AgentStarted { agent_id: AgentId, name: String, kind: AgentKindTag,
@@ -875,7 +875,7 @@ pub enum HiveEvent {
     ToolCallCompleted { agent_id: AgentId, tool_name: String, duration_ms: u64 },
     ToolApprovalRequested { agent_id: AgentId, tool_name: String, action: PendingAction },
 
-    // Streaming tool progress (v2.1.0) — one per `ToolProgress` pushed by a
+    // Streaming tool progress (3.0.0) — one per `ToolProgress` pushed by a
     // `StreamingTool`, bracketed by loop-generated Started/Completed bookends.
     ToolProgress { agent_id: AgentId, tool_name: String, progress: ToolProgress },
 
@@ -1145,7 +1145,7 @@ impl AnthropicProvider {
 // Implements LlmProvider
 ```
 
-**Transport hardening (2.1.0).** Every transport failure from `chat` is a
+**Transport hardening (3.0.0).** Every transport failure from `chat` is a
 `PulseHiveError::LlmTransport` carrying an `LlmError`; a request that cannot
 be built at all (malformed `base_url`, an `api_key` that cannot be a header
 value) is the request-build exception — `PulseHiveError::Llm(String)`, failing
@@ -1250,7 +1250,7 @@ let ollama = OpenAICompatibleProvider::new(OpenAIConfig {
 });
 ```
 
-**Transport contract (2.1.0).** Every transport failure from `chat` and `chat_stream` is a typed `PulseHiveError::LlmTransport(LlmError)`; `PulseHiveError::Llm(String)` remains for request-build failures — serialization, or a request that cannot be built at all (malformed `base_url`), which fails immediately without retrying or sending anything. Classification:
+**Transport contract (3.0.0).** Every transport failure from `chat` and `chat_stream` is a typed `PulseHiveError::LlmTransport(LlmError)`; `PulseHiveError::Llm(String)` remains for request-build failures — serialization, or a request that cannot be built at all (malformed `base_url`), which fails immediately without retrying or sending anything. Classification:
 
 | Situation | `LlmErrorKind` | Retried? | Carries |
 |---|---|---|---|

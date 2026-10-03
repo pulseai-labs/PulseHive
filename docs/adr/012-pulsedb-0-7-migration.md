@@ -71,7 +71,7 @@ collective was redirected into a fresh namespace. They now keep a task's collect
 when that collective already exists and fall back to the synthetic namespace only for
 unknown IDs. This is the behavior the migration proof depends on — deploying onto a
 migrated 0.5.1 collective must write into that collective — and it is recorded in the
-2.1.0 changelog as the observable deploy behavior change of this upgrade.
+3.0.0 changelog as the observable deploy behavior change of this upgrade.
 
 **Rationale:** ADR-004's ownership line means the only honest PulseHive posture is to
 open the substrate and propagate typed errors; duplicating upstream migration logic

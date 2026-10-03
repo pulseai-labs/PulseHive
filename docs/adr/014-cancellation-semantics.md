@@ -123,7 +123,7 @@ change under ADR-005.
 ## Amendment (2026-09-26, r2.s5)
 
 **Status:** Accepted. This amends the Decision above; the Decision text itself
-is unedited. **Trigger:** pulse-guard's smoke pass on published 3.0.0 — finding
+is unedited. **Trigger:** a downstream consumer's smoke pass on published 3.0.0 — finding
 **PH-1**, probe `a2_one_failed_lens_is_erased_by_the_surrounding_sequential`:
 `Sequential([Parallel([lenses]), critic])` with one failing lens returned
 `Complete`, erasing the failure.
@@ -159,4 +159,4 @@ does not accumulate errors across iterations. Documented here, not changed.
 **Correction.** `run_sequential` diverged from this Decision's own merge rule:
 its `PartialComplete` arm kept the child's joined `responses` as the sequence's
 last response and dropped the child's `errors`, so the sequence always ended
-`Complete`. A degraded run is now reported as one (pulse-guard PH-1).
+`Complete`. A degraded run is now reported as one (a downstream consumer's smoke finding PH-1).

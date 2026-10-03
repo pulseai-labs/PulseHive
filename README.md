@@ -158,8 +158,6 @@ pulsehive = { version = "3.0", features = ["openai"] } # transport-only
 ## Documentation
 
 - [**SDK Overview**](EXECUTIVE-SUMMARY.md) — Architecture, primitives, intelligence layer, development phases
-- [**Product Requirements**](docs/01-PRD.md) — Features, personas, success metrics
-- [**System Requirements**](docs/02-SRS.md) — Functional and non-functional requirements
 - [**Architecture**](docs/03-Architecture.md) — C4 model, data flows, architecture decisions
 - [**Data Model**](docs/04-Data-Model.md) — PulseDB entities and relationships
 - [**API Specification**](docs/05-API-Spec.md) — Public traits, structs, and methods

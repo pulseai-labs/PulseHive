@@ -730,7 +730,7 @@ impl HiveMindBuilder {
     /// When set, every `HiveEvent` emission is also forwarded to the exporter
     /// via a fire-and-forget `tokio::spawn` call — zero latency on the emit path.
     ///
-    /// Use this to connect PulseHive to PulseVision or custom dashboards.
+    /// Use this to connect PulseHive to an event-visualization tool or custom dashboards.
     pub fn event_exporter(mut self, exporter: impl EventExporter + 'static) -> Self {
         self.event_exporter = Some(Arc::new(exporter));
         self

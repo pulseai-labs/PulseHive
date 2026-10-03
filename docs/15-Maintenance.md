@@ -171,7 +171,7 @@ The specification is the source of truth. It is a living document updated when:
 - An open question is resolved.
 - Phase milestones are reached.
 
-EXECUTIVE-SUMMARY.md summarizes the spec; the detailed specification lives across `docs/01-PRD.md`, `docs/02-SRS.md`, and `docs/03-Architecture.md`. Keep them in sync with significant changes.
+EXECUTIVE-SUMMARY.md summarizes the spec; the public design record lives across `docs/03-Architecture.md`, `docs/05-API-Spec.md`, and the ADRs under `docs/adr/`. Keep them in sync with significant changes.
 
 ### 5.4 CHANGELOG.md
 

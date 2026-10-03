@@ -5,7 +5,7 @@
 //! provider ([`ScriptedProvider`], behind `pulsehive-core`'s `testing` feature)
 //! requests the streaming tool once; the tool emits fractional
 //! `ToolProgress::Progress` events roughly once per second for ~5s. The agent
-//! loop (v2.1.0) forwards each one as a `HiveEvent::ToolProgress` and brackets
+//! loop (3.0.0) forwards each one as a `HiveEvent::ToolProgress` and brackets
 //! them with loop-generated `Started` / `Completed` bookends.
 //!
 //! Hermetic: no API key and no network — the scripted provider drives the real
@@ -193,7 +193,7 @@ async fn main() {
                         }
                     }
                 }
-                // `HiveEvent` is `#[non_exhaustive]` (v2.1.0), so an external
+                // `HiveEvent` is `#[non_exhaustive]` (3.0.0), so an external
                 // exhaustive match needs this catch-all arm.
                 HiveEvent::AgentCompleted { .. } => break,
                 _ => {}
