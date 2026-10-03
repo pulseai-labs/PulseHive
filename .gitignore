@@ -62,7 +62,6 @@ id_rsa
 id_ed25519
 .secrets/
 .env.*
-!.env.example
 *.secret
 credentials.json
 
