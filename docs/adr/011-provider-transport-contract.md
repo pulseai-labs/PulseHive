@@ -94,7 +94,6 @@ promises and what downstream products depend on.
 **Negative:**
 - One coordinated break: struct literals for these types outside `pulsehive-core`
   must move to the constructors, and an exhaustive `match` on `PulseHiveError`
-  needs a `_ =>` arm. Recorded under `[2.1.0] - Unreleased` in `CHANGELOG.md`; the
-  published version number is a release-close decision.
+  needs a `_ =>` arm. Recorded under `[3.0.0]` in `CHANGELOG.md`.
 - `LlmError::body` is verbatim, so a consumer that logs it without redacting can
   leak whatever the provider echoed back.

@@ -4,7 +4,7 @@
 > **Version**: 0.7.0 (the version PulseHive pins since the r1.s4 upgrade)
 > **docs.rs**: https://docs.rs/pulsehive-db
 
-This is a concise reference of PulseDB's public API surface relevant to PulseHive development, verified against `pulsehive-db` 0.7.0. For full documentation, see docs.rs. Shapes are the 0.7 construction shapes — the value types PulseHive re-exports changed in the 0.5 → 0.7 move (see [ADR-012](adr/012-pulsedb-0-7-migration.md) and the 2.1.0 changelog); there is no shim.
+This is a concise reference of PulseDB's public API surface relevant to PulseHive development, verified against `pulsehive-db` 0.7.0. For full documentation, see docs.rs. Shapes are the 0.7 construction shapes — the value types PulseHive re-exports changed in the 0.5 → 0.7 move (see [ADR-012](adr/012-pulsedb-0-7-migration.md) and the 3.0.0 changelog); there is no shim.
 
 ---
 

@@ -21,7 +21,7 @@ No sixth primitive without a demonstrated, repo-backed use case. Enums over stri
 ## Status & direction
 
 - **Shipped (v2.0.2, AGPL-3.0, crates.io):** five primitives, agentic loop, workflow agents, intelligence layer, Anthropic + OpenAI-compatible providers, `HiveEvent` stream + `EventExporter`, PulseDB integration, Python (PyO3) + TypeScript (napi-rs) bindings.
-- **Next (v2.1.0 — Sprint 1, additive):** streaming tool execution + `ToolProgress` events; cooperative cancellation; subscription-billed subprocess providers (Claude Code + Codex), stateless then stateful. One coordinated `#[non_exhaustive]` migration absorbs the only contract change.
+- **Next:** released and upcoming work is tracked in [CHANGELOG.md](CHANGELOG.md).
 - **Deferred (v3.0):** breaking work (e.g. `TokenUsage` → tagged `Usage` enum).
 
 ## Success proof

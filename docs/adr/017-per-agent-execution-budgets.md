@@ -7,7 +7,7 @@
 
 ## Context
 
-pulse-guard's smoke pass on the published 3.0.0 found that a consumer cannot
+a downstream consumer's smoke pass on the published 3.0.0 found that a consumer cannot
 bound one agent's work without bounding every agent's: `DEFAULT_MAX_ITERATIONS`
 is a module constant applied to every LLM child by the workflow dispatch
 (`pulsehive-runtime/src/workflow.rs` builds

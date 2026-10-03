@@ -1,4 +1,4 @@
-//! r2.s5.w3 — per-agent execution budgets (pulse-guard PH-8).
+//! r2.s5.w3 — per-agent execution budgets (a downstream consumer's smoke finding PH-8).
 //!
 //! A consumer can bound one LLM agent's work without touching any other: an
 //! agent's own iteration cap and a cap on the tool calls it actually executes.
