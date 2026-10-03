@@ -108,7 +108,10 @@ FIXTURE_NOTE = (
 
 
 def git(*args):
-    return subprocess.run(("git", "-C", root) + args, capture_output=True, text=True)
+    # backslashreplace: a path that is not valid UTF-8 still reaches the rules
+    # (as an escaped name) instead of crashing the decode.
+    return subprocess.run(("git", "-C", root) + args, capture_output=True,
+                          encoding="utf-8", errors="backslashreplace")
 
 
 def inconclusive(msg):
@@ -434,6 +437,7 @@ POLICY
   reject_case tracked-gitleaksignore .gitleaksignore
   reject_case nested-env a/b/.env
   reject_case non-ascii-pem $'caf\xc3\xa9.pem'
+  reject_case latin1-pem $'caf\xe9.pem'
 
   # The synthetic deny term, in a file and in a --deny-terms list.
   printf 'AcmeWidget\n' > "$tmp/deny-terms.txt"
