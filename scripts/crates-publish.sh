@@ -480,6 +480,11 @@ do_publish() {
 # SPINE.md L5's measured pair: the hash the pinned 1.98.1 packaging produced for
 # pulsehive-core 3.0.0, and the cksum crates.io records for the 3.0.0 built by
 # another toolchain. The pair is this work item's real negative control.
+#
+# Fixture data, not a statement about the version under test: the case below
+# feeds these hashes to whatever version the manifest currently declares, so
+# nothing in this file may restate that version — every expectation is derived
+# from the same $VERSION the case hands the publisher.
 SELFTEST_REAL_TESTED_SHA="9bdf73630cf9d8047ff01a7ca5592caa9c1f6e7aa5a0334571f21696e0e20329"
 SELFTEST_REAL_INDEX_SHA="7b1029446574756342e315c99226f583941e76d87ba7ce07b96ebc4ee2b44171"
 
@@ -817,18 +822,20 @@ self_test() {
   selftest_expect_rejected "local-drift" \
     "$PROG: ERROR: ${CRATES[0]}-$VERSION.crate differs from the tested package (tested $want_index, rebuilt $want_tested)"
 
-  # 9. real-3.0.0: SPINE.md L5's measured pair — the tested bytes the pinned
-  #    toolchain produced against the cksum crates.io recorded for a 3.0.0 built
-  #    by another toolchain — must refuse as different bytes.
+  # 9. real-measured-pair: the tested bytes the pinned toolchain produced against
+  #    the cksum crates.io recorded for another build of the same version must
+  #    refuse as different bytes. The pair is fixture data measured in the 3.0.0
+  #    release; the case runs at whatever version the manifest declares, so the
+  #    expected line takes its version from $VERSION and never restates one.
   selftest_index_reset
-  dir="$SELFTEST_TMP/real-3.0.0"
+  dir="$SELFTEST_TMP/real-measured-pair"
   selftest_tested_dir "$dir"
   SELFTEST_TESTED_DIR="$dir"
   selftest_set_tested_hash "$dir" pulsehive-core "$SELFTEST_REAL_TESTED_SHA"
   selftest_index_entry pulsehive-core 200 "$SELFTEST_REAL_INDEX_SHA" false
   selftest_call do_plan "$dir"
-  selftest_expect_rejected "real-3.0.0" \
-    "$PROG: ERROR: pulsehive-core 3.0.0 is already on crates.io with different bytes (index $SELFTEST_REAL_INDEX_SHA, tested $SELFTEST_REAL_TESTED_SHA) — refusing"
+  selftest_expect_rejected "real-measured-pair" \
+    "$PROG: ERROR: pulsehive-core $VERSION is already on crates.io with different bytes (index $SELFTEST_REAL_INDEX_SHA, tested $SELFTEST_REAL_TESTED_SHA) — refusing"
 
   # 10. yanked-identical: a yanked entry is not complete whatever its bytes say
   #     (A17) — a version matching the tested hash exactly is still refused.
