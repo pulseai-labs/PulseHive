@@ -482,9 +482,10 @@ do_publish() {
 # another toolchain. The pair is this work item's real negative control.
 #
 # Fixture data, not a statement about the version under test: the case below
-# feeds these hashes to whatever version the manifest currently declares, so
-# nothing in this file may restate that version — every expectation is derived
-# from the same $VERSION the case hands the publisher.
+# feeds these hashes to whatever version the manifest currently declares. The
+# 3.0.0 above is the measurement's provenance, not that version, and no
+# expectation line below may restate the manifest version — each takes its
+# version from the same $VERSION the case hands the publisher.
 SELFTEST_REAL_TESTED_SHA="9bdf73630cf9d8047ff01a7ca5592caa9c1f6e7aa5a0334571f21696e0e20329"
 SELFTEST_REAL_INDEX_SHA="7b1029446574756342e315c99226f583941e76d87ba7ce07b96ebc4ee2b44171"
 
@@ -822,11 +823,10 @@ self_test() {
   selftest_expect_rejected "local-drift" \
     "$PROG: ERROR: ${CRATES[0]}-$VERSION.crate differs from the tested package (tested $want_index, rebuilt $want_tested)"
 
-  # 9. real-measured-pair: the tested bytes the pinned toolchain produced against
-  #    the cksum crates.io recorded for another build of the same version must
-  #    refuse as different bytes. The pair is fixture data measured in the 3.0.0
-  #    release; the case runs at whatever version the manifest declares, so the
-  #    expected line takes its version from $VERSION and never restates one.
+  # 9. real-measured-pair: the measured pair above — the tested bytes the pinned
+  #    toolchain produced against the cksum crates.io recorded for a 3.0.0 built
+  #    by another toolchain — must refuse as different bytes at the version the
+  #    manifest declares.
   selftest_index_reset
   dir="$SELFTEST_TMP/real-measured-pair"
   selftest_tested_dir "$dir"
