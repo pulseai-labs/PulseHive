@@ -76,7 +76,7 @@ pub trait Tool: Send + Sync {
     /// This is an object-safe capability probe — no `Any`, no `unsafe`, no second
     /// registry. Non-streaming tools use the `None` default unchanged; a streaming
     /// tool overrides this single method to return `Some(self)`. The agent loop
-    /// (v2.1.0) dispatches on this to decide whether to open a progress channel.
+    /// (3.0.0) dispatches on this to decide whether to open a progress channel.
     fn as_streaming(&self) -> Option<&dyn StreamingTool> {
         None
     }
@@ -159,7 +159,7 @@ pub enum LogLevel {
 /// A progress event emitted by a streaming tool during execution.
 ///
 /// Tools implementing [`StreamingTool`] push these over an [`mpsc::Sender`]. The
-/// agent loop (v2.1.0) forwards each one as a `HiveEvent::ToolProgress`. The
+/// agent loop (3.0.0) forwards each one as a `HiveEvent::ToolProgress`. The
 /// `Started` / `Completed` bookends are emitted by the loop, not by tool bodies.
 ///
 /// Serializes to tagged JSON: `{"kind": "progress", "fraction": 0.5, ...}`.

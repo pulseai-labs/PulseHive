@@ -5,7 +5,7 @@
 //! fire-and-forget broadcast mechanism for event distribution.
 //!
 //! Events are serializable to JSON for transmission to observability tools
-//! like PulseVision via [`EventExporter`](crate::export::EventExporter).
+//! like an event-visualization tool via [`EventExporter`](crate::export::EventExporter).
 //!
 //! Built on `tokio::sync::broadcast` for multi-consumer support.
 
@@ -184,7 +184,7 @@ pub enum HiveEvent {
     ///
     /// Carries a [`ToolProgress`](crate::tool::ToolProgress) payload
     /// (`Started` / `Progress` / `PartialResult` / `Log` / `Completed`). The
-    /// agent loop (v2.1.0) forwards each `ToolProgress` pushed by a
+    /// agent loop (3.0.0) forwards each `ToolProgress` pushed by a
     /// [`StreamingTool`](crate::tool::StreamingTool) as one of these events.
     ///
     /// Serializes with the outer tag `"type":"tool_progress"`; the nested

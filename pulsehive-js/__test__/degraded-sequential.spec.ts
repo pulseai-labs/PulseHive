@@ -5,7 +5,7 @@
 /// child is progress) and the sequence's `AgentCompleted` maps to
 /// `outcome === "partial_complete"` carrying the critic's text in `responses`
 /// and exactly one error naming the failing agent — never `"complete"`
-/// (pulse-guard PH-1; ADR-014's r2.s5 amendment, L1/L2).
+/// (a downstream consumer's smoke finding PH-1; ADR-014's r2.s5 amendment, L1/L2).
 ///
 /// Offline by construction: both OpenAI-compatible providers point at a stub
 /// `node:http` server this test starts on `127.0.0.1` with an OS-assigned port.

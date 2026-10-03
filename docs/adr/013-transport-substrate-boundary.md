@@ -13,8 +13,8 @@ Cargo features are additive: a consumer asking for `features = ["openai"]` canno
 subtract the runtime, so no transport-only dependency footprint exists while
 those defaults hold. Release 1 exit criterion 4 requires a transport-only
 consumer that builds with `features = ["openai"]` and resolves neither
-`pulsehive-runtime` nor `pulsehive-db`, measured against the 132-package /
-54-second PulseTrader baseline.
+`pulsehive-runtime` nor `pulsehive-db`, measured against the transport-only
+footprint gate's 132-package baseline (`scripts/check-transport-only.sh`).
 
 ADR-003 records `Experience` as PulseDB-defined and re-exported from core;
 ADR-004 gives PulseDB all storage ownership. Both remain true for persisted
@@ -58,8 +58,8 @@ ownership.
 standalone Cargo consumer outside workspace feature unification, so workspace
 members cannot silently re-enable runtime or substrate. The recurring gate
 requires that the resolved graph contain neither `pulsehive-runtime` nor
-`pulsehive-db` and a package count below the 132-package baseline; cold-build
-time is measured once against 54 seconds and recorded rather than gated.
+`pulsehive-db` and a package count below the transport-only footprint gate's
+132-package baseline (`scripts/check-transport-only.sh`).
 
 **Rejected alternatives.** Gating the PulseDB-owned identifier types behind
 `substrate` would make `HiveEvent`'s shape vary by feature, breaking
@@ -98,8 +98,6 @@ documented basis per ADR-005.
 - The package-count gate runs against a standalone consumer outside workspace
   feature unification, so it is an honest oracle but one more fixture to
   maintain.
-- Cold-build time is recorded once against the 54-second baseline rather than
-  gated, so timing regressions surface in the ledger, not as build failures.
 
 **Negative:**
 
