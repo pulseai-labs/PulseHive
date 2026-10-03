@@ -127,10 +127,15 @@ quiet a hit is exactly the failure the pinning exists to prevent.
 ### CI enforcement
 
 `.github/workflows/boundary.yml` runs on every pull request and on every push to
-`main`, with `contents: read`, and runs no checkout of the tree it may not
-trust: two jobs, **"Public boundary"** — the checker's hermetic self-test, then
-the checker — and **"Secrets scan (gitleaks)"** — a checksum-verified gitleaks
-binary, then a full-history scan. The gitleaks release is downloaded and its
+`main`, with `contents: read` and on `pull_request` (never
+`pull_request_target`), so a pull request's code runs with no write token and no
+secrets. It has two jobs: **"Public boundary"** — the checker's hermetic
+self-test, then the checker — and **"Secrets scan (gitleaks)"** — a
+checksum-verified gitleaks binary, then a full-history scan. The "Public
+boundary" job runs the pull request's own copy of the checker against the pull
+request's own rules block, so a pull request that edits either one sets its own
+verdict; such an edit touches this ADR's touch surface, and the reviewer judges
+it. The gitleaks release is downloaded and its
 tarball checked against a sha256 literal in the workflow, `actions/checkout` is
 pinned to a commit SHA, and the scanner is never invoked through
 `gitleaks/gitleaks-action` (which needs a paid licence on organization repos).

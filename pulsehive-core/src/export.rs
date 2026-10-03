@@ -1,8 +1,9 @@
 //! Event export trait for streaming HiveEvents to external observability systems.
 //!
-//! [`EventExporter`] enables PulseHive to forward events to tools like an event-visualization tool
-//! for real-time visualization. Implementations handle the wire protocol (WebSocket,
-//! HTTP, file, etc.); the SDK calls `export()` on each event emission.
+//! [`EventExporter`] enables PulseHive to forward events to an event-visualization
+//! tool or another consumer for real-time visualization. Implementations handle
+//! the wire protocol (WebSocket, HTTP, file, etc.); the SDK calls `export()` on
+//! each event emission.
 //!
 //! # Example
 //! ```rust,ignore
